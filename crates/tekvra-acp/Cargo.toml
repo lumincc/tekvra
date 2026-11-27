@@ -1,0 +1,30 @@
+[package]
+name = "tekvra-acp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Agent Client Protocol (ACP) stdio JSON-RPC 2.0 server for Zed, Neovim, and JetBrains"
+
+[lints]
+workspace = true
+
+[dependencies]
+tekvra-protocol = { workspace = true }
+tekvra-config = { workspace = true }
+tekvra-storage = { workspace = true }
+tekvra-providers = { workspace = true }
+tekvra-tools = { workspace = true }
+tekvra-core = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tempfile = { workspace = true }

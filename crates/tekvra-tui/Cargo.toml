@@ -1,0 +1,31 @@
+[package]
+name = "tekvra-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Full-screen Alternate-Screen ratatui TUI, syntax highlighting, Markdown/diff cards, and approval ladders for Tekvra"
+
+[lints]
+workspace = true
+
+[dependencies]
+tekvra-protocol = { workspace = true }
+tekvra-storage = { workspace = true }
+tekvra-core = { workspace = true }
+
+crossterm = { workspace = true }
+futures = { workspace = true }
+pulldown-cmark = { workspace = true }
+ratatui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+syntect = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,40 @@
+[package]
+name = "tekvra-app-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Codex-compatible v2 JSON-RPC 2.0 app-server over stdio://, unix://, and ws:// for Tekvra"
+
+[lints]
+workspace = true
+
+[dependencies]
+tekvra-protocol = { workspace = true }
+tekvra-config = { workspace = true }
+tekvra-storage = { workspace = true }
+tekvra-providers = { workspace = true }
+tekvra-tools = { workspace = true }
+tekvra-core = { workspace = true }
+
+axum = { workspace = true }
+base64 = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+ignore = { workspace = true }
+jiff = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml_edit = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+jsonschema = { workspace = true }
+tempfile = { workspace = true }
+tokio-tungstenite = { workspace = true }

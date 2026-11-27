@@ -1,0 +1,38 @@
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+unused-allowed-license = "allow"
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "MIT-0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "CC0-1.0",
+  "0BSD",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0",
+  "Python-2.0.1",
+  "BlueOak-1.0.0",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+deny = [
+  { crate = "smol", reason = "Tekvra standardizes on a single tokio async runtime" },
+  { crate = "isahc", reason = "Tekvra standardizes on reqwest + rustls without libcurl" },
+  { crate = "flume", reason = "Use tokio::sync channels instead of smol/flume bridges" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
