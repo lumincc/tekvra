@@ -3,6 +3,7 @@
 //! SSRF-safe `webfetch`, and isolated Monty Python `code` + MCP gateway.
 
 pub mod fs_tools;
+pub mod lsp_client;
 pub mod mcp_client;
 pub mod output_filter;
 pub mod patch;
@@ -11,6 +12,7 @@ pub mod powershell_syntax;
 pub mod pty;
 pub mod registry;
 pub mod web_and_code;
+pub mod web_search;
 
 use std::path::PathBuf;
 
@@ -20,6 +22,7 @@ pub use fs_tools::{
     FileEditSpec, WorkspacePathLocks, extract_file_outline, file_edit, file_glob, file_grep,
     file_read, file_write, is_sensitive_credential_path, view_image,
 };
+pub use lsp_client::{LspDiagnostic, LspManager};
 pub use mcp_client::{ConfiguredMcpGateway, McpStartupReport};
 pub use output_filter::{
     Corpus, FilteredOutput, RowRenderer, collapse_progress_lines, filter_command_output,
@@ -40,8 +43,10 @@ pub use registry::{
     ToolExecutionContext, build_tool_definitions_for_model, run_permission_ladder,
 };
 pub use web_and_code::{
-    McpCallAuthorizer, McpGateway, McpToolDescriptor, MontyCodeSandbox, SafeWebFetcher,
+    McpCallAuthorizer, McpElicitationHook, McpGateway, McpSamplingHook, McpServerHooks,
+    McpToolDescriptor, MontyCodeSandbox, SafeWebFetcher,
 };
+pub use web_search::{DEFAULT_WEBSEARCH_BASE_URL, WebSearcher};
 
 /// Errors emitted by `tekvra-tools`.
 #[derive(Debug, Error)]

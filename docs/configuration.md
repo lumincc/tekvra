@@ -60,7 +60,42 @@ url = "https://mcp.example.com/rpc"
 bearer_token_env_var = "DOCS_MCP_TOKEN"
 startup_timeout_sec = 10
 tool_timeout_sec = 30
+session = true        # Streamable-HTTP `Mcp-Session-Id` affinity (default true)
+
+[mcp_servers.local_sampler]
+command = "python3"
+args = ["sampler_mcp.py"]
+sampling = true       # per-server opt-in for sampling/createMessage
+
+[experimental]
+mcp_sampling = true   # global gate; sampling without it answers -32603
 ```
+
+Server→client requests are routed: `sampling/createMessage` uses the session's `fast`-role model binding after an interactive approval prompt (usage lands in the ledger under `<rpc_id>_mcp_sampling`); `elicitation/create` becomes interactive questions; unknown methods answer `-32601`.
+
+### Language Servers (`[lsp.<id>]`)
+
+Trusted `tekvra.toml` files configure read-only language servers for the `lsp_diagnostics` tool:
+
+```toml
+[lsp.rust-analyzer]
+command = "rust-analyzer"
+languages = ["rs"]
+```
+
+- Project `.tekvra/tekvra.toml` `[lsp]` tables inherit the existing trust gate (withheld from untrusted projects together with the rest of the project config).
+- Servers run as read-only guests over stdio (`initialize` → `didOpen`/`didChange` → `publishDiagnostics`), are reused across calls in a session, and are shut down on drop. Diagnostics settle inside a 500 ms quiet window bounded by 5 s.
+
+### Web Search Endpoint (`agent.websearch_base_url`)
+
+`web_search` posts one query to an HTML endpoint — default `https://html.duckduckgo.com/html/`. Override for self-hosted SearXNG/Whoogle-style HTML pages:
+
+```toml
+[agent]
+websearch_base_url = "https://search.internal.corp/search"
+```
+
+The endpoint is authorized through the `webfetch` ladder class; results are capped at 1..=10 (default 8) with duplicate-host collapsing.
 
 Enabled servers are connected at startup via `ConfiguredMcpGateway` (`initialize` -> `notifications/initialized` -> `tools/list`) and exposed inside Monty `code` (`mcp_list()` / `await mcp_call(...)`) as well as `/mcp` and `mcpServerStatus/list` without mutating top-level LLM tool schemas.
 

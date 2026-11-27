@@ -15,9 +15,9 @@ pub use discovery::{
 };
 pub use loader::{CliConfigOverrides, ConfigPaths, ResolvedConfig, load_config};
 pub use schema::{
-    AgentSettings, CURRENT_CONFIG_VERSION, ConfigNotice, FeatureFlags, McpServerConfig,
-    ModelJobRouting, PermissionRule, PermissionsToml, ProfileOverride, ProviderAccountConfig,
-    ProviderEntryConfig, ProvidersToml, TekvraToml,
+    AgentSettings, CURRENT_CONFIG_VERSION, ConfigNotice, FeatureFlags, LspServerConfig,
+    McpServerConfig, ModelJobRouting, PermissionRule, PermissionsToml, ProfileOverride,
+    ProviderAccountConfig, ProviderEntryConfig, ProvidersToml, TekvraToml,
 };
 pub use trust::{TrustStore, canonicalize_or_clean};
 

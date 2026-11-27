@@ -268,6 +268,7 @@ pub async fn run_code_review(
         mcp_gateway: None,
         approval_cb: None,
         question_cb: None,
+        lsp_manager: None,
         plan_markdown: Arc::new(Mutex::new(String::new())),
     };
 

@@ -556,6 +556,7 @@ async fn try_main() -> Result<()> {
                 &resolved.settings.mcp_servers,
                 &resolved.cwd,
                 &resolved.settings.agent,
+                resolved.settings.experimental.mcp_sampling,
             )
             .await;
             for warn in &mcp_report.warnings {

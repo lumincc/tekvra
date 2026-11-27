@@ -16,10 +16,12 @@ use crate::fs_tools::{
     FileEditSpec, WorkspacePathLocks, extract_file_outline, file_edit, file_glob, file_grep,
     file_read, file_write, view_image,
 };
+use crate::lsp_client::LspManager;
 use crate::patch::{PatchHunk, apply_patch_to_workspace, parse_patch};
 use crate::permissions::{PermissionDecision, PermissionEvaluator, ToolAction};
 use crate::pty::{PtyCommandRequest, PtySessionManager};
 use crate::web_and_code::{McpCallAuthorizer, McpGateway, MontyCodeSandbox, SafeWebFetcher};
+use crate::web_search::{DEFAULT_WEBSEARCH_BASE_URL, WebSearcher};
 
 /// Host callback invoked when a tool call requires interactive user approval (`ApprovalPrompt`).
 #[async_trait]
@@ -65,6 +67,8 @@ pub struct ToolExecutionContext {
     pub approval_cb: Option<Arc<dyn ApprovalCallback>>,
     /// Optional structured user question callback.
     pub question_cb: Option<Arc<dyn QuestionCallback>>,
+    /// Optional session-scoped language-server manager (`lsp_diagnostics`).
+    pub lsp_manager: Option<Arc<LspManager>>,
     /// Latest session plan Markdown updated via `plan`.
     pub plan_markdown: Arc<Mutex<String>>,
 }
@@ -227,6 +231,30 @@ pub fn build_tool_definitions_for_model(model: &ModelCapabilities) -> Vec<ToolDe
                 "type": "object",
                 "properties": { "url": { "type": "string" } },
                 "required": ["url"]
+            }),
+        ),
+        (
+            "web_search",
+            "Search the web via an HTML endpoint (SSRF-protected); returns numbered results.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "max_results": { "type": "integer", "minimum": 1, "maximum": 10 }
+                },
+                "required": ["query"]
+            }),
+        ),
+        (
+            "lsp_diagnostics",
+            "Collect published diagnostics for a workspace file from a configured language server.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "server": { "type": "string", "description": "Optional [lsp.<id>] key; auto-selected when omitted." }
+                },
+                "required": ["path"]
             }),
         ),
         (
@@ -635,6 +663,73 @@ impl NativeToolRegistry {
                 )
                 .await?;
                 ctx.web_fetcher.fetch(url).await
+            }
+            "web_search" => {
+                let query = req_str(args, "query")?;
+                let max_results = args
+                    .get("max_results")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(8)
+                    .clamp(1, 10) as u32;
+                let searcher = WebSearcher::new(
+                    ctx.web_fetcher.clone(),
+                    ctx.settings.websearch_base_url.clone(),
+                );
+                // Authorize the search endpoint through the webfetch ladder class.
+                self.authorize(
+                    ctx,
+                    call_id,
+                    ToolAction::WebFetch {
+                        url: ctx
+                            .settings
+                            .websearch_base_url
+                            .clone()
+                            .unwrap_or_else(|| DEFAULT_WEBSEARCH_BASE_URL.to_string()),
+                    },
+                )
+                .await?;
+                searcher.search(query, max_results).await
+            }
+            "lsp_diagnostics" => {
+                let path = req_str(args, "path")?;
+                let server_id = args
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let file = ctx.workspace_root.join(path);
+                self.authorize(
+                    ctx,
+                    call_id,
+                    ToolAction::ReadWorkspace {
+                        tool_name: "lsp_diagnostics".to_string(),
+                        path: file.clone(),
+                    },
+                )
+                .await?;
+                let Some(manager) = &ctx.lsp_manager else {
+                    return Err(ToolsError::invalid(
+                        "`lsp_diagnostics` requires configured `[lsp.*]` servers",
+                    ));
+                };
+                let diags = manager.diagnostics(&server_id, &file).await?;
+                if diags.is_empty() {
+                    Ok(ToolOutput::Text {
+                        text: format!("No diagnostics for `{path}`."),
+                    })
+                } else {
+                    let body = diags
+                        .iter()
+                        .map(|d| {
+                            format!(
+                                "{}:{}:{} [{}] {}",
+                                path, d.line, d.column, d.severity, d.message
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Ok(ToolOutput::Text { text: body })
+                }
             }
             "code" => {
                 let snippet = req_str(args, "code")?;

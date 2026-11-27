@@ -254,6 +254,42 @@ pub trait McpGateway: Send + Sync {
         tool: &str,
         arguments: Value,
     ) -> Result<Value, ToolsError>;
+
+    /// Attaches server→client hooks (`sampling/createMessage`, `elicitation/create`).
+    /// No-op by default; live gateways override to route server-initiated requests.
+    fn set_server_hooks(&self, hooks: Arc<McpServerHooks>) {
+        let _ = hooks;
+    }
+}
+
+/// Completes one MCP `sampling/createMessage` server→client request.
+#[async_trait]
+pub trait McpSamplingHook: Send + Sync {
+    /// Returns the JSON-RPC `result` object (`{ role, content: { type, text }, model }`)
+    /// or an error message surfaced as `-32603`.
+    async fn sample(
+        &self,
+        server: &str,
+        request_id: &Value,
+        params: &Value,
+    ) -> Result<Value, String>;
+}
+
+/// Answers one MCP `elicitation/create` server→client request.
+#[async_trait]
+pub trait McpElicitationHook: Send + Sync {
+    /// Returns the JSON-RPC `result` object (`{ action: "accept"|"decline", content? }`);
+    /// an `Err` is reported as a plain `decline`.
+    async fn elicit(&self, server: &str, params: &Value) -> Result<Value, String>;
+}
+
+/// Server→client request hooks attached to a live gateway.
+#[derive(Default)]
+pub struct McpServerHooks {
+    /// Model-sampling handler (session provider driver).
+    pub sampling: Option<Arc<dyn McpSamplingHook>>,
+    /// User-elicitation handler (session question bridge).
+    pub elicitation: Option<Arc<dyn McpElicitationHook>>,
 }
 
 /// Isolated Monty Python subset sandbox (`code` tool) with zero direct host OS/FS/network/env access,

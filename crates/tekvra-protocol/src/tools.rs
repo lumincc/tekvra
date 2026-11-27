@@ -190,11 +190,29 @@ pub enum ToolOutput {
         /// Base64-encoded full image payload.
         data_base64: String,
     },
+    /// Web search results from `web_search`.
+    SearchResults {
+        /// The executed query.
+        query: String,
+        /// Ordered result entries (host-collapsed, capped).
+        results: Vec<WebSearchResult>,
+    },
     /// Plain text or custom Lua plugin tool output.
     Text {
         /// Output body.
         text: String,
     },
+}
+
+/// One web search hit surfaced by `web_search`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSearchResult {
+    /// Result title.
+    pub title: String,
+    /// Absolute result URL.
+    pub url: String,
+    /// Snippet (HTML-unescaped, tag-stripped).
+    pub snippet: String,
 }
 
 impl ToolOutput {
@@ -295,6 +313,22 @@ impl ToolOutput {
                     "Viewed image {} ({media_type}, {bytes_len} bytes)",
                     path.display()
                 )
+            }
+            Self::SearchResults { query, results } if results.is_empty() => {
+                format!("No results found for `{query}`.")
+            }
+            Self::SearchResults { query, results } => {
+                let mut out = format!("Search results for `{query}`:\n");
+                for (i, r) in results.iter().enumerate() {
+                    out.push_str(&format!(
+                        "{}. [{}]({}) — {}\n",
+                        i + 1,
+                        r.title,
+                        r.url,
+                        r.snippet
+                    ));
+                }
+                out
             }
             Self::Text { text } => text.clone(),
         }

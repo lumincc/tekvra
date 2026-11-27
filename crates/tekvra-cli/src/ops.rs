@@ -254,8 +254,13 @@ async fn mcp_test(resolved: &ResolvedConfig, name: &str) -> Result<()> {
     };
     let mut single: indexmap::IndexMap<String, McpServerConfig> = indexmap::IndexMap::new();
     single.insert(name.to_string(), cfg.clone());
-    let (gw, report) =
-        ConfiguredMcpGateway::connect_all(&single, &resolved.cwd, &resolved.settings.agent).await;
+    let (gw, report) = ConfiguredMcpGateway::connect_all(
+        &single,
+        &resolved.cwd,
+        &resolved.settings.agent,
+        resolved.settings.experimental.mcp_sampling,
+    )
+    .await;
     for warn in &report.warnings {
         eprintln!("warning: {warn}");
     }

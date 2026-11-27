@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use serde_json::Value;
-use tekvra_config::ResolvedConfig;
+use serde_json::{Value, json};
+use tekvra_config::{LspServerConfig, ResolvedConfig};
 use tekvra_protocol::{
     ApprovalPrompt, ApprovalResolution, FileDiffEntry, InputDeliveryMode, InputImage,
     PermissionMode, RevertScope, SessionCommand, SessionEvent, TokenUsage, ToolOutput,
@@ -21,9 +21,10 @@ use tekvra_storage::{
     RolloutHeader, RolloutLog, RolloutRecord, SessionSummary, StateIndex, WorkspaceSnapshotStore,
 };
 use tekvra_tools::{
-    ApprovalCallback, McpGateway, MontyCodeSandbox, NativeToolRegistry, PermissionEvaluator,
-    PtyCompletionNotice, PtySessionManager, QuestionCallback, SafeWebFetcher, ToolExecutionContext,
-    WorkspacePathLocks, build_tool_definitions_for_model,
+    ApprovalCallback, LspManager, McpElicitationHook, McpGateway, McpSamplingHook, McpServerHooks,
+    MontyCodeSandbox, NativeToolRegistry, PermissionEvaluator, PtyCompletionNotice,
+    PtySessionManager, QuestionCallback, SafeWebFetcher, ToolExecutionContext, WorkspacePathLocks,
+    build_tool_definitions_for_model,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -267,6 +268,250 @@ impl QuestionCallback for InteractiveBridge {
                 (prompt, ans)
             })
             .collect()
+    }
+}
+
+/// Builds the session-scoped language-server manager from trusted `[lsp.<id>]` config.
+/// Entries without a `command` are skipped; an empty set yields `None`.
+fn build_lsp_manager(
+    config: &ResolvedConfig,
+    workspace_root: &std::path::Path,
+) -> Option<Arc<LspManager>> {
+    let configs: BTreeMap<String, LspServerConfig> = config
+        .settings
+        .lsp_servers
+        .iter()
+        .filter(|(_, c)| c.command.as_deref().is_some_and(|s| !s.trim().is_empty()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if configs.is_empty() {
+        None
+    } else {
+        Some(Arc::new(LspManager::new(
+            configs,
+            workspace_root.to_path_buf(),
+        )))
+    }
+}
+
+/// Session-side server→client MCP hooks: model sampling through the `fast` role binding and
+/// user elicitation through the interactive question bridge.
+struct SessionMcpServerHooks {
+    driver: Arc<dyn ProviderDriver>,
+    router: ModelRouter,
+    state_index: Arc<Mutex<StateIndex>>,
+    session_id: String,
+    questions: Arc<dyn QuestionCallback>,
+}
+
+#[async_trait]
+impl McpSamplingHook for SessionMcpServerHooks {
+    async fn sample(
+        &self,
+        server: &str,
+        request_id: &Value,
+        params: &Value,
+    ) -> Result<Value, String> {
+        // Approval gate: interactive prompt; a closed channel (headless) resolves to empty
+        // answers which decline below — sampling never runs without an explicit yes.
+        let prompt =
+            format!("MCP server `{server}` requests model sampling (createMessage). Allow?");
+        let answers = self.questions.ask_questions(vec![prompt]).await;
+        let approved = answers
+            .first()
+            .map(|(_, a)| {
+                let a = a.trim().to_ascii_lowercase();
+                a == "y" || a == "yes" || a == "1" || a == "true"
+            })
+            .unwrap_or(false);
+        if !approved {
+            return Err("sampling request denied by user".to_string());
+        }
+
+        let (provider, caps) = self
+            .router
+            .route(JobRole::Fast)
+            .map_err(|e| format!("sampling routing failed: {e}"))?;
+
+        let mut messages: Vec<ProviderMessage> = Vec::new();
+        if let Some(system) = params.get("systemPrompt").and_then(Value::as_str) {
+            messages.push(ProviderMessage::developer_cached(system));
+        }
+        for msg in params
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let role = match msg.get("role").and_then(Value::as_str) {
+                Some("assistant") => MessageRole::Assistant,
+                _ => MessageRole::User,
+            };
+            let text = match msg.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            };
+            if text.is_empty() {
+                continue;
+            }
+            messages.push(ProviderMessage {
+                role,
+                parts: vec![MessagePart::Text {
+                    text,
+                    cache_breakpoint: false,
+                }],
+            });
+        }
+        if messages.is_empty() {
+            return Err("sampling request contained no usable messages".to_string());
+        }
+
+        let request = CompletionRequest {
+            conversation_id: format!("{}-mcp-sampling", self.session_id),
+            messages,
+            tools: Vec::new(),
+            reasoning_effort: None,
+            output_schema: None,
+        };
+        let resp = self
+            .driver
+            .complete(provider, &caps, &request)
+            .await
+            .map_err(|e| format!("sampling completion failed: {e}"))?;
+
+        let text = resp
+            .assistant_message
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                MessagePart::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Usage attribution under a synthetic turn id derived from the JSON-RPC id.
+        let turn_id = format!("{}_mcp_sampling", request_id);
+        let recorded_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_default();
+        let _ = self
+            .state_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_usage(
+                &self.session_id,
+                &turn_id,
+                &caps.model_id,
+                &resp.usage,
+                recorded_at,
+            );
+
+        Ok(json!({
+            "role": "assistant",
+            "content": { "type": "text", "text": text },
+            "model": caps.model_id,
+        }))
+    }
+}
+
+#[async_trait]
+impl McpElicitationHook for SessionMcpServerHooks {
+    async fn elicit(&self, server: &str, params: &Value) -> Result<Value, String> {
+        let decline = || Ok(json!({ "action": "decline" }));
+        let schema = params.get("requestedSchema");
+        // `requestedSchema` is a JSON Schema object: the flat fields live one level down in
+        // `properties` (fall back to the top level only when it is absent).
+        let props = schema
+            .and_then(|s| s.get("properties"))
+            .and_then(Value::as_object)
+            .filter(|p| !p.is_empty())
+            .or_else(|| schema.and_then(Value::as_object).filter(|p| !p.is_empty()));
+        let Some(props) = props else {
+            return decline();
+        };
+
+        let intro = params
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("The MCP server requests input.");
+        let mut questions: Vec<(String, String)> = Vec::new();
+        for (key, spec) in props {
+            let ty = spec
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("string")
+                .to_string();
+            if !matches!(ty.as_str(), "string" | "number" | "integer" | "boolean") {
+                // Unsupported schema (nested object/array): decline the whole request.
+                return decline();
+            }
+            let mut q = format!("[{key}] ({ty})");
+            if let Some(enum_vals) = spec.get("enum").and_then(Value::as_array) {
+                let opts: Vec<String> = enum_vals
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect();
+                if !opts.is_empty() {
+                    q.push_str(&format!(" one of: {}", opts.join(" | ")));
+                }
+            }
+            if let Some(desc) = spec.get("description").and_then(Value::as_str) {
+                q.push_str(&format!(" — {desc}"));
+            }
+            questions.push((key.clone(), q));
+        }
+
+        let mut prompt_lines = vec![format!("MCP server `{server}`: {intro}")];
+        for (_, q) in &questions {
+            prompt_lines.push(q.clone());
+        }
+        let answers = self
+            .questions
+            .ask_questions(questions.into_iter().map(|(_, q)| q).collect())
+            .await;
+        // Empty resolution (headless / dismissed) is an explicit decline.
+        if answers.iter().all(|(_, a)| a.trim().is_empty()) {
+            return decline();
+        }
+
+        let mut content = serde_json::Map::new();
+        for ((key, _), (prompt, answer)) in props.iter().zip(answers) {
+            let _ = prompt;
+            let trimmed = answer.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let ty = props
+                .get(key.as_str())
+                .and_then(|s| s.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("string");
+            let value = match ty {
+                "number" | "integer" => match trimmed.parse::<f64>() {
+                    Ok(n) => json!(n),
+                    Err(_) => return Ok(json!({ "action": "decline" })),
+                },
+                "boolean" => match trimmed.to_ascii_lowercase().as_str() {
+                    "true" | "yes" | "y" | "1" => json!(true),
+                    "false" | "no" | "n" | "0" => json!(false),
+                    _ => return Ok(json!({ "action": "decline" })),
+                },
+                _ => Value::String(answer.clone()),
+            };
+            content.insert(key.clone(), value);
+        }
+        if content.is_empty() {
+            return decline();
+        }
+        Ok(json!({ "action": "accept", "content": content }))
     }
 }
 
@@ -569,6 +814,9 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
     let runner_pty = pty_manager.clone();
 
     tokio::spawn(async move {
+        // Build once so every per-turn `ToolExecutionContext` reuses the same servers.
+        let lsp_manager = build_lsp_manager(&bootstrap.config, &bootstrap.workspace_root);
+
         let mut actor = SessionActor {
             session_id: runner_session_id.clone(),
             workspace_root: canonical_ws,
@@ -589,6 +837,7 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
             extra_plugin_tools: bootstrap.extra_plugin_tools,
             allow_subagents: bootstrap.allow_subagents,
             subagents: runner_subagents,
+            lsp_manager,
             frame,
             mode,
             active_goal: None,
@@ -609,6 +858,30 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
             replace_slot,
             title_done: false,
         };
+
+        // Late-bind server→client MCP hooks (sampling/elicitation) onto the live gateway.
+        // Gate: global `[experimental] mcp_sampling = true`; per-server opt-in was resolved
+        // at connect time. Mock gateways keep the trait default (no-op).
+        if let Some(gateway) = actor.mcp_gateway.as_deref() {
+            let hooks_impl = Arc::new(SessionMcpServerHooks {
+                driver: Arc::clone(&actor.driver),
+                router: actor.router.clone(),
+                state_index: Arc::clone(&actor.state_index),
+                session_id: actor.session_id.clone(),
+                questions: Arc::clone(&actor.bridge) as Arc<dyn QuestionCallback>,
+            });
+            let hooks = McpServerHooks {
+                // Sampling additionally requires the global experimental flag.
+                sampling: actor
+                    .config
+                    .settings
+                    .experimental
+                    .mcp_sampling
+                    .then(|| Arc::clone(&hooks_impl) as Arc<dyn McpSamplingHook>),
+                elicitation: Some(Arc::clone(&hooks_impl) as Arc<dyn McpElicitationHook>),
+            };
+            gateway.set_server_hooks(Arc::new(hooks));
+        }
 
         loop {
             // Priority 1: if a `Replace` prompt preempted the previous turn, run it immediately!
@@ -686,6 +959,7 @@ struct SessionActor {
     extra_plugin_tools: Vec<ToolDefinition>,
     allow_subagents: bool,
     subagents: Option<SubagentManager>,
+    lsp_manager: Option<Arc<LspManager>>,
     frame: Frame,
     mode: PermissionMode,
     active_goal: Option<String>,
@@ -1801,6 +2075,7 @@ impl SessionActor {
             mcp_gateway: self.mcp_gateway.clone(),
             approval_cb: Some(Arc::clone(&self.bridge) as Arc<dyn ApprovalCallback>),
             question_cb: Some(Arc::clone(&self.bridge) as Arc<dyn QuestionCallback>),
+            lsp_manager: self.lsp_manager.clone(),
             plan_markdown: Arc::clone(&self.plan_markdown),
         };
 

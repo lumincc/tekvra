@@ -54,6 +54,7 @@ fn make_ctx(
         mcp_gateway: None,
         approval_cb: None,
         question_cb: None,
+        lsp_manager: None,
         plan_markdown: Arc::new(Mutex::new(String::new())),
     }
 }
@@ -787,7 +788,7 @@ for raw in sys.stdin:
     );
 
     let (gw, report) =
-        ConfiguredMcpGateway::connect_all(&servers, &ws, &AgentSettings::default()).await;
+        ConfiguredMcpGateway::connect_all(&servers, &ws, &AgentSettings::default(), false).await;
     assert_eq!(report.connected_servers, vec!["stdio_srv", "http_srv"]);
     assert_eq!(
         report.warnings.len(),
@@ -950,7 +951,7 @@ async fn streamable_http_sse_mcp_bearer_auth_and_list_changed_catalog_refresh() 
     );
 
     let (gw, report) =
-        ConfiguredMcpGateway::connect_all(&servers, &ws, &AgentSettings::default()).await;
+        ConfiguredMcpGateway::connect_all(&servers, &ws, &AgentSettings::default(), false).await;
     assert_eq!(report.connected_servers, vec!["sse_srv"]);
     assert_eq!(gw.list_tools().len(), 1);
 
@@ -1370,3 +1371,529 @@ async fn build_mode_mcp_call_inside_code_prompts_interactively() {
     );
     assert_eq!(mock_mcp.calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn mcp_session_header_echo_delete_and_split_sse_streaming() {
+    use indexmap::IndexMap;
+    use std::collections::BTreeMap;
+    use tekvra_config::McpServerConfig;
+    use tekvra_tools::ConfiguredMcpGateway;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(&state).expect("mkdir state");
+
+    // Server-side log: (method, session_header_present); plus observed DELETEs.
+    let seen: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let deletes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let seen_srv = Arc::clone(&seen);
+    let deletes_srv = Arc::clone(&deletes);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let seen_inner = Arc::clone(&seen_srv);
+            let deletes_inner = Arc::clone(&deletes_srv);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = vec![0_u8; 4096];
+                // Read until end of headers + body (mock server: single small request).
+                loop {
+                    let n = stream.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let s = String::from_utf8_lossy(&buf);
+                    let Some((headers, body)) = s.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    // DELETE carries no body — handle as soon as headers are complete.
+                    if headers.to_ascii_lowercase().starts_with("delete") {
+                        break;
+                    }
+                    if serde_json::from_str::<Value>(body.trim()).is_ok() {
+                        break;
+                    }
+                }
+                if buf.is_empty() {
+                    return;
+                }
+                let req_str = String::from_utf8_lossy(&buf).into_owned();
+                let (headers, body) = req_str.split_once("\r\n\r\n").unwrap_or(("", &req_str));
+                let headers_lower = headers.to_ascii_lowercase();
+                if headers_lower.starts_with("delete") {
+                    deletes_inner
+                        .lock()
+                        .expect("lock")
+                        .push(headers.to_string());
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    return;
+                }
+                let session_present = headers_lower.contains("mcp-session-id:");
+                let Ok(msg) = serde_json::from_str::<Value>(body.trim()) else {
+                    return;
+                };
+                let Some(mid) = msg.get("id").cloned() else {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    return;
+                };
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                seen_inner
+                    .lock()
+                    .expect("lock")
+                    .push((method.to_string(), session_present));
+                let result = match method {
+                    "initialize" => json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "serverInfo": { "name": "sess-mcp", "version": "1.0" }
+                    }),
+                    "tools/list" => json!({ "tools": [
+                        { "name": "echo", "description": "Echoes", "inputSchema": { "type": "object" } }
+                    ]}),
+                    _ => json!({}),
+                };
+                let rpc = json!({ "jsonrpc": "2.0", "id": mid, "result": result }).to_string();
+                let mut headers_out =
+                    String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n");
+                if method == "initialize" {
+                    headers_out.push_str("Mcp-Session-Id: sess-123\r\n");
+                }
+                headers_out.push_str(&format!(
+                    "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    format!("data: {rpc}\r\n\r\n").len()
+                ));
+                let _ = stream.write_all(headers_out.as_bytes()).await;
+                // Split the SSE data line across two writes to prove incremental parsing.
+                let payload = format!("data: {rpc}\r\n\r\n");
+                let (head, tail) = payload.split_at(payload.len() / 2);
+                let _ = stream.write_all(head.as_bytes()).await;
+                stream.flush().await.ok();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let _ = stream.write_all(tail.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut servers = IndexMap::new();
+    let mut env_map = BTreeMap::new();
+    env_map.insert("X".to_string(), "1".to_string());
+    servers.insert(
+        "sess_srv".to_string(),
+        McpServerConfig {
+            url: Some(format!("http://{addr}/mcp")),
+            enabled: true,
+            env: env_map,
+            ..McpServerConfig::default()
+        },
+    );
+
+    let (gw, report) =
+        ConfiguredMcpGateway::connect_all(&servers, &ws, &AgentSettings::default(), false).await;
+    assert_eq!(report.connected_servers, vec!["sess_srv"]);
+    assert_eq!(gw.list_tools().len(), 1, "split SSE frame must still parse");
+
+    // Every request after initialize must echo the captured session id.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let seen_now = seen.lock().expect("lock").clone();
+    let list_entry = seen_now.iter().find(|(m, _)| m == "tools/list");
+    assert!(list_entry.is_some(), "saw {seen_now:?}");
+    assert!(
+        list_entry.unwrap().1,
+        "tools/list must carry Mcp-Session-Id after initialize"
+    );
+
+    // Dropping the gateway must fire the best-effort session DELETE.
+    drop(gw);
+    let mut observed_delete = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if !deletes.lock().expect("lock").is_empty() {
+            observed_delete = true;
+            break;
+        }
+    }
+    assert!(observed_delete, "expected Mcp-Session-Id DELETE on drop");
+}
+
+#[tokio::test]
+async fn mcp_server_initiated_requests_fallback_gating_and_unknown_methods() {
+    use indexmap::IndexMap;
+    use std::collections::BTreeMap;
+    use tekvra_config::McpServerConfig;
+    use tekvra_tools::{ConfiguredMcpGateway, McpServerHooks};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(&state).expect("mkdir state");
+
+    // Log of responses POSTed back by the gateway, keyed by server-request method.
+    let responses: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let sampling_hook = Arc::new(SamplingCountHook {
+        invocations: AtomicUsize::new(0),
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let responses_srv = Arc::clone(&responses);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let responses_inner = Arc::clone(&responses_srv);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = vec![0_u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let s = String::from_utf8_lossy(&buf);
+                    if let Some((_, body)) = s.split_once("\r\n\r\n")
+                        && serde_json::from_str::<Value>(body.trim()).is_ok()
+                    {
+                        break;
+                    }
+                }
+                let req_str = String::from_utf8_lossy(&buf).into_owned();
+                let (_, body) = req_str.split_once("\r\n\r\n").unwrap_or(("", ""));
+                let Ok(msg) = serde_json::from_str::<Value>(body.trim()) else {
+                    return;
+                };
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                let mid = msg.get("id").cloned().unwrap_or(Value::Null);
+                // The gateway POSTs JSON-RPC RESPONSES back to us (server→client flow) or
+                // originates requests (initialize/tools/list) which we answer over SSE.
+                let is_response = msg.get("result").is_some() || msg.get("error").is_some();
+                if is_response {
+                    responses_inner.lock().expect("lock").push(msg.clone());
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    return;
+                }
+                // Originating request: for `initialize` we answer, then ALSO push a
+                // server→client request over the same SSE stream so the client must route it.
+                let (result, extra_server_request) = match method {
+                    "initialize" => (
+                        json!({
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": { "sampling": {}, "elicitation": {} },
+                            "serverInfo": { "name": "srv-init", "version": "1.0" }
+                        }),
+                        Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": "srv_req_unknown_1",
+                            "method": "workspace/writeFile",
+                            "params": { "path": "x.txt", "content": "nope" }
+                        })),
+                    ),
+                    "tools/list" => {
+                        let mut extra = vec![json!({
+                            "jsonrpc": "2.0",
+                            "id": "srv_req_sampling_1",
+                            "method": "sampling/createMessage",
+                            "params": { "messages": [ { "role": "user", "content": { "type": "text", "text": "hi" } } ] }
+                        })];
+                        // Second client connection (scenario B) also receives the elicitation probe.
+                        extra.push(json!({
+                            "jsonrpc": "2.0",
+                            "id": "srv_req_elicit_1",
+                            "method": "elicitation/create",
+                            "params": { "message": "Continue?", "requestedSchema": { "type": "object", "properties": { "ok": { "type": "boolean" } } } }
+                        }));
+                        (
+                            json!({ "tools": [
+                                { "name": "t", "description": "d", "inputSchema": { "type": "object" } }
+                            ]}),
+                            Some(Value::Array(extra)),
+                        )
+                    }
+                    _ => (
+                        json!({}),
+                        Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": "srv_req_unknown_1",
+                            "method": "workspace/writeFile",
+                            "params": { "path": "x.txt", "content": "nope" }
+                        })),
+                    ),
+                };
+                let mut events = String::new();
+                if let Some(Value::Array(reqs)) = extra_server_request {
+                    for sreq in reqs {
+                        events.push_str(&format!("data: {}\r\n\r\n", sreq));
+                    }
+                } else if let Some(sreq) = extra_server_request {
+                    events.push_str(&format!("data: {}\r\n\r\n", sreq));
+                }
+                let rpc = json!({ "jsonrpc": "2.0", "id": mid, "result": result }).to_string();
+                events.push_str(&format!("data: {rpc}\r\n\r\n"));
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}",
+                    events.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut servers = IndexMap::new();
+    let mut env_map = BTreeMap::new();
+    env_map.insert("X".to_string(), "1".to_string());
+    servers.insert(
+        "srv_init".to_string(),
+        McpServerConfig {
+            url: Some(format!("http://{addr}/mcp")),
+            enabled: true,
+            env: env_map,
+            sampling: true,
+            ..McpServerConfig::default()
+        },
+    );
+
+    // Scenario A: hooks attached, but the global sampling gate is OFF (`connect_all(..., false)`).
+    let (gw, report) =
+        ConfiguredMcpGateway::connect_all(&servers, &ws, &AgentSettings::default(), false).await;
+    assert_eq!(report.connected_servers, vec!["srv_init"]);
+    gw.set_server_hooks(Arc::new(McpServerHooks {
+        sampling: Some(Arc::clone(&sampling_hook) as Arc<dyn tekvra_tools::McpSamplingHook>),
+        elicitation: None,
+    }));
+
+    // The gateway routed the server→client `sampling/createMessage` and POSTed back
+    // an error (gate off); the unknown method got `-32601`.
+    let mut saw_unknown_32601 = false;
+    let mut saw_sampling_gate_error = false;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let now = responses.lock().expect("lock").clone();
+        for msg in &now {
+            if let Some(err) = msg.get("error") {
+                let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+                let message = err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if code == -32601 && message.contains("workspace/writeFile") {
+                    saw_unknown_32601 = true;
+                }
+                if code == -32603 && message.contains("sampling is not enabled") {
+                    saw_sampling_gate_error = true;
+                }
+            }
+        }
+        if saw_unknown_32601 && saw_sampling_gate_error {
+            break;
+        }
+    }
+    assert!(saw_unknown_32601, "unknown server method must yield -32601");
+    assert!(
+        saw_sampling_gate_error,
+        "sampling with the gate off must yield -32603 even with hooks attached"
+    );
+    assert_eq!(
+        sampling_hook.invocations.load(Ordering::SeqCst),
+        0,
+        "hook must never run while the gate is off"
+    );
+    drop(gw);
+
+    // Scenario B: global flag ON (`connect_all(..., true)`) + per-server `sampling: true`
+    // → the hook runs and its result is POSTed back; elicitation without a handler declines.
+    let (gw2, report2) =
+        ConfiguredMcpGateway::connect_all(&servers, &ws, &AgentSettings::default(), true).await;
+    assert_eq!(report2.connected_servers, vec!["srv_init"]);
+    gw2.set_server_hooks(Arc::new(McpServerHooks {
+        sampling: Some(Arc::clone(&sampling_hook) as Arc<dyn tekvra_tools::McpSamplingHook>),
+        elicitation: None,
+    }));
+
+    let mut saw_sampled_ok = false;
+    let mut saw_elicit_decline = false;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let now = responses.lock().expect("lock").clone();
+        for msg in &now {
+            if msg.get("result").and_then(|r| {
+                r.get("content")
+                    .and_then(|c| c.get("text"))
+                    .and_then(Value::as_str)
+            }) == Some("sampled-ok")
+            {
+                saw_sampled_ok = true;
+            }
+            if msg.get("id").and_then(Value::as_str) == Some("srv_req_elicit_1")
+                && msg
+                    .get("result")
+                    .and_then(|r| r.get("action"))
+                    .and_then(Value::as_str)
+                    == Some("decline")
+            {
+                saw_elicit_decline = true;
+            }
+        }
+        if saw_sampled_ok && saw_elicit_decline {
+            break;
+        }
+    }
+    assert!(
+        saw_sampled_ok,
+        "sampling hook must run and POST its result back when the gate is on"
+    );
+    assert_eq!(
+        sampling_hook.invocations.load(Ordering::SeqCst),
+        1,
+        "exactly one sampling invocation expected"
+    );
+    assert!(
+        saw_elicit_decline,
+        "elicitation without a handler must decline explicitly"
+    );
+}
+
+/// File-scope sampling hook fixture counting invocations.
+struct SamplingCountHook {
+    invocations: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl tekvra_tools::McpSamplingHook for SamplingCountHook {
+    async fn sample(
+        &self,
+        _server: &str,
+        _request_id: &Value,
+        _params: &Value,
+    ) -> Result<Value, String> {
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({
+            "role": "assistant",
+            "content": { "type": "text", "text": "sampled-ok" }
+        }))
+    }
+}
+
+#[tokio::test]
+async fn web_search_parses_mock_endpoint_honors_deny_rules_and_caps() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(&state).expect("mkdir state");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let page = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    SEARCH_PAGE.len(),
+                    SEARCH_PAGE
+                );
+                let _ = stream.write_all(page.as_bytes()).await;
+            });
+        }
+    });
+
+    let endpoint = format!("http://{addr}/search");
+
+    // 1. Deny rule on the search endpoint → the call is refused by the ladder.
+    let deny_rules = vec![PermissionRule {
+        tool: "webfetch".to_string(),
+        pattern: endpoint.clone(),
+        action: RuleAction::Deny,
+    }];
+    let mut ctx = make_ctx(ws.clone(), state.clone(), PermissionMode::Build, deny_rules);
+    ctx.settings.websearch_base_url = Some(endpoint.clone());
+    let reg = NativeToolRegistry::new();
+    let err = reg
+        .execute(
+            &ctx,
+            "ws_deny_1",
+            "web_search",
+            &json!({ "query": "rust async" }),
+        )
+        .await
+        .expect_err("deny rule must refuse the search endpoint");
+    assert!(
+        err.to_string().contains("denied") || err.to_string().contains("Denied"),
+        "got: {err}"
+    );
+
+    // 2. Auto-approving host → prompt is issued once and results parse.
+    let mut ctx2 = make_ctx(ws, state, PermissionMode::Build, Vec::new());
+    ctx2.settings.websearch_base_url = Some(endpoint);
+    // The mock endpoint is loopback: allowlist it for the SSRF-safe fetcher.
+    ctx2.web_fetcher = tekvra_tools::SafeWebFetcher::new(&["127.0.0.1".to_string()]);
+    ctx2.approval_cb = Some(Arc::new(ApprovingCallback {
+        prompts: Mutex::new(Vec::new()),
+    }));
+    let out = reg
+        .execute(
+            &ctx2,
+            "ws_ok_1",
+            "web_search",
+            &json!({ "query": "tekvra rust agent", "max_results": 99 }),
+        )
+        .await
+        .expect("approved web_search parses results");
+    let ToolOutput::SearchResults { query, results } = out else {
+        panic!("expected SearchResults");
+    };
+    assert_eq!(query, "tekvra rust agent");
+    assert_eq!(results.len(), 2, "cap 99 clamps to page content");
+    assert_eq!(results[0].url, "https://example.com/docs");
+    assert!(results[0].title.contains("Example"));
+
+    // Cap: max_results=1 keeps exactly one.
+    let out1 = reg
+        .execute(
+            &ctx2,
+            "ws_ok_2",
+            "web_search",
+            &json!({ "query": "q", "max_results": 1 }),
+        )
+        .await
+        .expect("capped search");
+    let ToolOutput::SearchResults { results: r1, .. } = out1 else {
+        panic!("expected SearchResults");
+    };
+    assert_eq!(r1.len(), 1);
+}
+
+/// Minimal DuckDuckGo-HTML-shaped fixture served by the mock endpoint.
+const SEARCH_PAGE: &str = r##"<html><body>
+<div class="result">
+  <h2 class="result__title"><a rel="nofollow" class="result__a" href="//duckduckgo.test/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs&amp;rut=x"><b>Example</b> Docs</a></h2>
+  <a class="result__snippet" href="//duckduckgo.test/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs">The &quot;official&quot; guide &lt;v2&gt;</a>
+</div>
+<div class="result">
+  <h2 class="result__title"><a class="result__a" href="https://direct.example.org/page">Direct Hit</a></h2>
+  <a class="result__snippet" href="#">A plain snippet</a>
+</div>
+</body></html>"##;

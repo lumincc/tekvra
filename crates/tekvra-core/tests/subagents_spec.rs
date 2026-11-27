@@ -83,6 +83,9 @@ fn setup_bootstrap(tmp: &TempDir, git_init: bool) -> SessionBootstrap {
         git(&ws, &["init", "-q", "-b", "main"]);
         git(&ws, &["config", "user.email", "t@tekvra.local"]);
         git(&ws, &["config", "user.name", "Tekvra Test"]);
+        // Windows runners default to `core.autocrlf=true`, which would rewrite merged
+        // file contents to CRLF and break byte-exact assertions.
+        git(&ws, &["config", "core.autocrlf", "false"]);
         std::fs::write(ws.join("lib.rs"), "fn a() {}\n").expect("seed file");
         git(&ws, &["add", "-A"]);
         git(&ws, &["commit", "-q", "-m", "init"]);

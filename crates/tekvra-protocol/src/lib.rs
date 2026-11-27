@@ -14,4 +14,5 @@ pub use session::{
 };
 pub use tools::{
     FileChangeKind, FileDiffEntry, ReviewFinding, SearchMatch, SymbolOutline, ToolOutput,
+    WebSearchResult,
 };

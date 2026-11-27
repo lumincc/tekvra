@@ -16,6 +16,9 @@ pub const CURRENT_CONFIG_VERSION: u32 = 2;
 pub struct FeatureFlags {
     /// Enables loading external Luau plugins from `<config>/lua/` and trusted `<project>/.tekvra/lua/`.
     pub lua_plugins: bool,
+    /// Global gate for MCP `sampling/createMessage` server→client requests (per-server
+    /// `sampling = true` opts in additionally). Default off.
+    pub mcp_sampling: bool,
 }
 
 /// Role-based model routing table (`[models]`).
@@ -64,6 +67,8 @@ pub struct AgentSettings {
     pub auto_title: bool,
     /// Maximum nesting depth for `task` subagents (`1` = children cannot spawn subagents).
     pub subagent_max_depth: u32,
+    /// Optional `web_search` HTML endpoint override (default: DuckDuckGo HTML Lite).
+    pub websearch_base_url: Option<String>,
 }
 
 impl Default for AgentSettings {
@@ -79,8 +84,21 @@ impl Default for AgentSettings {
             webfetch_allow_private_hosts: Vec::new(),
             auto_title: false,
             subagent_max_depth: 1,
+            websearch_base_url: None,
         }
     }
+}
+
+/// Language-server registration (`[lsp.<id>]`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspServerConfig {
+    /// Server executable (empty/missing entries are ignored with a loader notice).
+    pub command: Option<String>,
+    /// Command-line arguments for the server process.
+    pub args: Vec<String>,
+    /// File extensions this server handles (empty = all files routed to it).
+    pub languages: Vec<String>,
 }
 
 /// External MCP server configuration (`[mcp_servers.<name>]`).
@@ -103,6 +121,11 @@ pub struct McpServerConfig {
     pub env: BTreeMap<String, String>,
     /// Whether this server is enabled.
     pub enabled: bool,
+    /// Streamable-HTTP session affinity: capture/echo/release `Mcp-Session-Id` (default on).
+    pub session: Option<bool>,
+    /// Per-server opt-in for `sampling/createMessage` server→client requests
+    /// (also requires `[experimental] mcp_sampling = true`).
+    pub sampling: bool,
 }
 
 /// Named profile overrides (`[profiles.<name>]` in `tekvra.toml`).
@@ -133,6 +156,8 @@ pub struct TekvraToml {
     pub agent: AgentSettings,
     /// Configured MCP servers.
     pub mcp_servers: IndexMap<String, McpServerConfig>,
+    /// Language servers (`[lsp.<id>]`) — trusted configuration only.
+    pub lsp_servers: IndexMap<String, LspServerConfig>,
     /// Named configuration profiles selectable via `--profile <name>`.
     pub profiles: IndexMap<String, ProfileOverride>,
     /// Global-only experimental feature flags.
@@ -147,6 +172,7 @@ impl Default for TekvraToml {
             models: ModelJobRouting::default(),
             agent: AgentSettings::default(),
             mcp_servers: IndexMap::new(),
+            lsp_servers: IndexMap::new(),
             profiles: IndexMap::new(),
             experimental: FeatureFlags::default(),
         }
