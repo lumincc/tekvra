@@ -471,9 +471,16 @@ impl WorkspaceSnapshotStore {
         self.blobs_dir().join(prefix).join(sha256)
     }
 
+    /// Hex-encodes a SHA-256 digest as 64 lowercase hex characters.
+    fn sha256_hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     fn write_blob(&self, bytes: &[u8]) -> Result<String, StorageError> {
-        let digest = Sha256::digest(bytes);
-        let hex = format!("{digest:x}");
+        let hex = Self::sha256_hex(bytes);
         let path = self.blob_path(&hex);
         if !path.is_file() {
             atomic_write_bytes(&path, bytes)?;
@@ -487,7 +494,7 @@ impl WorkspaceSnapshotStore {
             path: path.clone(),
             source,
         })?;
-        let actual = format!("{:x}", Sha256::digest(&bytes));
+        let actual = Self::sha256_hex(&bytes);
         if actual != expected_sha256 {
             return Err(StorageError::SnapshotIntegrity {
                 expected: expected_sha256.to_string(),

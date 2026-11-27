@@ -479,5 +479,8 @@ fn message_byte_estimate(msg: &ProviderMessage) -> usize {
 
 fn hash_json<T: serde::Serialize>(val: &T) -> String {
     let bytes = serde_json::to_vec(val).unwrap_or_default();
-    format!("{:x}", Sha256::digest(&bytes))
+    Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
