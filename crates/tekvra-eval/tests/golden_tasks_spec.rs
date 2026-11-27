@@ -258,11 +258,12 @@ async fn golden_grep_task() {
         }],
     );
     assert!(failures.is_empty(), "tool-sequence failures: {failures:?}");
-    // Final state: grep must not mutate any fixture file.
+    // Final state: grep must not mutate any fixture file. Windows checkouts
+    // materialize the fixture with CRLF (autocrlf) — compare EOL-normalized.
     let alpha =
         std::fs::read_to_string(workspace.join("src/alpha.rs")).expect("read alpha fixture");
     assert_eq!(
-        alpha,
+        alpha.replace('\r', ""),
         "/// fixture module for grep task\npub fn alpha() -> u32 {\n    NEEDLE_MARKER\n}\n"
     );
 }
