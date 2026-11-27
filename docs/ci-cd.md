@@ -19,18 +19,18 @@ Triggered on every push to `main` / `release/**`, every pull request, and via `w
 
 `install.sh` (Linux/macOS, POSIX bash) and `install.ps1` (Windows PowerShell) install the release binary:
 
-1. Detect host OS/architecture and select the matching release archive (`tekvra-<tag>-<target>.tar.gz|zip`).
+1. Detect host OS/architecture and select the matching release archive (`tekvra-<tag>-<target>.tar.gz|zip`; Windows `ARM64` hosts probe for a native `aarch64-pc-windows-msvc` archive and fall back cleanly to `x86_64-pc-windows-msvc`, which ARM64 Windows executes via Prism emulation — override with `TEKVRA_FORCE_TARGET`).
 2. Download the archive **and** `SHA256SUMS.txt` from the release assets.
 3. Verify the archive digest against `SHA256SUMS.txt`; any mismatch aborts with a non-zero exit status **before** placing a binary into the install prefix.
-4. Install `tekvra` into `$TEKVRA_INSTALL_PREFIX/bin` (default `~/.local/bin` on POSIX, `%LOCALAPPDATA%\Programs\tekvra\bin` on Windows).
+4. Extract the binary from the nested `tekvra-<tag>-<target>/` bundle directory produced by `ci_verify_packaging.py --package-release` (flat-root archives are supported as a fallback) and install `tekvra` into `$TEKVRA_INSTALL_PREFIX/bin` (default `~/.local/bin` on POSIX, `%LOCALAPPDATA%\Programs\tekvra\bin` on Windows).
 
-Environment knobs: `TEKVRA_VERSION` (tag, default `v0.1.0`), `TEKVRA_INSTALL_PREFIX`, and `TEKVRA_DOWNLOAD_PREFIX` (override the release base URL; supports `file://` for offline smoke tests, e.g. the mismatch-rejection test in `crates/tekvra-cli/tests/cli_spec.rs`).
+Environment knobs: `TEKVRA_VERSION` (tag, default `v0.1.0`), `TEKVRA_INSTALL_PREFIX`, `TEKVRA_FORCE_TARGET` (Windows target override), and `TEKVRA_DOWNLOAD_PREFIX` (override the release base URL; supports `file://` for offline smoke tests, e.g. the mismatch-rejection tests in `crates/tekvra-cli/tests/cli_spec.rs` — the POSIX test packages its fixture through `ci_verify_packaging.py --package-release` so installer/layout drift fails in CI, and a `#[cfg(windows)]` sibling smoke-tests `install.ps1`).
 
 ## 2. Tagged Multi-Target Release CD (`.github/workflows/release.yml`)
 
 Triggered on `v*` tags (e.g., `git tag v0.1.0 && git push origin v0.1.0`) or manually via `workflow_dispatch`:
 
-1. **`validate`**: Runs `python3 scripts/ci_verify_packaging.py --verify-tag "$TAG"` to enforce exact parity between the Git tag (`vX.Y.Z`) and `[workspace.package].version` in `Cargo.toml`, `#![forbid(unsafe_code)]`, and `Apache-2.0` attribution completeness (`LICENSE`, `NOTICE.md`, `THIRD_PARTY_LICENSES/`).
+1. **`validate`**: Resolves a working Python 3 interpreter (`python3` or `python`, probing `--version` so Windows Store alias stubs are rejected) and runs `ci_verify_packaging.py --verify-tag "$TAG"` to enforce exact parity between the Git tag (`vX.Y.Z`) and `[workspace.package].version` in `Cargo.toml`, `#![forbid(unsafe_code)]`, and `Apache-2.0` attribution completeness (`LICENSE`, `NOTICE.md`, `THIRD_PARTY_LICENSES/`).
 2. **`verify-ci`**: Reuses `./.github/workflows/ci.yml` on the exact release commit before compiling release artifacts.
 3. **`build`**: Compiles `--locked --profile release-lto` binaries across 5 targets, runs CLI smoke checks, bundles license/attribution files, and emits `.sha256` digests:
    - `x86_64-unknown-linux-gnu` (`.tar.gz`)
@@ -39,6 +39,8 @@ Triggered on `v*` tags (e.g., `git tag v0.1.0 && git push origin v0.1.0`) or man
    - `aarch64-apple-darwin` (`.tar.gz`)
    - `x86_64-pc-windows-msvc` (`.zip`)
 4. **`publish`**: Verifies `SHA256SUMS.txt` and publishes archives, checksums, and generated release notes to GitHub Releases with scoped `contents: write` permission.
+
+The `build` job resolves the same portable `python3`/`python` interpreter before invoking the packager: on `windows-latest` (Git Bash) the bare `python3` name resolves to the Microsoft Store alias stub, so both candidates are probed with `--version` and the first working interpreter wins.
 
 ## 3. Running Packaging & Workflow Checks Locally
 

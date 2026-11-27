@@ -1415,11 +1415,23 @@ async fn handle_auth_command(resolved: &ResolvedConfig, args: AuthArgs) -> Resul
 fn try_open_browser_quietly(url: &str) {
     #[cfg(target_os = "macos")]
     let launcher = "open";
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    let launcher = "rundll32";
+    #[cfg(not(any(target_os = "macos", windows)))]
     let launcher = "xdg-open";
 
-    let _ = std::process::Command::new(launcher)
-        .arg(url)
+    let mut command = std::process::Command::new(launcher);
+    #[cfg(windows)]
+    {
+        // rundll32 expects the DLL entry point as one argument:
+        // `rundll32 url.dll,FileProtocolHandler <url>`.
+        command.arg("url.dll,FileProtocolHandler").arg(url);
+    }
+    #[cfg(not(windows))]
+    {
+        command.arg(url);
+    }
+    let _ = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

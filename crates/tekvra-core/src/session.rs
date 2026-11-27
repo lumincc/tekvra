@@ -332,7 +332,11 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
             .map(|g| g.scope)
             .collect()
     };
-    let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+    // Windows has no HOME; fall back to USERPROFILE so the broad-grant
+    // safety confirmation tied to the home directory still applies there.
+    let home_dir = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
     let evaluator = Arc::new(Mutex::new(PermissionEvaluator::new(
         mode,
         canonical_ws.clone(),

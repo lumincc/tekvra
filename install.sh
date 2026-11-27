@@ -77,6 +77,14 @@ if [ "$actual" != "$expected" ]; then
 fi
 
 tar -xzf "${tmp_dir}/${archive}" -C "$tmp_dir"
+# Release archives produced by `scripts/ci_verify_packaging.py --package-release`
+# nest the payload under tekvra-<version>-<target>/ alongside LICENSE, NOTICE.md,
+# THIRD_PARTY_LICENSES/, and docs/. Fall back to a flat archive root for
+# hand-built fixtures that predate the nested layout.
+bundle_dir="${tmp_dir}/tekvra-${TEKVRA_VERSION}-${target}"
+if [ ! -f "${bundle_dir}/tekvra" ]; then
+  bundle_dir="${tmp_dir}"
+fi
 mkdir -p "${TEKVRA_INSTALL_PREFIX}/bin"
-install -m 0755 "${tmp_dir}/tekvra" "${TEKVRA_INSTALL_PREFIX}/bin/tekvra"
+install -m 0755 "${bundle_dir}/tekvra" "${TEKVRA_INSTALL_PREFIX}/bin/tekvra"
 echo "installed tekvra ${TEKVRA_VERSION} to ${TEKVRA_INSTALL_PREFIX}/bin/tekvra"

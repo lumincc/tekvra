@@ -15,7 +15,7 @@ Built on a unified `tokio` + `reqwest` (`rustls` + `aws-lc-rs`) async foundation
   - RTK-derived terminal `\r` decoding, ANSI stripping, and build/test output compression—with raw logs persisted on disk and searchable via `tool_output`.
   - Isolated Monty Python `code` interpreter (`monty`) paired with a **prompt-cache-stable MCP gateway** (`ConfiguredMcpGateway` over child-process `stdio` JSON-RPC 2.0 and HTTP JSON-RPC 2.0 `POST`) exposed via `mcp_list()` and `await mcp_call(...)` without mutating top-level LLM tool schemas.
 - **Consent-Driven Safety Without Kernel Sandboxes (`tekvra-tools::permissions`)**:
-  - `tree-sitter-bash` AST decomposition evaluates every subcommand across `&&`, `||`, `;`, `|`, subshells, `$()`, and redirections independently (`Once`-only fallback on dynamic `eval` / `bash -c "$VAR"`).
+  - `tree-sitter-bash` AST decomposition evaluates every subcommand across `&&`, `||`, `;`, `|`, subshells, `$()`, and redirections independently (`Once`-only fallback on dynamic `eval` / `bash -c "$VAR"`); native Windows PowerShell invocations (`pwsh` / `powershell -Command`) get the same per-statement treatment via a hand-written lexical decomposer (`tekvra_tools::powershell_syntax`) with case-insensitive read-only allowlisting (`Get-ChildItem`, `Select-String`, `git status`, …) and destructive script-block detection.
   - Explicit modes (`Plan`, `ReadOnly`, `Build`, `Auto`, `Yolo`) where `deny` rules in `permissions.toml` are **never** bypassed—even in `Yolo` mode or untrusted repositories.
   - Canonical folder trust boundary withholding `.tekvra/tekvra.toml`, `.tekvra/providers.toml`, `.env`, `.tekvra/init.lua`, and project `allow`/`ask` rules until trusted.
   - SSRF-safe `webfetch` blocking loopback, link-local/cloud metadata (`169.254.169.254`), and RFC1918/ULA addresses across DNS resolution and every redirect hop.
@@ -28,7 +28,7 @@ Built on a unified `tokio` + `reqwest` (`rustls` + `aws-lc-rs`) async foundation
   - Reverse token-budget compaction preserving recent turns and active `plan` state while summarizing older history, plus pruned large tool outputs recoverable via `tool_output`.
   - Depth-bounded (`max_depth = 1`), concurrency-capped subagent orchestration (`spawn_agent`, `send_input`, `wait_agent`, `close_agent`) and dedicated read-only `/review` (`tekvra review`).
 - **Fullscreen Alt-Screen TUI, Headless `exec`, Codex v2 `app-server` & `acp`**:
-  - `ratatui` + `crossterm` Alt-Screen TUI (`tekvra-tui`) with live streaming Markdown, `syntect` syntax highlighting, inline diff hunks, Raw/Filtered tool output toggle (`Ctrl-O`), interactive permission approval modal, UTF-8/CJK cursor-aware composer, `/queue` vs `/steer` mid-turn submission, slash commands (`/help`, `/model`, `/mode`, `/mcp`, `/review`, `/undo`, `/compact`), and opt-in Luau (`mlua` 0.11) custom commands (`experimental.lua_plugins = true`).
+  - `ratatui` + `crossterm` Alt-Screen TUI (`tekvra-tui`) with live streaming Markdown, `syntect` syntax highlighting, inline diff hunks, Raw/Filtered tool output toggle (`Ctrl-O`), interactive permission approval modal, UTF-8/CJK cursor-aware composer, `/queue` vs `/steer` mid-turn submission, slash commands (`/help`, `/model`, `/mode`, `/mcp`, `/review`, `/undo`, `/compact`), and opt-in Luau (`mlua` 0.12) custom commands (`experimental.lua_plugins = true`).
   - Non-interactive `tekvra exec` (`text`, `--json` JSONL events, `--output-schema`, `-o`).
   - Codex v2 bidirectional `tekvra app-server` (`stdio://` JSONL and `ws://IP:PORT` with loopback/bearer-token enforcement and bounded outbound backpressure) plus `tekvra acp`.
 
@@ -44,7 +44,7 @@ Built on a unified `tokio` + `reqwest` (`rustls` + `aws-lc-rs`) async foundation
 | `crates/tekvra-providers` | OpenAI Responses/Chat, Anthropic, Gemini streaming adapters, PKCE/device-code OAuth + refresh, `AccountPool` |
 | `crates/tekvra-tools` | Native file/patch/search/`tree-sitter` index tools, `tree-sitter-bash` permission & SSRF engine, `portable-pty`, RTK filter, Monty `code`, stdio/HTTP MCP client |
 | `crates/tekvra-core` | Turn loop, mid-turn `steer`/`queue`, reverse compaction, `/undo`, depth-bounded subagents, read-only code review |
-| `crates/tekvra-lua` | Strictly opt-in Luau 0.11 (`mlua`) sandboxed plugin host with memory & instruction quotas (`--no-plugins` bypass) |
+| `crates/tekvra-lua` | Strictly opt-in Luau 0.12 (`mlua`) sandboxed plugin host with memory & instruction quotas (`--no-plugins` bypass) |
 | `crates/tekvra-tui` | Fullscreen Alt-Screen `ratatui` interface, composer cursor editing, permission modal, slash commands |
 | `crates/tekvra-app-server` | Codex v2 JSON-RPC 2.0 server (`stdio://` & `ws://`) with bearer-token auth and backpressure |
 | `crates/tekvra-acp` | Agent Client Protocol (`acp`) stdio bridge |

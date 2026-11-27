@@ -1121,7 +1121,10 @@ fn installer_sh_verifies_sha256_and_rejects_mismatch() {
     let dist_versioned = dist.join("v0.1.0");
     std::fs::create_dir_all(&dist_versioned).expect("mkdir dist");
 
-    // Build a tiny release archive containing a fake `tekvra` binary.
+    // Package a real release bundle through ci_verify_packaging.py so the
+    // fixture mirrors the exact nested layout (`tekvra-<tag>-<target>/tekvra`)
+    // published by the release pipeline; any packaging layout drift fails here
+    // instead of silently breaking install.sh / install.ps1 for real users.
     let payload_dir = tmp.path().join("payload");
     std::fs::create_dir_all(&payload_dir).expect("mkdir payload");
     std::fs::write(payload_dir.join("tekvra"), "#!/bin/sh\necho FAKE_TEKVRA\n")
@@ -1142,34 +1145,36 @@ fn installer_sh_verifies_sha256_and_rejects_mismatch() {
         }
     );
     let archive_name = format!("tekvra-v0.1.0-{target}.tar.gz");
-    let archive = dist_versioned.join(&archive_name);
-    let tar = StdCommand::new("tar")
-        .args(["-czf"])
-        .arg(&archive)
-        .arg("-C")
-        .arg(&payload_dir)
-        .arg("tekvra")
+    let packager = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/ci_verify_packaging.py");
+    let python = find_python_interpreter()
+        .expect("python3 or python must be available to package the installer fixture");
+    let packaged = StdCommand::new(&python)
+        .args([
+            packager,
+            "--package-release",
+            "--version",
+            "v0.1.0",
+            "--target",
+            &target,
+            "--binary",
+        ])
+        .arg(payload_dir.join("tekvra"))
+        .arg("--out-dir")
+        .arg(&dist_versioned)
         .output()
-        .expect("tar");
-    assert!(tar.status.success(), "tar failed");
+        .expect("run ci_verify_packaging.py --package-release");
+    assert!(
+        packaged.status.success(),
+        "packaging fixture failed: {}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
 
-    // macOS ships `shasum -a 256` instead of GNU `sha256sum`.
-    let has_sha256sum = StdCommand::new("sha256sum")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let mut digest_cmd = StdCommand::new(if has_sha256sum { "sha256sum" } else { "shasum" });
-    if !has_sha256sum {
-        digest_cmd.args(["-a", "256"]);
-    }
-    let digest = digest_cmd.arg(&archive).output().expect("sha256");
-    let good_digest = String::from_utf8_lossy(&digest.stdout)
-        .split_whitespace()
-        .next()
-        .expect("digest")
-        .to_string();
-    let good_sums = format!("{good_digest}  {archive_name}\n");
+    // The packager emits `<digest>  <archive>` in a `<archive>.sha256` sidecar;
+    // the release publish job assembles SHA256SUMS.txt by concatenating those
+    // sidecars (`cat *.sha256 | sort -k2`), so mirror that content here.
+    let sums_line = std::fs::read_to_string(dist_versioned.join(format!("{archive_name}.sha256")))
+        .expect("read packager sha256 sidecar");
+    let good_sums = sums_line;
     let bad_sums = format!("{}  {archive_name}\n", "0".repeat(64));
 
     let installer = concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh");
@@ -1210,6 +1215,142 @@ fn installer_sh_verifies_sha256_and_rejects_mismatch() {
     let installed = prefix.join("bin").join("tekvra");
     assert!(installed.exists(), "binary must be installed");
     let run = StdCommand::new(&installed)
+        .output()
+        .expect("run installed binary");
+    assert!(String::from_utf8_lossy(&run.stdout).contains("FAKE_TEKVRA"));
+}
+
+/// Probes for a working Python 3 interpreter (`python3`, then `python`),
+/// rejecting Windows Store alias stubs that exit non-zero on `--version`.
+fn find_python_interpreter() -> Option<String> {
+    for candidate in ["python3", "python"] {
+        let works = std::process::Command::new(candidate)
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if works {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+#[test]
+// install.ps1 is a Windows PowerShell script (Invoke-WebRequest, Expand-Archive,
+// Get-FileHash); Unix distribution is served by install.sh.
+#[cfg(windows)]
+fn installer_ps1_verifies_sha256_and_installs_nested_bundle() {
+    use std::process::Command as StdCommand;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let dist = tmp.path().join("dist");
+    let prefix = tmp.path().join("prefix");
+    // Release layout: <DOWNLOAD_PREFIX>/<VERSION>/<assets>.
+    let dist_versioned = dist.join("v0.1.0");
+    std::fs::create_dir_all(&dist_versioned).expect("mkdir dist");
+
+    // Package a real release bundle through ci_verify_packaging.py so the
+    // fixture mirrors the exact nested layout
+    // (`tekvra-<tag>-<target>/tekvra.exe`) published by the release pipeline.
+    // The payload must be a valid PE so the installed binary stays executable;
+    // a copy of cmd.exe prints on demand without shipping any extra fixture.
+    let payload_dir = tmp.path().join("payload");
+    std::fs::create_dir_all(&payload_dir).expect("mkdir payload");
+    let payload_path = payload_dir.join("tekvra.exe");
+    let system_root =
+        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let cmd_exe = std::path::Path::new(&system_root)
+        .join("System32")
+        .join("cmd.exe");
+    std::fs::copy(&cmd_exe, &payload_path).expect("copy cmd.exe as fake binary");
+
+    // The packager fixture only builds the x86_64 archive, so on ARM64 hosts
+    // this exercises install.ps1's documented fall-back from aarch64 (probed,
+    // missing) to x86_64-pc-windows-msvc.
+    let target = "x86_64-pc-windows-msvc";
+    let archive_name = format!("tekvra-v0.1.0-{target}.zip");
+    let packager = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/ci_verify_packaging.py");
+    let python = find_python_interpreter()
+        .expect("python3 or python must be available to package the installer fixture");
+    let packaged = StdCommand::new(&python)
+        .args([
+            packager,
+            "--package-release",
+            "--version",
+            "v0.1.0",
+            "--target",
+            target,
+            "--binary",
+        ])
+        .arg(&payload_path)
+        .arg("--out-dir")
+        .arg(&dist_versioned)
+        .output()
+        .expect("run ci_verify_packaging.py --package-release");
+    assert!(
+        packaged.status.success(),
+        "packaging fixture failed: {}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    // Mirror the publish job's `cat *.sha256 | sort -k2 > SHA256SUMS.txt`.
+    let sums_line = std::fs::read_to_string(dist_versioned.join(format!("{archive_name}.sha256")))
+        .expect("read packager sha256 sidecar");
+    let good_sums = sums_line;
+    let bad_sums = format!("{}  {archive_name}\n", "0".repeat(64));
+
+    let installer = concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.ps1");
+    let download_prefix = format!("file://{}", dist.display());
+    // Prefer PowerShell 7; Windows PowerShell 5.1 works too because
+    // install.ps1 resolves file:// download prefixes locally.
+    let has_pwsh = StdCommand::new("pwsh")
+        .args(["-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    let shell = if has_pwsh { "pwsh" } else { "powershell" };
+    let mut installer_cmd = |sums: &str| {
+        std::fs::write(dist_versioned.join("SHA256SUMS.txt"), sums).expect("write SHA256SUMS.txt");
+        StdCommand::new(shell)
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", installer])
+            .env("TEKVRA_VERSION", "v0.1.0")
+            .env("TEKVRA_INSTALL_PREFIX", &prefix)
+            .env("TEKVRA_DOWNLOAD_PREFIX", &download_prefix)
+            .output()
+            .expect("run install.ps1")
+    };
+
+    // 1. Mismatched digest -> non-zero exit, nothing installed.
+    let out = installer_cmd(&bad_sums);
+    assert_ne!(out.status.code(), Some(0), "mismatched checksum must abort");
+    assert!(
+        !prefix.join("bin").join("tekvra.exe").exists(),
+        "no binary may be installed on mismatch"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("checksum mismatch"), "{stderr}");
+
+    // 2. Matching digest -> exit 0, nested-bundle binary installed and runnable.
+    let out = installer_cmd(&good_sums);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("installed tekvra"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let installed = prefix.join("bin").join("tekvra.exe");
+    let installed_bytes = std::fs::read(&installed).expect("read installed binary");
+    let payload_bytes = std::fs::read(&payload_path).expect("read payload binary");
+    assert_eq!(installed_bytes, payload_bytes, "installed binary must match the packaged payload");
+    let run = StdCommand::new(&installed)
+        .args(["/d", "/c", "echo", "FAKE_TEKVRA"])
         .output()
         .expect("run installed binary");
     assert!(String::from_utf8_lossy(&run.stdout).contains("FAKE_TEKVRA"));

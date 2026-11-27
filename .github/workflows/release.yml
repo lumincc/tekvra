@@ -37,6 +37,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Resolve portable Python 3 interpreter
+        run: |
+          PYTHON_BIN=""
+          for candidate in python3 python; do
+            if command -v "${candidate}" >/dev/null 2>&1 && "${candidate}" --version >/dev/null 2>&1; then
+              PYTHON_BIN="$(command -v "${candidate}")"
+              break
+            fi
+          done
+          if [ -z "${PYTHON_BIN}" ]; then
+            echo "no working Python 3 interpreter found (python3 or python)" >&2
+            exit 1
+          fi
+          echo "Using Python: ${PYTHON_BIN} ($("${PYTHON_BIN}" --version 2>&1))"
+          echo "PYTHON_BIN=${PYTHON_BIN}" >> "${GITHUB_ENV}"
       - name: Resolve release tag & verify Cargo.toml version parity
         id: meta
         run: |
@@ -45,7 +60,7 @@ jobs:
           else
             TAG="${GITHUB_REF_NAME}"
           fi
-          python3 scripts/ci_verify_packaging.py --verify-tag "${TAG}"
+          "${PYTHON_BIN}" scripts/ci_verify_packaging.py --verify-tag "${TAG}"
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
 
   verify-ci:
@@ -117,7 +132,21 @@ jobs:
             EXT=".exe"
           fi
           BIN="target/${{ matrix.target }}/release-lto/tekvra${EXT}"
-          python3 scripts/ci_verify_packaging.py \
+          # Windows Git Bash resolves `python3` to the Microsoft Store alias
+          # stub, which exits non-zero; probe both names and reject any
+          # candidate whose `--version` fails before invoking the packager.
+          PYTHON_BIN=""
+          for candidate in python3 python; do
+            if command -v "${candidate}" >/dev/null 2>&1 && "${candidate}" --version >/dev/null 2>&1; then
+              PYTHON_BIN="$(command -v "${candidate}")"
+              break
+            fi
+          done
+          if [ -z "${PYTHON_BIN}" ]; then
+            echo "no working Python 3 interpreter found (python3 or python)" >&2
+            exit 1
+          fi
+          "${PYTHON_BIN}" scripts/ci_verify_packaging.py \
             --package-release \
             --version "${{ needs.validate.outputs.tag }}" \
             --target "${{ matrix.target }}" \
