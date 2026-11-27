@@ -25,6 +25,19 @@ fn internal_session_and_tool_output_roundtrip() {
         serde_json::from_str(&encoded).expect("deserialize SessionCommand");
     assert_eq!(decoded, cmd);
 
+    // Legacy wire frames without `images` decode cleanly (additive field).
+    let legacy: SessionCommand =
+        serde_json::from_str(r#"{"command":"submit_input","prompt":"legacy","delivery":"next"}"#)
+            .expect("legacy SubmitInput frame");
+    assert_eq!(
+        legacy,
+        SessionCommand::SubmitInput {
+            prompt: "legacy".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        }
+    );
+
     let event = SessionEvent::ItemCompleted {
         thread_id: "thr_01".to_string(),
         turn_id: "turn_01".to_string(),
@@ -56,6 +69,68 @@ fn internal_session_and_tool_output_roundtrip() {
         cost_usd: 0.012,
     };
     assert!((usage.cache_hit_ratio() - 0.95).abs() < 1e-9);
+}
+
+#[test]
+fn compact_undo_and_multimodal_image_roundtrip() {
+    let compact = SessionCommand::Compact;
+    let encoded = serde_json::to_string(&compact).expect("serialize Compact");
+    assert_eq!(encoded, r#"{"command":"compact"}"#);
+    let decoded: SessionCommand = serde_json::from_str(&encoded).expect("deserialize Compact");
+    assert_eq!(decoded, SessionCommand::Compact);
+
+    let undo = SessionCommand::UndoLastTurn {
+        scope: tekvra_protocol::RevertScope::ConversationAndFiles,
+    };
+    let undo_val = serde_json::to_value(&undo).expect("to_value UndoLastTurn");
+    assert_eq!(undo_val["command"], "undo_last_turn");
+    let undo_back: SessionCommand =
+        serde_json::from_value(undo_val).expect("from_value UndoLastTurn");
+    assert_eq!(undo_back, undo);
+
+    let compaction_event = SessionEvent::CompactionCompleted {
+        thread_id: "thr_01".to_string(),
+        generation: 3,
+        before_tokens: 12_500,
+        after_tokens: 3_400,
+    };
+    let ev_val = serde_json::to_value(&compaction_event).expect("to_value CompactionCompleted");
+    assert_eq!(ev_val["event"], "compaction_completed");
+    let ev_back: SessionEvent =
+        serde_json::from_value(ev_val).expect("from_value CompactionCompleted");
+    assert_eq!(ev_back, compaction_event);
+
+    let multimodal = SessionCommand::SubmitInput {
+        prompt: "What is in this diagram?".to_string(),
+        delivery: InputDeliveryMode::Next,
+        images: vec![tekvra_protocol::InputImage {
+            media_type: "image/png".to_string(),
+            data_base64: "aGVsbG8=".to_string(),
+            source_path: Some("assets/diagram.png".to_string()),
+        }],
+    };
+    let mm_val = serde_json::to_value(&multimodal).expect("to_value multimodal SubmitInput");
+    assert_eq!(mm_val["images"][0]["media_type"], "image/png");
+    let mm_back: SessionCommand =
+        serde_json::from_value(mm_val).expect("from_value multimodal SubmitInput");
+    assert_eq!(mm_back, multimodal);
+
+    // Diff entries omit null `old_text`/`new_text` for wire compactness but round-trip values.
+    let diff = FileDiffEntry {
+        path: "a.txt".into(),
+        moved_from: None,
+        change_kind: FileChangeKind::Add,
+        unified_diff: String::new(),
+        old_text: None,
+        new_text: Some("body".to_string()),
+        additions: 1,
+        deletions: 0,
+    };
+    let diff_json = serde_json::to_value(&diff).expect("to_value diff");
+    assert!(diff_json.get("old_text").is_none());
+    assert_eq!(diff_json["new_text"], "body");
+    let diff_back: FileDiffEntry = serde_json::from_value(diff_json).expect("from_value diff");
+    assert_eq!(diff_back, diff);
 }
 
 #[test]

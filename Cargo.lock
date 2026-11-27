@@ -4047,8 +4047,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.23.1",
  "clap",
  "ignore",
+ "indexmap",
  "jsonschema",
  "serde",
  "serde_json",
@@ -4064,6 +4066,7 @@ dependencies = [
  "tekvra-tui",
  "tempfile",
  "tokio",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -4092,6 +4095,7 @@ name = "tekvra-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "jiff",
  "regex",
  "serde",
@@ -4228,6 +4232,7 @@ dependencies = [
 name = "tekvra-tui"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "crossterm",
  "futures",
  "pulldown-cmark",

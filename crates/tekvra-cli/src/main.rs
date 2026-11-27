@@ -406,6 +406,137 @@ async fn try_main() -> Result<()> {
         return handle_auth_command(&resolved, auth_args).await;
     }
 
+    // Local trust/mcp/completion/worktree operations short-circuit before plugin/MCP/session init.
+    if let Some(Commands::Trust(trust_args)) = &cli.command {
+        let action = match trust_args.action {
+            TrustSubAction::Status => TrustAction::Status,
+            TrustSubAction::Allow => TrustAction::Allow,
+            TrustSubAction::Revoke => TrustAction::Revoke,
+        };
+        return handle_trust_command(&ConfigPaths::from_env(), &resolved.cwd, action);
+    }
+    if let Some(Commands::Mcp(mcp_args)) = &cli.command {
+        let action = match &mcp_args.action {
+            McpSubAction::List => McpAction::List,
+            McpSubAction::Add {
+                name,
+                command,
+                command_args,
+                url,
+                bearer_env,
+                scope,
+            } => {
+                let scope = match scope.as_str() {
+                    "project" => ConfigScope::Project,
+                    "user" => ConfigScope::User,
+                    other => anyhow::bail!("invalid --scope `{other}`; expected project|user"),
+                };
+                McpAction::Add(McpAddSpec {
+                    name: name.clone(),
+                    command: command.clone(),
+                    command_args: command_args.clone(),
+                    url: url.clone(),
+                    bearer_env: bearer_env.clone(),
+                    scope,
+                })
+            }
+            McpSubAction::Remove { name } => McpAction::Remove { name: name.clone() },
+            McpSubAction::Test { name } => McpAction::Test { name: name.clone() },
+        };
+        return handle_mcp_command(&ConfigPaths::from_env(), &resolved, action).await;
+    }
+    if let Some(Commands::Completion(completion_args)) = &cli.command {
+        let script =
+            generate_completion(&Cli::command(), "tekvra", completion_args.shell.as_str())?;
+        print!("{script}");
+        return Ok(());
+    }
+    if let Some(Commands::Worktree(worktree_args)) = &cli.command {
+        match &worktree_args.action {
+            WorktreeSubAction::Create { name } => {
+                let outcome = ensure_worktree(&resolved.cwd, &resolved.paths.state_dir, name)?;
+                println!(
+                    "{} ({}) {}",
+                    outcome.path.display(),
+                    outcome.branch,
+                    if outcome.created { "created" } else { "reused" }
+                );
+            }
+            WorktreeSubAction::List => {
+                let slug = resolved
+                    .cwd
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| {
+                        let mut slug = s.to_ascii_lowercase();
+                        slug.retain(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                        slug
+                    })
+                    .unwrap_or_default();
+                let root = resolved.paths.state_dir.join("worktrees").join(&slug);
+                let mut entries: Vec<PathBuf> = if root.is_dir() {
+                    std::fs::read_dir(&root)
+                        .expect("read worktrees dir")
+                        .filter_map(std::result::Result::ok)
+                        .map(|e| e.path())
+                        .filter(|p| p.join(".git").exists())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let mut found = false;
+                entries.sort();
+                for path in entries {
+                    found = true;
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default();
+                    println!("{}\t{}\ttekvra/{name}", name, path.display());
+                }
+                if !found {
+                    println!("no managed worktrees for `{slug}`");
+                }
+            }
+            WorktreeSubAction::Remove { name } => {
+                let slug = resolved
+                    .cwd
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| {
+                        let mut slug = s.to_ascii_lowercase();
+                        slug.retain(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                        slug
+                    })
+                    .unwrap_or_default();
+                // Reject invalid names without any create side effect.
+                ensure_worktree_name(name)?;
+                let path = resolved
+                    .paths
+                    .state_dir
+                    .join("worktrees")
+                    .join(&slug)
+                    .join(name);
+                if !path.join(".git").exists() {
+                    bail!("worktree `{name}` does not exist");
+                }
+                let output = std::process::Command::new("git")
+                    .args(["-C", &resolved.cwd.display().to_string()])
+                    .args(["worktree", "remove", &path.display().to_string()])
+                    .output()
+                    .context("running `git worktree remove`")?;
+                if !output.status.success() {
+                    bail!(
+                        "`git worktree remove` failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                println!("removed worktree {} (tekvra/{name})", path.display());
+            }
+        }
+        return Ok(());
+    }
+
     // 1. Initialize opt-in Luau plugin host (`vm_initialized == false` by default and under `--no-plugins`!)
     let (plugin_host, plugin_report) = PluginHost::initialize(
         resolved.clone(),
@@ -438,6 +569,14 @@ async fn try_main() -> Result<()> {
     let mut registry = ProviderRegistry::new();
     registry.apply_custom_configs(&resolved.providers.providers);
     let router = ModelRouter::from_config(&resolved, registry.clone());
+    let available_models: Vec<(String, String)> = registry
+        .iter()
+        .flat_map(|def| {
+            def.featured_models
+                .iter()
+                .map(move |model| (format!("{}/{}", def.id, model), def.display_name.clone()))
+        })
+        .collect();
 
     let account_pool = build_account_pool(&resolved, &registry, cli.account.as_deref()).await?;
     let driver: Arc<dyn ProviderDriver> = Arc::new(HttpProviderDriver::new(account_pool));
@@ -753,6 +892,16 @@ async fn launch_interactive_tui(
         .into_iter()
         .map(|c| (c.name, c.description))
         .collect();
+    let discovered_skills: Vec<(String, String)> = tekvra_config::discover_skills(
+        &resolved.paths.global_config_dir,
+        resolved.paths.home_dir.as_deref(),
+        &resolved.cwd,
+    )
+    .into_iter()
+    .map(|s| (s.name, s.description))
+    .collect();
+    let trust_state_dir = resolved.paths.state_dir.clone();
+    let trust_cwd = resolved.cwd.clone();
 
     let host_for_reload = plugin_host.clone();
     let host_for_cmd = plugin_host;
@@ -774,6 +923,37 @@ async fn launch_interactive_tui(
         initial_records,
         workspace_files,
         extra_slash_commands,
+        discovered_skills,
+        available_models,
+        on_trust_command: Some(Box::new(move |action| {
+            let mut store =
+                tekvra_config::TrustStore::load(&trust_state_dir).map_err(|e| e.to_string())?;
+            let canonical = tekvra_config::canonicalize_or_clean(&trust_cwd);
+            match action {
+                tekvra_tui::TrustUiCommand::Status => {
+                    if store.is_trusted(&canonical) {
+                        Ok(format!("trusted: {}", canonical.display()))
+                    } else {
+                        Ok(format!(
+                            "not trusted: {} (`/trust allow` to grant)",
+                            canonical.display()
+                        ))
+                    }
+                }
+                tekvra_tui::TrustUiCommand::Allow => {
+                    store.grant_trust(&canonical).map_err(|e| e.to_string())?;
+                    Ok(format!("granted trust: {}", canonical.display()))
+                }
+                tekvra_tui::TrustUiCommand::Revoke => {
+                    let removed = store.revoke_trust(&canonical).map_err(|e| e.to_string())?;
+                    Ok(if removed {
+                        format!("revoked trust: {}", canonical.display())
+                    } else {
+                        format!("was not trusted: {}", canonical.display())
+                    })
+                }
+            }
+        })),
         on_reload_plugins: Some(Box::new(move || {
             let rep = host_for_reload.reload().map_err(|e| e.to_string())?;
             Ok(format!(

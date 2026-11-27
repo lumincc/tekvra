@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use tekvra_config::ResolvedConfig;
 use tekvra_core::{
     CompactionConfig, PluginToolExecutor, SessionBootstrap, SessionHandle, spawn_session,
@@ -14,6 +15,7 @@ use tekvra_protocol::{
     ApprovalResolution, GrantLifetime, InputDeliveryMode, PermissionMode, SessionCommand,
     SessionEvent,
 };
+use tekvra_protocol::{FileDiffEntry, ToolOutput};
 use tekvra_providers::{ModelRouter, ProviderDriver, ToolDefinition};
 use tekvra_storage::StateIndex;
 use tekvra_tools::McpGateway;
@@ -93,11 +95,34 @@ where
 
     let sessions: Arc<Mutex<BTreeMap<String, SessionHandle>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
+    // Server -> client `session/request_permission` requests awaiting the editor's response.
+    // Keyed by the serialized JSON-RPC id; each entry carries the owning session id so
+    // `session/cancel` can fail-closed everything pending for that session.
+    let pending_permissions: PendingPermissionsMap = Arc::new(Mutex::new(BTreeMap::new()));
+    let next_outbound_rpc_id = Arc::new(AtomicI64::new(100_000));
     let mut lines = BufReader::new(reader).lines();
 
     while let Some(line) = lines.next_line().await? {
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+        // A client *response* (has `id`, `result`/`error`, no `method`) resolves a pending
+        // bidirectional request instead of being treated as a new call.
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed)
+            && v.get("id").is_some()
+            && v.get("method").is_none()
+            && (v.get("result").is_some() || v.get("error").is_some())
+        {
+            let key =
+                serde_json::to_string(v.get("id").unwrap_or(&Value::Null)).unwrap_or_default();
+            if let Some((_sid, resp_tx)) = pending_permissions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key)
+            {
+                let _ = resp_tx.send(v.get("result").cloned().unwrap_or(Value::Null));
+            }
             continue;
         }
         let Ok(req) = serde_json::from_str::<JsonRpcRequest>(trimmed) else {
@@ -251,18 +276,52 @@ where
                                     text,
                                     tool_output,
                                     ..
-                                } => {
-                                    emit_acp_update(
-                                        &tx_clone,
-                                        &sid,
-                                        json!({
-                                            "sessionUpdate": "tool_call_update",
-                                            "toolCallId": item_id,
-                                            "status": "completed",
-                                            "rawOutput": text,
-                                        }),
-                                    );
-                                }
+                                } => match tool_output {
+                                    Some(ToolOutput::Diff { files, .. }) => {
+                                        for FileDiffEntry {
+                                            path,
+                                            change_kind,
+                                            old_text,
+                                            new_text,
+                                            ..
+                                        } in files
+                                        {
+                                            emit_acp_update(
+                                                &tx_clone,
+                                                &sid,
+                                                json!({
+                                                    "sessionUpdate": "tool_call_update",
+                                                    "toolCallId": item_id,
+                                                    "status": "completed",
+                                                    "kind": match change_kind {
+                                                        tekvra_protocol::FileChangeKind::Delete => "delete",
+                                                        _ => "edit",
+                                                    },
+                                                    "content": [{
+                                                        "type": "diff",
+                                                        "path": path.display().to_string(),
+                                                        "oldText": old_text,
+                                                        "newText": new_text,
+                                                    }],
+                                                    "rawOutput": &text,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                    Some(_) => {
+                                        emit_acp_update(
+                                            &tx_clone,
+                                            &sid,
+                                            json!({
+                                                "sessionUpdate": "tool_call_update",
+                                                "toolCallId": item_id,
+                                                "status": "completed",
+                                                "rawOutput": text,
+                                            }),
+                                        );
+                                    }
+                                    None => {}
+                                },
                                 SessionEvent::ApprovalRequested { prompt, .. } => {
                                     // Bidirectional `session/request_permission` (ACP 3.1):
                                     // ask the editor, fail closed on EOF/cancel or an
@@ -518,5 +577,108 @@ mod tests {
             }
         }
         assert!(saw_chunk);
+    }
+
+    #[test]
+    fn acp_permission_results_map_to_core_resolutions() {
+        let allow_once = map_acp_permission_result(&json!({
+            "outcome": { "outcome": "selected", "optionId": "allow_once" }
+        }));
+        assert_eq!(
+            allow_once,
+            ApprovalResolution::Approve {
+                scope: None,
+                lifetime: GrantLifetime::Once,
+                confirmed_broad: false,
+            }
+        );
+
+        let allow_always = map_acp_permission_result(&json!({
+            "outcome": { "outcome": "selected", "optionId": "allow_always" }
+        }));
+        assert!(matches!(
+            allow_always,
+            ApprovalResolution::Approve {
+                lifetime: GrantLifetime::Project,
+                ..
+            }
+        ));
+
+        let reject = map_acp_permission_result(&json!({
+            "outcome": { "outcome": "selected", "optionId": "reject_once" }
+        }));
+        assert!(matches!(reject, ApprovalResolution::Deny { .. }));
+
+        // Malformed / empty results fail closed.
+        let malformed = map_acp_permission_result(&json!({ "unexpected": true }));
+        assert!(matches!(malformed, ApprovalResolution::Deny { .. }));
+        let empty = map_acp_permission_result(&json!({}));
+        assert!(matches!(empty, ApprovalResolution::Deny { .. }));
+    }
+
+    #[tokio::test]
+    async fn acp_unknown_client_response_frames_do_not_break_the_stream() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        let cfg_dir = tmp.path().join("cfg");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir cfg");
+        std::fs::create_dir_all(&state_dir).expect("mkdir state");
+
+        let resolved = load_config(
+            ConfigPaths {
+                global_config_dir: cfg_dir,
+                state_dir,
+                home_dir: Some(ws.clone()),
+            },
+            &ws,
+            &CliConfigOverrides::default(),
+        )
+        .expect("config");
+        let registry = ProviderRegistry::new();
+        let router = ModelRouter::from_config(&resolved, registry);
+        let state_index = Arc::new(Mutex::new(
+            StateIndex::open(&tmp.path().join("state")).expect("state db"),
+        ));
+
+        let deps = AcpServerDeps {
+            config: resolved,
+            router,
+            driver: Arc::new(MockAcpDriver),
+            state_index,
+            mcp_gateway: None,
+            plugin_executor: None,
+            extra_plugin_tools: Vec::new(),
+        };
+
+        let (cli, srv) = tokio::io::duplex(32 * 1024);
+        let (srv_r, srv_w) = tokio::io::split(srv);
+        tokio::spawn(async move {
+            let _ = serve_acp_stream(srv_r, srv_w, deps).await;
+        });
+
+        let (cli_r, mut cli_w) = tokio::io::split(cli);
+        let mut lines = BufReader::new(cli_r).lines();
+
+        cli_w
+            .write_all(b"{\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .expect("init");
+        let _ = lines.next_line().await.expect("io").expect("line");
+
+        // A stray response frame with no pending bidirectional request must be swallowed
+        // (routed to the pending-permission map, no reply, stream stays alive).
+        cli_w
+            .write_all(b"{\"id\":4242,\"result\":{\"outcome\":{\"optionId\":\"allow_once\"}}}\n")
+            .await
+            .expect("stray response");
+        cli_w
+            .write_all(b"{\"id\":2,\"method\":\"session/new\",\"params\":{}}\n")
+            .await
+            .expect("new");
+        let new_v: Value =
+            serde_json::from_str(&lines.next_line().await.expect("io").expect("l")).expect("j");
+        assert!(new_v["result"]["sessionId"].is_string());
     }
 }

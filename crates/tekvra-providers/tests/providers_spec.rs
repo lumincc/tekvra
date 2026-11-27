@@ -167,6 +167,7 @@ async fn stateless_openai_responses_replays_encrypted_reasoning_and_preserves_ca
         base_url: format!("http://{addr}/v1"),
         default_protocol: WireProtocol::OpenAiResponses,
         default_api_key_env: None,
+        supports_vision_override: None,
         headers: BTreeMap::new(),
         featured_models: Vec::new(),
     };
@@ -324,6 +325,7 @@ async fn multi_account_quota_exhaustion_triggers_automatic_failover_unless_pinne
         base_url: format!("http://{addr}/v1"),
         default_protocol: WireProtocol::OpenAiResponses,
         default_api_key_env: None,
+        supports_vision_override: None,
         headers: BTreeMap::new(),
         featured_models: Vec::new(),
     };
@@ -615,4 +617,261 @@ async fn device_code_polling_through_pending_and_slow_down_plus_refresh_token_re
         "refresh_token must be preserved"
     );
     assert_eq!(renewed.expires_at_epoch_secs, Some(2_000_007_200));
+}
+
+fn multimodal_request() -> CompletionRequest {
+    CompletionRequest {
+        conversation_id: "conv_vision_01".to_string(),
+        messages: vec![
+            ProviderMessage::developer_cached("You inspect screenshots."),
+            ProviderMessage {
+                role: MessageRole::User,
+                parts: vec![
+                    MessagePart::Text {
+                        text: "Identify the misaligned button".to_string(),
+                        cache_breakpoint: false,
+                    },
+                    MessagePart::Image {
+                        media_type: "image/png".to_string(),
+                        data_base64: "aGVsbG8=".to_string(),
+                        source_path: Some("ui-bug.png".to_string()),
+                    },
+                ],
+            },
+        ],
+        tools: Vec::new(),
+        reasoning_effort: None,
+        output_schema: None,
+    }
+}
+
+#[test]
+fn multimodal_image_wire_encoding_across_all_four_protocols() {
+    let model = tekvra_providers::ModelCapabilities::resolve("openai", "gpt-5.4-codex", None);
+    assert!(model.supports_vision, "codex models must be vision-capable");
+
+    // 1. OpenAI /responses -> input_image data URL inside user message content
+    let responses_body =
+        build_openai_responses_payload(&model, &multimodal_request()).expect("responses payload");
+    let user_items: Vec<&Value> = responses_body["input"]
+        .as_array()
+        .expect("input array")
+        .iter()
+        .filter(|i| i["role"] == "user")
+        .collect();
+    assert_eq!(user_items.len(), 1);
+    assert_eq!(
+        user_items[0]["content"][1]["type"],
+        json!("input_image"),
+        "image must ride alongside the prompt text block"
+    );
+    assert_eq!(
+        user_items[0]["content"][1]["image_url"],
+        json!("data:image/png;base64,aGVsbG8=")
+    );
+    assert_eq!(user_items[0]["content"][0]["type"], json!("input_text"));
+
+    // 2. OpenAI /chat/completions -> array content with image_url block
+    let chat_body = build_chat_completions_payload(&model, &multimodal_request());
+    let chat_user = chat_body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["role"] == "user")
+        .expect("chat user message");
+    assert_eq!(chat_user["content"][0]["type"], json!("text"));
+    assert_eq!(
+        chat_user["content"][1]["image_url"]["url"],
+        json!("data:image/png;base64,aGVsbG8=")
+    );
+
+    // 3. Anthropic /v1/messages -> base64 image source block
+    let anthropic_body = build_anthropic_messages_payload(&model, &multimodal_request());
+    let anthropic_user = anthropic_body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["role"] == "user")
+        .expect("anthropic user message");
+    assert_eq!(anthropic_user["content"][1]["type"], json!("image"));
+    assert_eq!(
+        anthropic_user["content"][1]["source"],
+        json!({ "type": "base64", "media_type": "image/png", "data": "aGVsbG8=" })
+    );
+
+    // 4. Native Gemini -> inlineData mimeType/data block
+    let gemini_model =
+        tekvra_providers::ModelCapabilities::resolve("gemini", "gemini-2.5-pro", None);
+    assert!(gemini_model.supports_vision);
+    let gemini_body = build_gemini_payload(&gemini_model, &multimodal_request());
+    assert_eq!(
+        gemini_body["contents"][0]["parts"][1]["inlineData"],
+        json!({ "mimeType": "image/png", "data": "aGVsbG8=" })
+    );
+    assert_eq!(
+        gemini_body["contents"][0]["parts"][0]["text"],
+        json!("Identify the misaligned button")
+    );
+    assert_eq!(
+        gemini_body["systemInstruction"]["parts"][0]["text"],
+        json!("You inspect screenshots.")
+    );
+
+    // Gemini tool mapping: assistant functionCall + user functionResponse round-trips by name
+    let gemini_tools_req = CompletionRequest {
+        conversation_id: "conv_vision_tools".to_string(),
+        messages: vec![
+            ProviderMessage::developer_cached("Use tools."),
+            ProviderMessage {
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::ToolCall {
+                    call_id: "call_read_1".to_string(),
+                    name: "file_read".to_string(),
+                    arguments_json: r#"{"path":"Cargo.toml"}"#.to_string(),
+                }],
+            },
+            ProviderMessage {
+                role: MessageRole::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    call_id: "call_read_1".to_string(),
+                    output: "[workspace]".to_string(),
+                    is_error: false,
+                }],
+            },
+        ],
+        tools: vec![ToolDefinition {
+            name: "file_read".to_string(),
+            description: "Read file".to_string(),
+            parameters: json!({"type": "object"}),
+        }],
+        reasoning_effort: None,
+        output_schema: None,
+    };
+    let tools_body = build_gemini_payload(&gemini_model, &gemini_tools_req);
+    // The developer message lands in `systemInstruction`, so contents[0] is the assistant
+    // functionCall and contents[1] the user functionResponse.
+    assert_eq!(
+        tools_body["contents"][0]["parts"][0]["functionCall"]["name"],
+        json!("file_read")
+    );
+    assert_eq!(
+        tools_body["contents"][1]["parts"][0]["functionResponse"]["name"],
+        json!("file_read")
+    );
+    assert!(
+        tools_body["tools"][0]["functionDeclarations"]
+            .as_array()
+            .is_some()
+    );
+
+    // Parsing a chunked `streamGenerateContent` JSON array response
+    let gemini_raw = json!([
+        {
+            "candidates": [{ "content": { "parts": [{ "text": "The button " }] } }],
+            "usageMetadata": { "promptTokenCount": 300, "cachedContentTokenCount": 100, "candidatesTokenCount": 12 }
+        },
+        {
+            "candidates": [{ "content": { "parts": [{ "text": "is misaligned." }] } }],
+            "usageMetadata": { "promptTokenCount": 300, "cachedContentTokenCount": 100, "candidatesTokenCount": 30, "thoughtsTokenCount": 5 }
+        }
+    ])
+    .to_string();
+    let parsed = tekvra_providers::parse_gemini_body(&gemini_raw, &gemini_model, "mock")
+        .expect("parse gemini");
+    // Each streamed candidate chunk becomes its own assistant text part in order.
+    assert_eq!(
+        tekvra_providers::MessagePart::Text {
+            text: "The button ".to_string(),
+            cache_breakpoint: false,
+        },
+        parsed.assistant_message.parts[0],
+    );
+    assert_eq!(
+        tekvra_providers::MessagePart::Text {
+            text: "is misaligned.".to_string(),
+            cache_breakpoint: false,
+        },
+        parsed.assistant_message.parts[1],
+    );
+    assert_eq!(parsed.usage.input_tokens, 300);
+    assert_eq!(parsed.usage.cached_input_tokens, 100);
+    assert_eq!(parsed.usage.output_tokens, 30);
+    assert_eq!(parsed.usage.reasoning_tokens, 5);
+    assert!(parsed.usage.cost_usd > 0.0);
+
+    // Text-only chat-completions requests must keep plain string `content` for local servers.
+    let text_only = CompletionRequest {
+        conversation_id: "conv_plain".to_string(),
+        messages: vec![ProviderMessage::user_text("ping")],
+        tools: Vec::new(),
+        reasoning_effort: None,
+        output_schema: None,
+    };
+    let plain_body = build_chat_completions_payload(&model, &text_only);
+    assert_eq!(plain_body["messages"][0]["content"], json!("ping"));
+}
+
+#[tokio::test]
+async fn non_vision_model_rejects_image_locally_before_network_io() {
+    // Model whose heuristics yield `supports_vision == false`.
+    let model = tekvra_providers::ModelCapabilities::resolve("openai", "gpt-3.5-turbo", None);
+    assert!(!model.supports_vision);
+
+    let driver = HttpProviderDriver::new(AccountPool::new(0.01));
+    let provider = ProviderDefinition {
+        id: "openai".to_string(),
+        display_name: "OpenAI".to_string(),
+        base_url: "http://127.0.0.1:9/never-listen".to_string(),
+        default_protocol: WireProtocol::OpenAiResponses,
+        default_api_key_env: None,
+        supports_vision_override: None,
+        headers: BTreeMap::new(),
+        featured_models: Vec::new(),
+    };
+    let err = driver
+        .complete(&provider, &model, &multimodal_request())
+        .await
+        .expect_err("image on non-vision model must be rejected");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("does not support image input"),
+        "unexpected error: {rendered}"
+    );
+    if let tekvra_providers::ProviderError::UnsupportedModality { model, modality } = err {
+        assert_eq!(model, "openai/gpt-3.5-turbo");
+        assert_eq!(modality, "image");
+    } else {
+        panic!("expected UnsupportedModality, got: {err}");
+    }
+}
+
+#[test]
+fn providers_toml_vision_override_applies_to_resolved_models() {
+    use indexmap::IndexMap;
+    use tekvra_config::{ProviderAccountConfig, ProviderEntryConfig};
+
+    let mut providers = IndexMap::new();
+    providers.insert(
+        "ollama".to_string(),
+        ProviderEntryConfig {
+            api_key_env: None,
+            supports_vision: Some(true),
+            accounts: Vec::<ProviderAccountConfig>::new(),
+            ..Default::default()
+        },
+    );
+    let mut registry = ProviderRegistry::new();
+    registry.apply_custom_configs(&providers);
+
+    let (_, caps) = registry
+        .resolve_model_spec("ollama/qwen3-coder:30b")
+        .expect("resolve ollama model");
+    assert!(
+        caps.supports_vision,
+        "providers.toml `supports_vision = true` must override per-model heuristics"
+    );
+    let (def, _) = registry
+        .resolve_model_spec("ollama/qwen3-coder:30b")
+        .expect("def");
+    assert_eq!(def.supports_vision_override, Some(true));
 }

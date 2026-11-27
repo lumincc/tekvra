@@ -1,0 +1,661 @@
+//! Implementations behind the `tekvra trust|mcp|completion|worktree` subcommands and the
+//! shared `-i/--image` attachment loader.
+//!
+//! These operations intentionally short-circuit before plugin / MCP / session initialization
+//! (mirroring `tekvra auth`), so they stay fast, offline, and safe to run from shell scripts.
+
+use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
+
+use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use clap::Command as ClapCommand;
+use tekvra_config::{
+    ConfigPaths, McpServerConfig, ResolvedConfig, TrustStore, canonicalize_or_clean,
+};
+use tekvra_protocol::InputImage;
+use tekvra_tools::{ConfiguredMcpGateway, McpGateway};
+
+/// Maximum accepted image attachment size per file (10 MiB).
+pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// trust
+// ---------------------------------------------------------------------------
+
+/// Folder-trust subcommand action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustAction {
+    /// Print whether the workspace root is trusted.
+    Status,
+    /// Grant trust for the workspace root.
+    Allow,
+    /// Revoke trust for the workspace root.
+    Revoke,
+}
+
+/// Runs `tekvra trust <status|allow|revoke>` against the canonical trust store.
+///
+/// # Errors
+/// Returns an error when the trust store cannot be loaded or updated.
+pub fn handle_trust_command(paths: &ConfigPaths, cwd: &Path, action: TrustAction) -> Result<()> {
+    let mut store = TrustStore::load(&paths.state_dir).context("loading trust store")?;
+    let canonical = canonicalize_or_clean(cwd);
+    match action {
+        TrustAction::Status => {
+            if store.is_trusted(&canonical) {
+                println!("trusted: {}", canonical.display());
+            } else {
+                println!("not trusted: {}", canonical.display());
+                println!("run `tekvra trust allow` to grant folder trust");
+            }
+        }
+        TrustAction::Allow => {
+            store.grant_trust(&canonical)?;
+            println!("granted trust: {}", canonical.display());
+        }
+        TrustAction::Revoke => {
+            if store.revoke_trust(&canonical)? {
+                println!("revoked trust: {}", canonical.display());
+            } else {
+                println!("was not trusted: {}", canonical.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// mcp
+// ---------------------------------------------------------------------------
+
+/// Scope of the `tekvra.toml` file mutated by `tekvra mcp add|remove`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigScope {
+    /// `<workspace>/tekvra.toml` (the default).
+    Project,
+    /// `<global_config_dir>/tekvra.toml`.
+    User,
+}
+
+/// Arguments for `tekvra mcp add <NAME>`.
+#[derive(Debug, Clone)]
+pub struct McpAddSpec {
+    /// Server registry key under `[mcp_servers.<NAME>]`.
+    pub name: String,
+    /// Stdio executable (mutually exclusive with `url`).
+    pub command: Option<String>,
+    /// Stdio argument vector (`--` trailing args).
+    pub command_args: Vec<String>,
+    /// HTTP/SSE endpoint URL (mutually exclusive with `command`).
+    pub url: Option<String>,
+    /// Environment variable holding the Bearer token for HTTP servers.
+    pub bearer_env: Option<String>,
+    /// Which `tekvra.toml` file to edit.
+    pub scope: ConfigScope,
+}
+
+/// Runs `tekvra mcp <list|add|remove|test>` against merged configuration.
+///
+/// `add`/`remove` edit `tekvra.toml` via `toml_edit` so unrelated comments and
+/// formatting survive the mutation.
+///
+/// # Errors
+/// Returns an error on invalid arguments, unparsable TOML, or handshake failure in `test`.
+pub async fn handle_mcp_command(
+    paths: &ConfigPaths,
+    resolved: &ResolvedConfig,
+    action: McpAction,
+) -> Result<()> {
+    match action {
+        McpAction::List => {
+            if resolved.settings.mcp_servers.is_empty() {
+                println!("no MCP servers configured");
+                return Ok(());
+            }
+            for (name, cfg) in &resolved.settings.mcp_servers {
+                let kind = if cfg.url.is_some() { "http" } else { "stdio" };
+                let state = if cfg.enabled { "enabled" } else { "disabled" };
+                println!("{name}\t{kind}\t{state}");
+            }
+            Ok(())
+        }
+        McpAction::Add(spec) => mcp_add(paths, resolved, spec),
+        McpAction::Remove { name } => mcp_remove(paths, resolved, &name),
+        McpAction::Test { name } => mcp_test(resolved, &name).await,
+    }
+}
+
+/// Selected `tekvra mcp` subcommand.
+#[derive(Debug, Clone)]
+pub enum McpAction {
+    /// List configured servers.
+    List,
+    /// Add or overwrite a server entry.
+    Add(McpAddSpec),
+    /// Remove a server entry.
+    Remove {
+        /// Registry key to remove.
+        name: String,
+    },
+    /// Perform a one-shot handshake and list advertised tools.
+    Test {
+        /// Registry key to test.
+        name: String,
+    },
+}
+
+fn project_toml_path(resolved: &ResolvedConfig) -> PathBuf {
+    // The config loader reads project overrides from `<git_root>/.tekvra/tekvra.toml`.
+    resolved.cwd.join(".tekvra").join("tekvra.toml")
+}
+
+fn load_toml_document(path: &Path) -> Result<toml_edit::DocumentMut> {
+    if !path.exists() {
+        return Ok(toml_edit::DocumentMut::new());
+    }
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    raw.parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parsing {}", path.display()))
+}
+
+fn mcp_add(paths: &ConfigPaths, resolved: &ResolvedConfig, spec: McpAddSpec) -> Result<()> {
+    if spec.command.is_some() == spec.url.is_some() {
+        bail!("pass exactly one of `--command` (stdio) or `--url` (http)");
+    }
+    if spec.name.is_empty()
+        || !spec
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("invalid MCP server name `{}`", spec.name);
+    }
+
+    let path = match spec.scope {
+        ConfigScope::Project => project_toml_path(resolved),
+        ConfigScope::User => paths.global_config_dir.join("tekvra.toml"),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut doc = load_toml_document(&path)?;
+
+    let servers = doc
+        .as_table_mut()
+        .entry("mcp_servers")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .context("`mcp_servers` must be a TOML table")?;
+    let mut entry = toml_edit::Table::new();
+    entry["enabled"] = toml_edit::value(true);
+    if let Some(cmd) = &spec.command {
+        entry["command"] = toml_edit::value(cmd.as_str());
+        if !spec.command_args.is_empty() {
+            let arr = toml_edit::Array::from_iter(spec.command_args.iter().map(String::as_str));
+            entry["args"] = toml_edit::value(arr);
+        }
+    }
+    if let Some(url) = &spec.url {
+        entry["url"] = toml_edit::value(url.as_str());
+    }
+    if let Some(env_name) = &spec.bearer_env {
+        entry["bearer_token_env_var"] = toml_edit::value(env_name.as_str());
+    }
+    servers.insert(&spec.name, toml_edit::Item::Table(entry));
+
+    std::fs::write(&path, doc.to_string())
+        .with_context(|| format!("writing {}", path.display()))?;
+    println!("wrote [mcp_servers.{}] to {}", spec.name, path.display());
+    Ok(())
+}
+
+fn mcp_remove(paths: &ConfigPaths, resolved: &ResolvedConfig, name: &str) -> Result<()> {
+    // Remove from the scope that actually defines the entry (project preferred).
+    let candidates = [
+        (ConfigScope::Project, project_toml_path(resolved)),
+        (
+            ConfigScope::User,
+            paths.global_config_dir.join("tekvra.toml"),
+        ),
+    ];
+    for (scope, path) in candidates {
+        if !path.exists() {
+            continue;
+        }
+        let mut doc = load_toml_document(&path)?;
+        let removed = doc
+            .as_table_mut()
+            .get_mut("mcp_servers")
+            .and_then(|item| item.as_table_mut())
+            .and_then(|t| t.remove(name))
+            .is_some();
+        if removed {
+            std::fs::write(&path, doc.to_string())
+                .with_context(|| format!("writing {}", path.display()))?;
+            println!(
+                "removed [mcp_servers.{name}] from {} config",
+                match scope {
+                    ConfigScope::Project => "project",
+                    ConfigScope::User => "user",
+                }
+            );
+            return Ok(());
+        }
+    }
+    bail!("MCP server `{name}` is not defined in project or user config");
+}
+
+async fn mcp_test(resolved: &ResolvedConfig, name: &str) -> Result<()> {
+    let Some(cfg) = resolved.settings.mcp_servers.get(name) else {
+        bail!("MCP server `{name}` is not configured");
+    };
+    let mut single: indexmap::IndexMap<String, McpServerConfig> = indexmap::IndexMap::new();
+    single.insert(name.to_string(), cfg.clone());
+    let (gw, report) =
+        ConfiguredMcpGateway::connect_all(&single, &resolved.cwd, &resolved.settings.agent).await;
+    for warn in &report.warnings {
+        eprintln!("warning: {warn}");
+    }
+    let tools = gw.list_tools();
+    if tools.is_empty() {
+        println!("{name}: connected, 0 tools advertised");
+        return Ok(());
+    }
+    println!("{name}: connected, {} tool(s):", tools.len());
+    for tool in tools {
+        println!("  {}/{}", tool.server, tool.tool);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// completion
+// ---------------------------------------------------------------------------
+
+/// Renders a static completion script for `program` from its clap [`ClapCommand`] tree.
+///
+/// Pure Rust (no `clap_complete`): traverses subcommands/arguments once at runtime.
+///
+/// # Errors
+/// Returns an error for an unsupported shell name.
+pub fn generate_completion(cmd: &ClapCommand, program: &str, shell: &str) -> Result<String> {
+    let tree = collect_command_tree(cmd);
+    let script = match shell {
+        "bash" => render_bash(&tree, program),
+        "zsh" => render_zsh(&tree, program),
+        "fish" => render_fish(&tree, program),
+        "powershell" => render_powershell(&tree, program),
+        other => bail!("unsupported shell `{other}`; expected bash|zsh|fish|powershell"),
+    };
+    Ok(script)
+}
+
+/// One node of the flattened clap command tree.
+#[derive(Debug, Clone)]
+struct CmdNode {
+    /// Subcommand path from the root (`""` for the root itself).
+    path: String,
+    /// Short help text.
+    about: String,
+    /// `--long` flag names.
+    longs: Vec<String>,
+    /// Immediate subcommand names.
+    subs: Vec<String>,
+}
+
+fn collect_command_tree(root: &ClapCommand) -> Vec<CmdNode> {
+    let mut out = Vec::new();
+    fn walk(cmd: &ClapCommand, prefix: &str, out: &mut Vec<CmdNode>) {
+        let mut longs: Vec<String> = cmd
+            .get_arguments()
+            .filter_map(|a| a.get_long().map(str::to_string))
+            .collect();
+        longs.sort();
+        longs.dedup();
+        let subs: Vec<String> = cmd
+            .get_subcommands()
+            .map(|sc| sc.get_name().to_string())
+            .collect();
+        let path = if prefix.is_empty() {
+            String::new()
+        } else {
+            prefix.to_string()
+        };
+        out.push(CmdNode {
+            path,
+            about: cmd.get_about().unwrap_or_default().to_string(),
+            longs,
+            subs,
+        });
+        for sc in cmd.get_subcommands() {
+            let child_prefix = if prefix.is_empty() {
+                sc.get_name().to_string()
+            } else {
+                format!("{prefix} {}", sc.get_name())
+            };
+            walk(sc, &child_prefix, out);
+        }
+    }
+    walk(root, "", &mut out);
+    out
+}
+
+fn find<'a>(tree: &'a [CmdNode], path: &str) -> Option<&'a CmdNode> {
+    tree.iter().find(|n| n.path == path)
+}
+
+fn opts_literal(node: &CmdNode, include_subs: bool) -> String {
+    let mut parts: Vec<String> = node.longs.iter().map(|l| format!("--{l}")).collect();
+    if include_subs {
+        parts.extend(node.subs.iter().cloned());
+    }
+    parts.join(" ")
+}
+
+fn render_bash(tree: &[CmdNode], program: &str) -> String {
+    let root = find(tree, "").expect("root node");
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# bash completion for {program} (generated by `tekvra completion bash`)\n"
+    ));
+    out.push_str(&format!("_{program}() {{\n"));
+    out.push_str("    local cur sub opts\n");
+    out.push_str("    cur=\"${{COMP_WORDS[COMP_CWORD]}}\"\n");
+    out.push_str("    if [ \"$COMP_CWORD\" -eq 1 ]; then\n");
+    out.push_str(&format!(
+        "        COMPREPLY=( $(compgen -W \"{}\" -- \"$cur\") )\n",
+        opts_literal(root, true)
+    ));
+    out.push_str("        return 0\n");
+    out.push_str("    fi\n");
+    out.push_str("    sub=\"${COMP_WORDS[1]}\"\n");
+    out.push_str("    case \"$sub\" in\n");
+    for node in tree.iter().skip(1) {
+        let key = node.path.split(' ').next_back().unwrap_or_default();
+        out.push_str(&format!(
+            "        {key}) opts=\"{}\" ;;\n",
+            opts_literal(node, true)
+        ));
+    }
+    out.push_str("        *) opts=\"\" ;;\n");
+    out.push_str("    esac\n");
+    out.push_str("    COMPREPLY=( $(compgen -W \"$opts\" -- \"$cur\") )\n");
+    out.push_str("    return 0\n");
+    out.push_str("}\n");
+    out.push_str(&format!("complete -F _{program} {program}\n"));
+    out
+}
+
+fn render_zsh(tree: &[CmdNode], program: &str) -> String {
+    let root = find(tree, "").expect("root node");
+    let mut out = String::new();
+    out.push_str(&format!("#compdef {program}\n"));
+    out.push_str(&format!(
+        "# zsh completion for {program} (generated by `tekvra completion zsh`)\n"
+    ));
+    out.push_str(&format!("_{program}() {{\n"));
+    out.push_str("    local -a cmds\n");
+    out.push_str("    cmds=(\n");
+    for name in &root.subs {
+        let about = find(tree, name).map_or(String::new(), |n| n.about.replace('\'', ""));
+        out.push_str(&format!("        '{name}:{about}'\n"));
+    }
+    out.push_str("    )\n");
+    out.push_str("    _arguments -C \\\n");
+    out.push_str("        '1: :->cmds' \\\n");
+    out.push_str("        '*:: :->args'\n");
+    out.push_str("    case $state in\n");
+    out.push_str("        cmds) _describe 'command' cmds ;;\n");
+    out.push_str("        args)\n");
+    out.push_str("            case $line[1] in\n");
+    for node in tree.iter().skip(1) {
+        let key = node.path.split(' ').next_back().unwrap_or_default();
+        out.push_str(&format!("                {key}) _arguments \\\n"));
+        for (i, long) in node.longs.iter().enumerate() {
+            let about = escape_zsh(&node.about);
+            let continuation = if i + 1 == node.longs.len() { "" } else { " \\" };
+            out.push_str(&format!(
+                "                    '--{long}[{about}]'{continuation}\n"
+            ));
+        }
+        if node.longs.is_empty() {
+            out.push_str("                    '(*): :_files'\n");
+        }
+        out.push_str("                    ;;\n");
+    }
+    out.push_str("            esac ;;\n");
+    out.push_str("    esac\n");
+    out.push_str("}\n");
+    out.push_str(&format!("_{program} \"$@\"\n"));
+    out
+}
+
+fn escape_zsh(text: &str) -> String {
+    text.replace('[', "\\[").replace(']', "\\]")
+}
+
+fn render_fish(tree: &[CmdNode], program: &str) -> String {
+    let root = find(tree, "").expect("root node");
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# fish completion for {program} (generated by `tekvra completion fish`)\n"
+    ));
+    out.push_str(&format!(
+        "complete -c {program} -n '__fish_use_subcommand' -a '{}' -d '{}'\n",
+        root.subs.join(" "),
+        escape_fish(&root.about)
+    ));
+    for node in tree.iter().skip(1) {
+        let key = node.path.split(' ').next_back().unwrap_or_default();
+        let guard = format!("__fish_seen_subcommand_from {key}");
+        for long in &node.longs {
+            out.push_str(&format!(
+                "complete -c {program} -n '{guard}' -l {long} -d '{}'\n",
+                escape_fish(&node.about)
+            ));
+        }
+    }
+    out
+}
+
+fn escape_fish(text: &str) -> String {
+    text.replace('\'', "\\'")
+}
+
+fn render_powershell(tree: &[CmdNode], program: &str) -> String {
+    let root = find(tree, "").expect("root node");
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# PowerShell completion for {program} (generated by `tekvra completion powershell`)\n"
+    ));
+    out.push_str(&format!(
+        "Register-ArgumentCompleter -CommandName '{program}' -Native -ScriptBlock {{\n"
+    ));
+    out.push_str("    param($wordToComplete, $commandAst, $cursorPosition)\n");
+    out.push_str("    $elements = $commandAst.CommandElements\n");
+    out.push_str(&format!("    $rootOpts = '{}'\n", opts_literal(root, true)));
+    out.push_str("    if ($elements.Count -le 2) {\n");
+    out.push_str(
+        "        $rootOpts | Where-Object { $_ -like \"$wordToComplete*\" } | ForEach-Object {\n",
+    );
+    out.push_str("            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)\n");
+    out.push_str("        }\n");
+    out.push_str("        return\n");
+    out.push_str("    }\n");
+    out.push_str("    $sub = $elements[1].ToString()\n");
+    out.push_str("    $opts = switch ($sub) {\n");
+    for node in tree.iter().skip(1) {
+        let key = node.path.split(' ').next_back().unwrap_or_default();
+        out.push_str(&format!(
+            "        '{key}' {{ @('{}') }}\n",
+            opts_literal(node, true)
+        ));
+    }
+    out.push_str("        default { @() }\n");
+    out.push_str("    }\n");
+    out.push_str("    $opts | Where-Object { $_ -like \"$wordToComplete*\" } | ForEach-Object {\n");
+    out.push_str("        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)\n");
+    out.push_str("    }\n");
+    out.push_str("}\n");
+    out
+}
+
+// ---------------------------------------------------------------------------
+// worktree
+// ---------------------------------------------------------------------------
+
+/// Result of `ensure_worktree`.
+#[derive(Debug, Clone)]
+pub struct WorktreeOutcome {
+    /// Absolute path of the worktree checkout.
+    pub path: PathBuf,
+    /// Branch checked out in the worktree (`tekvra/<name>`).
+    pub branch: String,
+    /// Whether this call created the worktree (vs reusing an existing one).
+    pub created: bool,
+}
+
+/// Validates a managed worktree name (`[A-Za-z0-9._-]+`, no leading dot).
+///
+/// # Errors
+/// Returns an error for invalid names.
+pub fn ensure_worktree_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        || name.starts_with('.')
+    {
+        bail!("invalid worktree name `{name}`; expected [A-Za-z0-9._-]+");
+    }
+    Ok(())
+}
+
+/// Creates (or reuses) the managed git worktree `<state_dir>/worktrees/<repo-slug>/<name>`
+/// on branch `tekvra/<name>`.
+///
+/// # Errors
+/// Returns an error for invalid names or git failures.
+pub fn ensure_worktree(repo_root: &Path, state_dir: &Path, name: &str) -> Result<WorktreeOutcome> {
+    ensure_worktree_name(name)?;
+    let repo_slug = repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| {
+            let mut slug = s.to_ascii_lowercase();
+            slug.retain(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            slug
+        })
+        .filter(|s| !s.is_empty())
+        .context("resolving repository slug from working directory")?;
+    let branch = format!("tekvra/{name}");
+    let dir = state_dir.join("worktrees").join(&repo_slug).join(name);
+
+    if dir.join(".git").exists() {
+        return Ok(WorktreeOutcome {
+            path: dir,
+            branch,
+            created: false,
+        });
+    }
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    let branch_exists = StdCommand::new("git")
+        .args(["-C", &repo_root.display().to_string()])
+        .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let mut add = StdCommand::new("git");
+    add.args(["-C", &repo_root.display().to_string()]);
+    add.arg("worktree");
+    add.arg("add");
+    if !branch_exists {
+        add.arg("-b");
+        add.arg(&branch);
+    }
+    add.arg(dir.display().to_string());
+    let output = add.output().context("running `git worktree add`")?;
+    if !output.status.success() {
+        bail!(
+            "`git worktree add` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(WorktreeOutcome {
+        path: dir,
+        branch,
+        created: true,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// image attachments
+// ---------------------------------------------------------------------------
+
+/// Loads and validates `-i/--image` attachments into protocol [`InputImage`] values.
+///
+/// Accepts `png|jpg|jpeg|webp|gif` up to [`MAX_IMAGE_BYTES`]; content is inlined as base64.
+///
+/// # Errors
+/// Returns an error for unsupported extensions, oversized files, or unreadable paths.
+pub fn load_image_attachments(paths: &[PathBuf]) -> Result<Vec<InputImage>> {
+    let mut images = Vec::new();
+    for path in paths {
+        let meta =
+            std::fs::metadata(path).with_context(|| format!("stating image {}", path.display()))?;
+        if meta.len() > MAX_IMAGE_BYTES {
+            bail!(
+                "image {} is {} bytes; the limit is {MAX_IMAGE_BYTES} bytes",
+                path.display(),
+                meta.len()
+            );
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        let media_type = match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            other => bail!(
+                "unsupported image extension `.{other}` on {}",
+                path.display()
+            ),
+        };
+        let data =
+            std::fs::read(path).with_context(|| format!("reading image {}", path.display()))?;
+        images.push(InputImage {
+            media_type: media_type.to_string(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+            source_path: Some(path.display().to_string()),
+        });
+    }
+    Ok(images)
+}
+
+/// Injects the `--skill <NAME>` invocation prefix into `prompt`.
+///
+/// The session runner expands `/skill <NAME> ...` against discovered SKILL.md packages.
+///
+/// # Errors
+/// Returns an error when `--skill` is passed without a prompt.
+pub fn apply_skill_flag(skill: Option<&str>, prompt: Option<String>) -> Result<Option<String>> {
+    match (skill, prompt) {
+        (Some(name), Some(p)) => Ok(Some(format!("/skill {name} {p}"))),
+        (Some(name), None) => {
+            bail!("`--skill {name}` requires a prompt (positional or `--print`)")
+        }
+        (None, p) => Ok(p),
+    }
+}

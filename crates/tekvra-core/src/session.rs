@@ -399,8 +399,8 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
     let is_turn_running = Arc::new(AtomicBool::new(false));
     let current_cancel: Arc<Mutex<CancellationToken>> =
         Arc::new(Mutex::new(CancellationToken::new()));
-    let guide_inbox: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let replace_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let guide_inbox: Arc<Mutex<VecDeque<PendingUserInput>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let replace_slot: Arc<Mutex<Option<PendingUserInput>>> = Arc::new(Mutex::new(None));
     let pending_approvals: PendingApprovalsMap = Arc::new(Mutex::new(HashMap::new()));
     let pending_questions: PendingQuestionsMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -453,7 +453,8 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
                         if router_running.load(Ordering::SeqCst) {
                             match delivery {
                                 InputDeliveryMode::Next => {
-                                    let _ = router_work_tx.send(RunnerWork::UserTurn(prompt));
+                                    let _ = router_work_tx
+                                        .send(RunnerWork::UserTurn { prompt, images });
                                 }
                                 InputDeliveryMode::Guide => {
                                     router_guide
@@ -703,60 +704,136 @@ impl SessionActor {
                 }
             }
             RunnerWork::RevertTo { target_id, scope } => {
-                let now_epoch = jiff::Timestamp::now().as_second();
-                let res = {
-                    let idx = self
-                        .state_index
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    self.snapshots.revert_from_turn(
-                        &idx,
-                        &mut self.rollout_log,
-                        &self.rollout_records,
-                        &target_id,
-                        scope,
-                        now_epoch,
-                    )
-                };
-                match res {
-                    Ok(outcome) => {
-                        if matches!(
-                            scope,
-                            RevertScope::ConversationOnly | RevertScope::ConversationAndFiles
-                        ) {
-                            self.rollout_records.truncate(outcome.remaining_records);
-                            let restored_msgs: Vec<ProviderMessage> = self
-                                .rollout_records
-                                .iter()
-                                .filter_map(|r| match r {
-                                    RolloutRecord::Message { message, .. } => Some(message.clone()),
-                                    _ => None,
-                                })
-                                .collect();
-                            if let Ok((_, caps)) = self.router.route_for_mode(self.mode) {
-                                let mut tools = build_tool_definitions_for_model(&caps);
-                                if !self.allow_subagents {
-                                    tools.retain(|t| t.name != "task");
-                                }
-                                tools.extend(self.extra_plugin_tools.clone());
-                                self.frame = Frame::from_messages(
-                                    self.frame.generation() + 1,
-                                    self.developer_instructions.clone(),
-                                    restored_msgs,
-                                    tools,
-                                    caps.uses_apply_patch,
-                                );
-                            }
-                        }
-                        self.sync_shared_state();
-                    }
-                    Err(err) => {
+                self.revert_to_turn(&target_id, scope);
+            }
+            RunnerWork::UndoLastTurn { scope } => {
+                let latest_turn = self.rollout_records.iter().rev().find_map(|r| match r {
+                    RolloutRecord::TurnStarted { turn_id, .. } => Some(turn_id.clone()),
+                    _ => None,
+                });
+                match latest_turn {
+                    Some(turn_id) => self.revert_to_turn(&turn_id, scope),
+                    None => {
                         let _ = self.event_tx.send(SessionEvent::ConfigWarning {
-                            summary: format!("Revert failed: {err}"),
+                            summary: "Nothing to undo: no recorded turns in this session yet."
+                                .to_string(),
                             details: None,
                         });
                     }
                 }
+            }
+            RunnerWork::Compact => {
+                let before_tokens = self.frame.estimated_tokens();
+                let compact_route = self
+                    .router
+                    .route(JobRole::Compact)
+                    .map(|(p, m)| (p.clone(), m));
+                match compact_route {
+                    Ok((compact_provider, compact_model)) => {
+                        match self
+                            .frame
+                            .force_compact(
+                                &self.session_id,
+                                &compact_provider,
+                                &compact_model,
+                                self.driver.as_ref(),
+                                self.compaction.preserve_recent_messages,
+                            )
+                            .await
+                        {
+                            Ok(summary) => {
+                                let after_tokens = self.frame.estimated_tokens();
+                                let _ = self.event_tx.send(SessionEvent::CompactionCompleted {
+                                    thread_id: self.session_id.clone(),
+                                    generation: self.frame.generation(),
+                                    before_tokens,
+                                    after_tokens,
+                                });
+                                let _ = self.append_rollout(RolloutRecord::SteeringNote {
+                                    turn_id: "manual_compaction".to_string(),
+                                    kind: "compaction".to_string(),
+                                    text: format!(
+                                        "Context compacted to generation {} ({before_tokens} -> {after_tokens} est. tokens):\n{summary}",
+                                        self.frame.generation()
+                                    ),
+                                });
+                            }
+                            Err(err) => {
+                                let _ = self.event_tx.send(SessionEvent::ConfigWarning {
+                                    summary: format!("Manual compaction failed: {err}"),
+                                    details: None,
+                                });
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let _ = self.event_tx.send(SessionEvent::ConfigWarning {
+                            summary: format!(
+                                "Manual compaction failed to route compact model: {err}"
+                            ),
+                            details: None,
+                        });
+                    }
+                }
+                self.sync_shared_state();
+            }
+        }
+    }
+
+    /// Shared revert pipeline used by `RevertTo` and `UndoLastTurn`.
+    fn revert_to_turn(&mut self, target_id: &str, scope: RevertScope) {
+        let now_epoch = jiff::Timestamp::now().as_second();
+        let res = {
+            let idx = self
+                .state_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.snapshots.revert_from_turn(
+                &idx,
+                &mut self.rollout_log,
+                &self.rollout_records,
+                target_id,
+                scope,
+                now_epoch,
+            )
+        };
+        match res {
+            Ok(outcome) => {
+                if matches!(
+                    scope,
+                    RevertScope::ConversationOnly | RevertScope::ConversationAndFiles
+                ) {
+                    self.rollout_records.truncate(outcome.remaining_records);
+                    let restored_msgs: Vec<ProviderMessage> = self
+                        .rollout_records
+                        .iter()
+                        .filter_map(|r| match r {
+                            RolloutRecord::Message { message, .. } => Some(message.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Ok((_, caps)) = self.router.route_for_mode(self.mode) {
+                        let mut tools = build_tool_definitions_for_model(&caps);
+                        if !self.allow_subagents {
+                            tools.retain(|t| t.name != "task");
+                        }
+                        tools.extend(self.extra_plugin_tools.clone());
+                        self.frame = Frame::from_messages(
+                            self.frame.generation() + 1,
+                            self.developer_instructions.clone(),
+                            restored_msgs,
+                            tools,
+                            caps.uses_apply_patch,
+                        );
+                    }
+                }
+                self.sync_shared_state();
+            }
+            Err(err) => {
+                let _ = self.event_tx.send(SessionEvent::ConfigWarning {
+                    summary: format!("Revert failed: {err}"),
+                    details: None,
+                });
             }
         }
     }
@@ -857,7 +934,8 @@ impl SessionActor {
                 .state_index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = idx.index_message_text(&self.session_id, &turn_id, "user", &prompt);
+            let _ =
+                idx.index_message_text(&self.session_id, &turn_id, "user", &original_indexed_text);
             if let Ok(Some(mut summary)) = idx.get_session(&self.session_id) {
                 if summary.preview.is_empty() {
                     summary.preview = original_indexed_text.chars().take(120).collect();

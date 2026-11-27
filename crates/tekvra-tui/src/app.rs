@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -33,9 +34,9 @@ use crate::TuiError;
 use crate::cards::{ToolCardState, render_tool_card};
 use crate::markdown::render_markdown_lines;
 use crate::modals::{
-    ApprovalModalState, CompletionKind, CompletionPopupState, RevertOverlayState,
-    SearchOverlayState, SessionsOverlayState, TasksOverlayState, build_completion_popup,
-    is_excluded_mention_path,
+    ApprovalModalState, CompletionKind, CompletionPopupState, ModelPickerState, RevertOverlayState,
+    SearchOverlayState, SessionsOverlayState, TasksOverlayState, TrustUiCommand,
+    build_completion_popup, is_excluded_mention_path,
 };
 
 /// Single entry in the TUI transcript view (main session or subagent).
@@ -1041,6 +1042,72 @@ impl TuiApp {
                 if trimmed == "/sessions" || trimmed == "/resume" {
                     return TuiCommand::OpenSessionsOverlay;
                 }
+                if trimmed == "/undo" {
+                    self.main_transcript.push(TranscriptEntry::SystemBanner {
+                        tag: "undo".to_string(),
+                        text: "Undo requested: reverting the most recent turn (conversation + workspace files).".to_string(),
+                    });
+                    return TuiCommand::Session(SessionCommand::UndoLastTurn {
+                        scope: RevertScope::ConversationAndFiles,
+                    });
+                }
+                if trimmed == "/compact" {
+                    self.main_transcript.push(TranscriptEntry::SystemBanner {
+                        tag: "compact".to_string(),
+                        text:
+                            "Compaction requested: summarizing older context into a new generation."
+                                .to_string(),
+                    });
+                    return TuiCommand::Session(SessionCommand::Compact);
+                }
+                if trimmed == "/trust" || trimmed.starts_with("/trust ") {
+                    let arg = trimmed
+                        .strip_prefix("/trust")
+                        .unwrap_or_default()
+                        .trim()
+                        .to_ascii_lowercase();
+                    let action = match arg.as_str() {
+                        "" | "status" => TrustUiCommand::Status,
+                        "allow" | "grant" => TrustUiCommand::Allow,
+                        "revoke" | "deny" => TrustUiCommand::Revoke,
+                        other => {
+                            self.main_transcript.push(TranscriptEntry::SystemBanner {
+                                tag: "error".to_string(),
+                                text: format!(
+                                    "Usage: `/trust <status|allow|revoke>` (got `{other}`)"
+                                ),
+                            });
+                            return TuiCommand::Noop;
+                        }
+                    };
+                    return TuiCommand::RunTrust { action };
+                }
+                if trimmed == "/copy" || trimmed.starts_with("/copy ") {
+                    let arg = trimmed.strip_prefix("/copy").unwrap_or_default().trim();
+                    let Some(markdown) = self.latest_assistant_markdown() else {
+                        self.main_transcript.push(TranscriptEntry::SystemBanner {
+                            tag: "error".to_string(),
+                            text: "Nothing to copy yet: no completed assistant reply.".to_string(),
+                        });
+                        return TuiCommand::Noop;
+                    };
+                    let (text, label) = if arg == "code" {
+                        match extract_last_fenced_code_block(&markdown) {
+                            Some(code) => (code, "code block".to_string()),
+                            None => {
+                                self.main_transcript.push(TranscriptEntry::SystemBanner {
+                                    tag: "error".to_string(),
+                                    text: "No fenced code block found in the latest reply."
+                                        .to_string(),
+                                });
+                                return TuiCommand::Noop;
+                            }
+                        }
+                    } else {
+                        (markdown, "reply".to_string())
+                    };
+                    return TuiCommand::CopyToClipboard { text, label };
+                }
                 if let Some(rest) = trimmed.strip_prefix("/resume ") {
                     let sid = rest.trim();
                     if !sid.is_empty() {
@@ -1071,10 +1138,16 @@ impl TuiApp {
                 if trimmed == "/model" || trimmed.starts_with("/model ") {
                     let arg = trimmed.strip_prefix("/model").unwrap_or_default().trim();
                     if arg.is_empty() {
-                        self.main_transcript.push(TranscriptEntry::SystemBanner {
-                            tag: "model".to_string(),
-                            text: format!("Active model: `{}`", self.active_model),
-                        });
+                        if self.available_models.is_empty() {
+                            self.main_transcript.push(TranscriptEntry::SystemBanner {
+                                tag: "model".to_string(),
+                                text: format!("Active model: `{}` (no model catalog available for the interactive picker)", self.active_model),
+                            });
+                        } else {
+                            self.overlay = ActiveOverlay::ModelPicker(ModelPickerState::new(
+                                self.available_models.clone(),
+                            ));
+                        }
                         return TuiCommand::Noop;
                     }
                     self.active_model = arg.to_string();
@@ -1250,6 +1323,16 @@ impl TuiApp {
             .as_deref()
             .map(|g| format!(" | GOAL:{g}"))
             .unwrap_or_default();
+        let ctx_pct = if self.context_window > 0 {
+            format!(
+                " | ctx {:.0}%",
+                (self.usage.input_tokens.min(u32::MAX as u64) as f64 / self.context_window as f64
+                    * 100.0)
+                    .clamp(0.0, 100.0)
+            )
+        } else {
+            String::new()
+        };
         let status_text = format!(
             " TEKVRA | {} | mode={:?} | model={} | in={} (cache {:.0}%) out={} ${:.4}{ctx_pct}{}",
             view_label,

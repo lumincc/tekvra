@@ -269,6 +269,7 @@ async fn append_only_frame_plan_to_build_prefix_stability_compaction_and_non_des
         .send(SessionCommand::SubmitInput {
             prompt: "Draft a plan".to_string(),
             delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
         })
         .await
         .expect("send turn 1");
@@ -287,6 +288,7 @@ async fn append_only_frame_plan_to_build_prefix_stability_compaction_and_non_des
         .send(SessionCommand::SubmitInput {
             prompt: "Run slow check".to_string(),
             delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
         })
         .await
         .expect("send turn 2");
@@ -305,6 +307,7 @@ async fn append_only_frame_plan_to_build_prefix_stability_compaction_and_non_des
         .send(SessionCommand::SubmitInput {
             prompt: "GUIDE_NOTE: prefer BTreeMap over HashMap".to_string(),
             delivery: InputDeliveryMode::Guide,
+            images: Vec::new(),
         })
         .await
         .expect("send Guide mid-tool");
@@ -367,6 +370,7 @@ async fn automatic_steering_abandoned_turn_three_strike_refusal_and_idle_parent_
         .send(SessionCommand::SubmitInput {
             prompt: "Inspect does_not_exist.rs".to_string(),
             delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
         })
         .await
         .expect("submit");
@@ -427,6 +431,7 @@ async fn automatic_steering_abandoned_turn_three_strike_refusal_and_idle_parent_
         .send(SessionCommand::SubmitInput {
             prompt: "Launch background audit".to_string(),
             delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
         })
         .await
         .expect("submit bg");
@@ -588,6 +593,7 @@ async fn goal_evaluator_rejects_unverified_test_claim_and_review_extracts_struct
         .send(SessionCommand::SubmitInput {
             prompt: "Finish the feature and ensure tests pass".to_string(),
             delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
         })
         .await
         .expect("submit");
@@ -662,4 +668,347 @@ async fn goal_evaluator_rejects_unverified_test_claim_and_review_extracts_struct
     assert_eq!(outcome.findings[0].severity, "high");
     assert_eq!(outcome.findings[0].path, PathBuf::from("src/lib.rs"));
     assert_eq!(outcome.findings[0].start_line, 2);
+}
+
+#[tokio::test]
+async fn manual_compaction_reports_generation_and_token_delta() {
+    let tmp = TempDir::new().expect("tempdir");
+    // Large filler body per turn so the mock summary is genuinely smaller than the transcript.
+    let filler = "FILLER_CONTEXT_LINE_FOR_COMPACTION. ".repeat(400);
+    let driver = ScriptedDriver::from_fn(|_, _, req| {
+        // Compaction summarizer requests use the `:compact` conversation suffix (see `Frame::force_compact`).
+        if req.conversation_id.ends_with(":compact") {
+            text_resp("COMPACT_SUMMARY: session touched filler files; nothing else outstanding.")
+        } else {
+            text_resp("Turn answer.")
+        }
+    });
+    let bootstrap = setup_bootstrap(&tmp, driver.clone(), PermissionMode::Plan);
+    let handle = spawn_session(bootstrap).expect("spawn session");
+    let mut rx = handle.subscribe();
+
+    // Three turns so `force_compact` summarizes older messages while preserving the recent tail.
+    for turn in 0..3 {
+        handle
+            .send(SessionCommand::SubmitInput {
+                prompt: format!("Turn {turn} {filler}"),
+                delivery: InputDeliveryMode::Next,
+                images: Vec::new(),
+            })
+            .await
+            .expect("submit");
+        assert_eq!(wait_for_turn_complete(&mut rx).await, "completed");
+    }
+
+    let generation_before = handle
+        .state_snapshot()
+        .last_frame_snapshot
+        .unwrap()
+        .generation;
+
+    handle
+        .send(SessionCommand::Compact)
+        .await
+        .expect("send compact");
+
+    let mut compaction = None;
+    while let Ok(ev) = rx.recv().await {
+        if let SessionEvent::CompactionCompleted {
+            generation,
+            before_tokens,
+            after_tokens,
+            ..
+        } = ev
+        {
+            compaction = Some((generation, before_tokens, after_tokens));
+            break;
+        }
+    }
+    let (generation, before_tokens, after_tokens) =
+        compaction.expect("CompactionCompleted event must be emitted");
+
+    assert!(
+        generation > generation_before,
+        "compaction must run under a fresh frame generation"
+    );
+    assert!(before_tokens > 0);
+    assert!(
+        after_tokens < before_tokens,
+        "summary must be smaller than the raw transcript ({after_tokens} !< {before_tokens})"
+    );
+
+    // Frame snapshot must reflect the new generation and preserved tail only.
+    let snap = handle
+        .state_snapshot()
+        .last_frame_snapshot
+        .expect("snapshot");
+    assert_eq!(snap.generation, generation);
+    assert!(
+        snap.message_hashes.len() <= 5,
+        "compacted frame keeps only the summary + recent tail, got {}",
+        snap.message_hashes.len()
+    );
+}
+
+#[tokio::test]
+async fn undo_last_turn_rolls_back_conversation_to_latest_snapshot() {
+    let tmp = TempDir::new().expect("tempdir");
+    let driver = ScriptedDriver::from_queue(vec![
+        text_resp("First reply."),
+        text_resp("Second reply."),
+        text_resp("Post-undo reply."),
+    ]);
+    let bootstrap = setup_bootstrap(&tmp, driver.clone(), PermissionMode::Plan);
+    let handle = spawn_session(bootstrap).expect("spawn session");
+    let mut rx = handle.subscribe();
+
+    for prompt in ["one", "two"] {
+        handle
+            .send(SessionCommand::SubmitInput {
+                prompt: prompt.to_string(),
+                delivery: InputDeliveryMode::Next,
+                images: Vec::new(),
+            })
+            .await
+            .expect("submit");
+        assert_eq!(wait_for_turn_complete(&mut rx).await, "completed");
+    }
+
+    let frames_after_two = handle
+        .state_snapshot()
+        .last_frame_snapshot
+        .expect("snapshot")
+        .message_hashes
+        .len();
+    assert!(
+        frames_after_two >= 4,
+        "two turns append user+assistant each"
+    );
+
+    handle
+        .send(SessionCommand::UndoLastTurn {
+            scope: tekvra_protocol::RevertScope::ConversationOnly,
+        })
+        .await
+        .expect("undo");
+
+    // Revert is processed asynchronously; poll the shared snapshot until the frame shrinks.
+    let mut frames_after_undo = frames_after_two;
+    for _ in 0..50 {
+        frames_after_undo = handle
+            .state_snapshot()
+            .last_frame_snapshot
+            .expect("snapshot")
+            .message_hashes
+            .len();
+        if frames_after_undo < frames_after_two {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        frames_after_undo < frames_after_two,
+        "undo must remove the latest turn's messages"
+    );
+
+    // Continuing after undo keeps the append-only invariant: no prefix mutation warnings.
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "after undo".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("post-undo turn");
+    assert_eq!(wait_for_turn_complete(&mut rx).await, "completed");
+    let reqs = driver.recorded_requests();
+    let final_req = &reqs.last().expect("final request").1;
+    assert!(
+        !serde_json::to_string(&final_req.messages)
+            .expect("json")
+            .contains("\"two\""),
+        "undone turn content must not replay after rollback"
+    );
+}
+
+#[tokio::test]
+async fn at_file_mention_expands_bounded_attachment_blocks_and_blocks_secrets() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("repo");
+    std::fs::create_dir_all(&ws).expect("mkdir ws");
+    std::fs::write(
+        ws.join("notes.txt"),
+        "line one\nline two SECRET_MARKER\nline three\nline four\n",
+    )
+    .expect("write notes");
+    std::fs::write(ws.join(".env.production"), "TOP_SECRET_TOKEN=1\n").expect("write env");
+    std::fs::write(ws.join("big.bin"), "not utf8 \u{0}\u{1}").expect("write binary-ish");
+
+    let driver = ScriptedDriver::from_fn(|_, _, req| {
+        let serialized = serde_json::to_string(&req.messages).expect("json");
+        text_resp(&format!("ACK:{serialized}"))
+    });
+    let bootstrap = setup_bootstrap(&tmp, driver.clone(), PermissionMode::Plan);
+    let handle = spawn_session(bootstrap).expect("spawn session");
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "Review @notes.txt#L2-L3 and check @.env.production plus @../../etc/passwd"
+                .to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit");
+
+    let mut saw_warning = false;
+    // Collect events streamed during the turn; the warning precedes `TurnCompleted`.
+    loop {
+        match rx.recv().await.expect("event stream open") {
+            SessionEvent::ConfigWarning { summary, .. } => {
+                if summary.contains("sensitive credential") {
+                    saw_warning = true;
+                }
+            }
+            SessionEvent::TurnCompleted { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_warning,
+        "sensitive skip must emit a non-fatal ConfigWarning"
+    );
+
+    let reqs = driver.recorded_requests();
+    let request = reqs.last().expect("request").1.clone();
+    let plain = flat_text(&request);
+
+    // Line-range attachment expanded in place with exact requested lines.
+    assert!(
+        plain.contains("<attached_file path=\"notes.txt\" lines=\"2-3\">"),
+        "line-range mention must expand into a bounded attachment block"
+    );
+    assert!(
+        plain.contains("line two SECRET_MARKER") && plain.contains("line three"),
+        "lines 2..=3 content must be included"
+    );
+    assert!(
+        !plain.contains("line four"),
+        "content outside the requested range must not leak"
+    );
+
+    // Sensitive credential mention is withheld with a ConfigWarning.
+    assert!(
+        !plain.contains("TOP_SECRET_TOKEN"),
+        "sensitive file contents must never be attached"
+    );
+    assert!(plain.contains("withheld=\"sensitive_credential\""));
+
+    // Escaping paths are left untouched (literal text).
+    assert!(
+        plain.contains("@../../etc/passwd"),
+        "workspace-escaping mentions must remain literal"
+    );
+
+    // Append-only invariant: the developer prefix is untouched by expansion.
+    let developer_msg = &request.messages[0];
+    assert_eq!(developer_msg.role, MessageRole::Developer);
+}
+
+#[tokio::test]
+async fn skill_invocation_injects_instructions_without_mutating_developer_prefix() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("repo");
+    let skill_dir = ws.join(".claude").join("skills").join("review-api");
+    std::fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: review-api\ndescription: API review checklist\n---\nSKILL_BODY_MARKER: audit every HTTP handler for authz.",
+    )
+    .expect("write SKILL.md");
+
+    let driver = ScriptedDriver::from_fn(|_, _, req| {
+        let serialized = serde_json::to_string(&req.messages).expect("json");
+        text_resp(&format!("ACK:{serialized}"))
+    });
+    let bootstrap = setup_bootstrap(&tmp, driver.clone(), PermissionMode::Plan);
+    let handle = spawn_session(bootstrap).expect("spawn session");
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "plain turn".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("turn 1");
+    assert_eq!(wait_for_turn_complete(&mut rx).await, "completed");
+
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "/skill review-api Audit the HTTP handlers".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("turn 2");
+    assert_eq!(wait_for_turn_complete(&mut rx).await, "completed");
+
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "/skill does-not-exist fallback prompt".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("turn 3");
+    assert_eq!(wait_for_turn_complete(&mut rx).await, "completed");
+
+    let reqs = driver.recorded_requests();
+    let dev_prefix_t1 = reqs[0].1.messages[0].clone();
+    let dev_prefix_t2 = reqs[1].1.messages[0].clone();
+    let dev_prefix_t3 = reqs[2].1.messages[0].clone();
+    assert_eq!(
+        dev_prefix_t1, dev_prefix_t2,
+        "developer prefix untouched by /skill"
+    );
+    assert_eq!(dev_prefix_t2, dev_prefix_t3);
+
+    let turn2_user = &reqs[1].1.messages.last().expect("user msg").clone();
+    let t2 = flat_text(&CompletionRequest {
+        conversation_id: String::new(),
+        messages: vec![turn2_user.clone()],
+        tools: Vec::new(),
+        reasoning_effort: None,
+        output_schema: None,
+    });
+    assert!(
+        t2.contains("<skill_instructions name=\"review-api\""),
+        "skill block must be appended to the user turn: {t2}"
+    );
+    assert!(
+        t2.contains("SKILL_BODY_MARKER"),
+        "frontmatter body must be included"
+    );
+    assert!(
+        !t2.contains("description: API review checklist"),
+        "YAML frontmatter must be stripped"
+    );
+    assert!(t2.contains("Audit the HTTP handlers"));
+
+    // Unknown skill: original prompt continues + warning.
+    let turn3_user = reqs[2].1.messages.last().expect("user msg").clone();
+    let t3 = flat_text(&CompletionRequest {
+        conversation_id: String::new(),
+        messages: vec![turn3_user],
+        tools: Vec::new(),
+        reasoning_effort: None,
+        output_schema: None,
+    });
+    assert!(
+        t3.contains("does-not-exist fallback prompt") && !t3.contains("skill_instructions"),
+        "unknown skill must leave the prompt unexpanded"
+    );
 }

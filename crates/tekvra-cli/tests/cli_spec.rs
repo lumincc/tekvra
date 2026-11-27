@@ -571,3 +571,620 @@ fn tekvra_providers_url_query(raw_url: &str) -> std::collections::BTreeMap<Strin
     }
     out
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_trust_status_allow_revoke_roundtrip() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    let cfg_dir = tmp.path().join("cfg");
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(&cfg_dir).expect("mkdir cfg");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+
+    let bin = env!("CARGO_BIN_EXE_tekvra");
+    let run = async |args: &[&str]| -> (i32, String) {
+        let out = Command::new(bin)
+            .args(args)
+            .current_dir(&ws)
+            .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+            .env("TEKVRA_STATE_DIR", &state_dir)
+            .output()
+            .await
+            .expect("run tekvra trust");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+        )
+    };
+
+    let (code, out) = run(&["trust", "status"]).await;
+    assert_eq!(code, 0);
+    assert!(out.contains("not trusted"), "initial status: {out}");
+
+    let (code, out) = run(&["trust", "allow"]).await;
+    assert_eq!(code, 0);
+    assert!(out.contains("granted trust"), "allow: {out}");
+
+    let (code, out) = run(&["trust", "status"]).await;
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("trusted:") && !out.contains("not trusted"),
+        "post-allow: {out}"
+    );
+
+    let (code, out) = run(&["trust", "revoke"]).await;
+    assert_eq!(code, 0);
+    assert!(out.contains("revoked trust"), "revoke: {out}");
+
+    // Trust state persists in TEKVRA_STATE_DIR (trusted_folders.toml), independent of config dir.
+    assert!(
+        state_dir.join("trusted_folders.toml").exists(),
+        "trust store file must exist"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_mcp_add_list_remove_preserves_toml_comments() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    let cfg_dir = tmp.path().join("cfg");
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(&cfg_dir).expect("mkdir cfg");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+
+    let project_toml = ws.join(".tekvra").join("tekvra.toml");
+    std::fs::create_dir_all(ws.join(".tekvra")).expect("mkdir .tekvra");
+    std::fs::write(
+        &project_toml,
+        "# model preferences\nversion = 2\nmodel = \"openai/gpt-5.4-codex\"\n\n# alpha stdio gateway\n[mcp_servers.alpha]\ncommand = \"alpha-cmd\"\nenabled = true\n",
+    )
+    .expect("write project toml");
+
+    let bin = env!("CARGO_BIN_EXE_tekvra");
+    let run = async |args: &[&str]| -> (i32, String, String) {
+        let out = Command::new(bin)
+            .args(args)
+            .current_dir(&ws)
+            .env("OPENAI_API_KEY", "sk-test-cli")
+            .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+            .env("TEKVRA_STATE_DIR", &state_dir)
+            .output()
+            .await
+            .expect("run tekvra mcp");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    // Trust the workspace first: untrusted projects withhold MCP servers from merged config.
+    let (code, _, err) = run(&["trust", "allow"]).await;
+    assert_eq!(code, 0, "trust allow failed: {err}");
+
+    // add stdio with `--` trailing args
+    let (code, out, err) = run(&[
+        "mcp",
+        "add",
+        "beta",
+        "--command",
+        "uvx",
+        "--",
+        "-y",
+        "mcp-server-git",
+    ])
+    .await;
+    assert_eq!(code, 0, "add failed: {out} {err}");
+
+    let after_add = std::fs::read_to_string(&project_toml).expect("read toml");
+    assert!(
+        after_add.contains("# model preferences"),
+        "document-level comment must survive: {after_add}"
+    );
+    assert!(after_add.contains("[mcp_servers.alpha]"));
+    assert!(after_add.contains("[mcp_servers.beta]"));
+    assert!(after_add.contains("command = \"uvx\""));
+    assert!(after_add.contains("\"-y\"") && after_add.contains("\"mcp-server-git\""));
+
+    // list shows both
+    let (code, out, err) = run(&["mcp", "list"]).await;
+    assert_eq!(code, 0, "list failed: {out} {err}");
+    assert!(out.contains("alpha") && out.contains("beta"));
+
+    // add http with bearer env var
+    let (code, _, err) = run(&[
+        "mcp",
+        "add",
+        "remote",
+        "--url",
+        "http://127.0.0.1:9/mcp",
+        "--bearer-env",
+        "REMOTE_TOKEN",
+    ])
+    .await;
+    assert_eq!(code, 0, "http add failed: {err}");
+    let toml_now = std::fs::read_to_string(&project_toml).expect("read toml");
+    assert!(toml_now.contains("url = \"http://127.0.0.1:9/mcp\""));
+    assert!(toml_now.contains("bearer_token_env_var = \"REMOTE_TOKEN\""));
+
+    // command + url together is rejected
+    let (code, _, _) = run(&["mcp", "add", "both", "--command", "x", "--url", "http://x"]).await;
+    assert_ne!(code, 0, "command+url must be mutually exclusive");
+
+    // remove keeps the comment and the untouched entries
+    let (code, out, err) = run(&["mcp", "remove", "alpha"]).await;
+    assert_eq!(code, 0, "remove failed: {out} {err}");
+    let after_remove = std::fs::read_to_string(&project_toml).expect("read toml");
+    assert!(
+        after_remove.contains("# model preferences"),
+        "document-level comment must survive removal: {after_remove}"
+    );
+    // The comment decorating the removed table goes with it (owned decor).
+    assert!(!after_remove.contains("# alpha stdio gateway"));
+    assert!(!after_remove.contains("[mcp_servers.alpha]"));
+    assert!(after_remove.contains("[mcp_servers.beta]"));
+
+    // removing a missing server errors
+    let (code, _, _) = run(&["mcp", "remove", "ghost"]).await;
+    assert_ne!(code, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_mcp_test_performs_oneshot_handshake_against_http_mock() {
+    use std::net::SocketAddr;
+
+    async fn mcp_dispatch(axum::Json(body): axum::Json<Value>) -> axum::response::Response {
+        let method = body
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let id = body.get("id").cloned().unwrap_or(Value::Null);
+        let result = match method {
+            "initialize" => json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "serverInfo": { "name": "mock-mcp", "version": "0.0.1" }
+            }),
+            "tools/list" => json!({
+                "tools": [
+                    { "name": "echo", "description": "Echo a message", "inputSchema": { "type": "object" } },
+                    { "name": "ping", "description": "Ping", "inputSchema": { "type": "object" } }
+                ]
+            }),
+            _ => json!({}),
+        };
+        let payload = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        axum::response::Response::builder()
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(payload.to_string()))
+            .expect("response")
+    }
+
+    let app: Router<()> = Router::new().route("/mcp", axum::routing::post(mcp_dispatch));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    let cfg_dir = tmp.path().join("cfg");
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(&cfg_dir).expect("mkdir cfg");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+    std::fs::create_dir_all(ws.join(".tekvra")).expect("mkdir .tekvra");
+    std::fs::write(
+        ws.join(".tekvra").join("tekvra.toml"),
+        format!("version = 2\n\n[mcp_servers.mock]\nurl = \"http://{addr}/mcp\"\nenabled = true\n"),
+    )
+    .expect("write toml");
+
+    let bin = env!("CARGO_BIN_EXE_tekvra");
+    // Untrusted projects withhold MCP servers from merged config: grant trust first.
+    let pre = Command::new(bin)
+        .args(["trust", "allow"])
+        .current_dir(&ws)
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .output()
+        .await
+        .expect("trust allow");
+    assert_eq!(pre.status.code(), Some(0));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tekvra"))
+        .args(["mcp", "test", "mock"])
+        .current_dir(&ws)
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .output()
+        .await
+        .expect("run mcp test");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("connected, 2 tool(s)"), "{stdout}");
+    assert!(stdout.contains("mock/echo") && stdout.contains("mock/ping"));
+}
+
+#[test]
+fn cli_completion_scripts_for_all_four_shells() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    let cfg_dir = tmp.path().join("cfg");
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(&cfg_dir).expect("mkdir cfg");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+
+    let bin = env!("CARGO_BIN_EXE_tekvra");
+    let cases: [(&str, Vec<&str>); 4] = [
+        (
+            "bash",
+            vec!["_tekvra()", "complete -F _tekvra tekvra", "--worktree"],
+        ),
+        ("zsh", vec!["#compdef tekvra", "_tekvra()"]),
+        ("fish", vec!["complete -c tekvra", "__fish_use_subcommand"]),
+        (
+            "powershell",
+            vec!["Register-ArgumentCompleter", "tekvra", "ParameterValue"],
+        ),
+    ];
+    for (shell, needles) in &cases {
+        let out = std::process::Command::new(bin)
+            .args(["completion", shell])
+            .current_dir(&ws)
+            .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+            .env("TEKVRA_STATE_DIR", &state_dir)
+            .output()
+            .expect("run completion");
+        assert_eq!(out.status.code(), Some(0), "completion {shell} failed");
+        let script = String::from_utf8_lossy(&out.stdout).to_string();
+        for needle in needles {
+            assert!(
+                script.contains(needle),
+                "completion {shell} missing `{needle}`:\n{script}"
+            );
+        }
+    }
+
+    // Unsupported shell exits non-zero.
+    let bad = std::process::Command::new(bin)
+        .args(["completion", "csh"])
+        .output()
+        .expect("run completion csh");
+    assert_ne!(bad.status.code(), Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_exec_image_flag_attaches_input_image_to_provider_payload() {
+    use std::sync::Arc as StdArc;
+
+    #[derive(Clone)]
+    struct CaptureState(StdArc<Mutex<Vec<Value>>>);
+
+    async fn handle_capture(
+        State(st): State<CaptureState>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> axum::Json<Value> {
+        st.0.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(body);
+        axum::Json(json!({
+            "id": "resp_img",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "IMAGE_SEEN" }]
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        }))
+    }
+
+    let captured = StdArc::new(Mutex::new(Vec::new()));
+    let app: Router<()> = Router::new()
+        .route("/v1/responses", post(handle_capture))
+        .with_state(CaptureState(StdArc::clone(&captured)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    let cfg_dir = tmp.path().join("cfg");
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(&cfg_dir).expect("mkdir cfg");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+    std::fs::write(
+        cfg_dir.join("providers.toml"),
+        format!("version = 2\n\n[providers.openai]\nbase_url = \"http://{addr}/v1\"\n"),
+    )
+    .expect("write providers.toml");
+
+    // 1x1 PNG (smallest valid payload; only the extension/size matter for the CLI gate).
+    let img_path = ws.join("ui-bug.png");
+    std::fs::write(
+        &img_path,
+        [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+    )
+    .expect("write png");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tekvra"))
+        .args([
+            "exec",
+            "--mode",
+            "yolo",
+            "-i",
+            "ui-bug.png",
+            "Describe this screenshot",
+        ])
+        .current_dir(&ws)
+        .env("OPENAI_API_KEY", "sk-test-img")
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .output()
+        .await
+        .expect("run exec");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "exec -i failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("IMAGE_SEEN"));
+
+    let serialized = {
+        let bodies = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let last = bodies.last().expect("captured request body");
+        serde_json::to_string(last).expect("json")
+    };
+    assert!(
+        serialized.contains("input_image"),
+        "image must reach the provider payload: {serialized}"
+    );
+    assert!(serialized.contains("data:image/png;base64,"));
+
+    // Unsupported extension is rejected before any network call.
+    std::fs::write(ws.join("notes.bmp"), b"xx").expect("write bmp");
+    let out = Command::new(env!("CARGO_BIN_EXE_tekvra"))
+        .args(["exec", "--mode", "yolo", "-i", "notes.bmp", "nope"])
+        .current_dir(&ws)
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .output()
+        .await
+        .expect("run exec bmp");
+    assert_ne!(out.status.code(), Some(0), "bmp must be rejected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_worktree_flag_routes_writes_into_managed_checkout() {
+    let base_url = spawn_mock_openai_server(vec![]).await;
+    let _ = base_url; // per-request queue handled by default fallback replies
+
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("repo");
+    let cfg_dir = tmp.path().join("cfg");
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(&ws).expect("mkdir ws");
+    std::fs::create_dir_all(&cfg_dir).expect("mkdir cfg");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&ws)
+            .output()
+            .expect("git")
+    };
+    let init = git(&["init", "-q"]);
+    assert!(
+        init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    git(&["config", "user.email", "test@tekvra.local"]);
+    git(&["config", "user.name", "Tekvra Test"]);
+    std::fs::write(ws.join("README.md"), "seed").expect("seed file");
+    git(&["add", "."]);
+    let commit = git(&["commit", "-q", "-m", "seed"]);
+    assert!(commit.status.success(), "git commit failed");
+
+    std::fs::write(
+        cfg_dir.join("providers.toml"),
+        "version = 2\n\n[providers.openai]\nbase_url = \"http://127.0.0.1:9/unused\"\n",
+    )
+    .expect("write providers.toml");
+
+    let bin = env!("CARGO_BIN_EXE_tekvra");
+
+    // 1. `tekvra worktree create demo` creates the managed checkout.
+    let out = Command::new(bin)
+        .args(["worktree", "create", "demo"])
+        .current_dir(&ws)
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .output()
+        .await
+        .expect("run worktree create");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("created"), "{stdout}");
+    let wt_dir = state_dir.join("worktrees").join("repo").join("demo");
+    assert!(wt_dir.join(".git").exists(), "worktree checkout must exist");
+    assert!(
+        wt_dir.join("README.md").exists(),
+        "worktree must contain seeded files"
+    );
+
+    // 2. `list` shows the managed worktree; second `create` reuses it.
+    let out = Command::new(bin)
+        .args(["worktree", "list"])
+        .current_dir(&ws)
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .output()
+        .await
+        .expect("run worktree list");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("demo"));
+
+    let out = Command::new(bin)
+        .args(["worktree", "create", "demo"])
+        .current_dir(&ws)
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .output()
+        .await
+        .expect("run worktree reuse");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("reused"));
+
+    // 3. Branch `tekvra/demo` exists in the repo.
+    let branch = git(&["rev-parse", "--verify", "refs/heads/tekvra/demo"]);
+    assert!(branch.status.success(), "tekvra/demo branch must exist");
+
+    // 4. Removing a missing worktree errors without side effects; removing an existing one works.
+    let out = Command::new(bin)
+        .args(["worktree", "remove", "ghost"])
+        .current_dir(&ws)
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .output()
+        .await
+        .expect("run worktree remove ghost");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "removing a missing worktree must fail"
+    );
+    assert!(
+        !state_dir
+            .join("worktrees")
+            .join("repo")
+            .join("ghost")
+            .exists()
+    );
+
+    let out = Command::new(bin)
+        .args(["worktree", "remove", "demo"])
+        .current_dir(&ws)
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .output()
+        .await
+        .expect("run worktree remove demo");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!wt_dir.join(".git").exists(), "worktree must be removed");
+}
+
+#[test]
+fn installer_sh_verifies_sha256_and_rejects_mismatch() {
+    use std::process::Command as StdCommand;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let dist = tmp.path().join("dist");
+    let prefix = tmp.path().join("prefix");
+    // Release layout: <DOWNLOAD_PREFIX>/<VERSION>/<assets>.
+    let dist_versioned = dist.join("v0.1.0");
+    std::fs::create_dir_all(&dist_versioned).expect("mkdir dist");
+
+    // Build a tiny release archive containing a fake `tekvra` binary.
+    let payload_dir = tmp.path().join("payload");
+    std::fs::create_dir_all(&payload_dir).expect("mkdir payload");
+    std::fs::write(payload_dir.join("tekvra"), "#!/bin/sh\necho FAKE_TEKVRA\n")
+        .expect("write fake bin");
+    let archive = dist_versioned.join("tekvra-v0.1.0-x86_64-unknown-linux-gnu.tar.gz");
+    let tar = StdCommand::new("tar")
+        .args(["-czf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(&payload_dir)
+        .arg("tekvra")
+        .output()
+        .expect("tar");
+    assert!(tar.status.success(), "tar failed");
+
+    let digest = StdCommand::new("sha256sum")
+        .arg(&archive)
+        .output()
+        .expect("sha256sum");
+    let good_digest = String::from_utf8_lossy(&digest.stdout)
+        .split_whitespace()
+        .next()
+        .expect("digest")
+        .to_string();
+    let good_sums = format!("{good_digest}  tekvra-v0.1.0-x86_64-unknown-linux-gnu.tar.gz\n");
+    let bad_sums = format!(
+        "{}  tekvra-v0.1.0-x86_64-unknown-linux-gnu.tar.gz\n",
+        "0".repeat(64)
+    );
+
+    let installer = concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh");
+    let download_prefix = format!("file://{}", dist.display());
+
+    // 1. Mismatched digest -> non-zero exit, nothing installed.
+    std::fs::write(dist_versioned.join("SHA256SUMS.txt"), &bad_sums).expect("write bad sums");
+    let out = StdCommand::new("bash")
+        .arg(installer)
+        .env("TEKVRA_VERSION", "v0.1.0")
+        .env("TEKVRA_INSTALL_PREFIX", &prefix)
+        .env("TEKVRA_DOWNLOAD_PREFIX", &download_prefix)
+        .output()
+        .expect("run install.sh with bad checksum");
+    assert_ne!(out.status.code(), Some(0), "mismatched checksum must abort");
+    assert!(
+        !prefix.join("bin").join("tekvra").exists(),
+        "no binary may be installed on mismatch"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("checksum mismatch"), "{stderr}");
+
+    // 2. Matching digest -> exit 0, binary installed and executable.
+    std::fs::write(dist_versioned.join("SHA256SUMS.txt"), good_sums).expect("write good sums");
+    let out = StdCommand::new("bash")
+        .arg(installer)
+        .env("TEKVRA_VERSION", "v0.1.0")
+        .env("TEKVRA_INSTALL_PREFIX", &prefix)
+        .env("TEKVRA_DOWNLOAD_PREFIX", &download_prefix)
+        .output()
+        .expect("run install.sh with good checksum");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let installed = prefix.join("bin").join("tekvra");
+    assert!(installed.exists(), "binary must be installed");
+    let run = StdCommand::new(&installed)
+        .output()
+        .expect("run installed binary");
+    assert!(String::from_utf8_lossy(&run.stdout).contains("FAKE_TEKVRA"));
+}

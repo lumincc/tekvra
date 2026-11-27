@@ -194,3 +194,38 @@ fn parse_skill_frontmatter(raw: &str, fallback_name: &str) -> (String, String) {
     }
     (name, description)
 }
+
+/// Strips YAML frontmatter (`---\n...\n---`) from raw `SKILL.md` content, returning the body.
+#[must_use]
+pub fn strip_yaml_frontmatter(raw: &str) -> String {
+    let rest = match raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))
+    {
+        Some(rest) => rest,
+        None => return raw.to_string(),
+    };
+    match rest.split_once("\n---") {
+        Some((_yaml, after)) => {
+            // Skip the remainder of the closing `---` line.
+            let body = after
+                .split_once('\n')
+                .map(|(_, body)| body)
+                .unwrap_or(after);
+            body.to_string()
+        }
+        None => raw.to_string(),
+    }
+}
+
+/// Loads the full Markdown body of a discovered `SKILL.md`, stripping YAML frontmatter.
+///
+/// # Errors
+/// Returns [`ConfigError`] when the skill file cannot be read.
+pub fn load_skill_body(skill: &SkillMetadata) -> Result<String, ConfigError> {
+    let raw = fs::read_to_string(&skill.path).map_err(|source| ConfigError::Io {
+        path: skill.path.clone(),
+        source,
+    })?;
+    Ok(strip_yaml_frontmatter(&raw))
+}

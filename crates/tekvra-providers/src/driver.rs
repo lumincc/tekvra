@@ -611,6 +611,234 @@ pub fn build_chat_completions_payload(
     body
 }
 
+/// Builds a native Google Gemini `:streamGenerateContent` payload with `inlineData` image blocks,
+/// `systemInstruction`, and `functionDeclaration` / `functionCall` / `functionResponse` tool mapping.
+#[must_use]
+pub fn build_gemini_payload(_model: &ModelCapabilities, request: &CompletionRequest) -> Value {
+    let mut system_parts: Vec<Value> = Vec::new();
+    let mut contents: Vec<Value> = Vec::new();
+
+    // Pre-index assistant `ToolCall` ids so tool results can map `call_id` -> function name.
+    let mut call_id_to_name: BTreeMap<String, String> = BTreeMap::new();
+    for msg in &request.messages {
+        for part in &msg.parts {
+            if let MessagePart::ToolCall { call_id, name, .. } = part {
+                call_id_to_name.insert(call_id.clone(), name.clone());
+            }
+        }
+    }
+
+    for msg in &request.messages {
+        match msg.role {
+            MessageRole::Developer => {
+                for p in &msg.parts {
+                    if let MessagePart::Text { text, .. } = p {
+                        system_parts.push(json!({ "text": text }));
+                    }
+                }
+            }
+            MessageRole::User => {
+                let mut parts = Vec::new();
+                for p in &msg.parts {
+                    match p {
+                        MessagePart::Text { text, .. } => {
+                            parts.push(json!({ "text": text }));
+                        }
+                        MessagePart::Image {
+                            media_type,
+                            data_base64,
+                            ..
+                        } => {
+                            parts.push(json!({
+                                "inlineData": {
+                                    "mimeType": media_type,
+                                    "data": data_base64,
+                                }
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                if !parts.is_empty() {
+                    contents.push(json!({ "role": "user", "parts": parts }));
+                }
+            }
+            MessageRole::Assistant => {
+                let mut parts = Vec::new();
+                for p in &msg.parts {
+                    match p {
+                        MessagePart::Text { text, .. } => {
+                            parts.push(json!({ "text": text }));
+                        }
+                        MessagePart::ToolCall {
+                            name,
+                            arguments_json,
+                            ..
+                        } => {
+                            let args: Value =
+                                serde_json::from_str(arguments_json).unwrap_or_else(|_| json!({}));
+                            parts.push(json!({ "functionCall": { "name": name, "args": args } }));
+                        }
+                        _ => {}
+                    }
+                }
+                if !parts.is_empty() {
+                    contents.push(json!({ "role": "model", "parts": parts }));
+                }
+            }
+            MessageRole::Tool => {
+                let mut parts = Vec::new();
+                for p in &msg.parts {
+                    if let MessagePart::ToolResult {
+                        call_id,
+                        output,
+                        is_error,
+                    } = p
+                    {
+                        let function_name = call_id_to_name
+                            .get(call_id)
+                            .cloned()
+                            .unwrap_or_else(|| call_id.clone());
+                        let response = if *is_error {
+                            json!({ "error": { "message": output } })
+                        } else {
+                            json!({ "result": { "content": output } })
+                        };
+                        parts.push(json!({
+                            "functionResponse": {
+                                "name": function_name,
+                                "response": response,
+                            }
+                        }));
+                    }
+                }
+                if !parts.is_empty() {
+                    contents.push(json!({ "role": "user", "parts": parts }));
+                }
+            }
+        }
+    }
+
+    let mut body = json!({ "contents": contents });
+    if !system_parts.is_empty() {
+        body["systemInstruction"] = json!({ "parts": system_parts });
+    }
+    if !request.tools.is_empty() {
+        body["tools"] = json!([{
+            "functionDeclarations": request
+                .tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    })
+                })
+                .collect::<Vec<Value>>(),
+        }]);
+    }
+    body["generationConfig"] = json!({ "maxOutputTokens": 65_536 });
+    body
+}
+
+/// Parses a native Gemini `:streamGenerateContent` response (chunked JSON array or single object)
+/// into a [`CompletionResponse`], synthesizing deterministic `call_<name>_<n>` ids for `functionCall` parts.
+///
+/// # Errors
+/// Returns [`ProviderError`] if the body is not valid JSON.
+pub fn parse_gemini_body(
+    raw_body: &str,
+    model: &ModelCapabilities,
+    served_by_account: &str,
+) -> Result<CompletionResponse, ProviderError> {
+    let val: Value = serde_json::from_str(raw_body.trim()).map_err(|e| ProviderError::Decode {
+        provider: model.provider.clone(),
+        message: e.to_string(),
+    })?;
+    let chunks: Vec<&Value> = match &val {
+        Value::Array(items) => items.iter().collect(),
+        _ => vec![&val],
+    };
+
+    let mut parts: Vec<MessagePart> = Vec::new();
+    let mut deltas: Vec<StreamDelta> = Vec::new();
+    let mut usage = TokenUsage::default();
+
+    for chunk in chunks {
+        if let Some(u) = chunk.get("usageMetadata") {
+            usage.input_tokens = u
+                .get("promptTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(usage.input_tokens);
+            usage.cached_input_tokens = u
+                .get("cachedContentTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(usage.cached_input_tokens);
+            usage.output_tokens = u
+                .get("candidatesTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(usage.output_tokens);
+            usage.reasoning_tokens = u
+                .get("thoughtsTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(usage.reasoning_tokens);
+        }
+        let Some(candidates) = chunk.get("candidates").and_then(Value::as_array) else {
+            continue;
+        };
+        for candidate in candidates {
+            let Some(content_parts) = candidate
+                .get("content")
+                .and_then(|c| c.get("parts"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            let mut function_counter = 0usize;
+            for p in content_parts {
+                if let Some(txt) = p.get("text").and_then(Value::as_str) {
+                    if !txt.is_empty() {
+                        deltas.push(StreamDelta::TextDelta(txt.to_string()));
+                        parts.push(MessagePart::Text {
+                            text: txt.to_string(),
+                            cache_breakpoint: false,
+                        });
+                    }
+                } else if let Some(fc) = p.get("functionCall") {
+                    let name = fc
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                    function_counter += 1;
+                    parts.push(MessagePart::ToolCall {
+                        call_id: format!("call_{name}_{function_counter}"),
+                        name,
+                        arguments_json: args.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    let uncached_input = usage.input_tokens.saturating_sub(usage.cached_input_tokens);
+    usage.cost_usd = (uncached_input as f64 / 1_000_000.0) * model.input_cost_per_million
+        + (usage.cached_input_tokens as f64 / 1_000_000.0) * model.cached_input_cost_per_million
+        + (usage.output_tokens as f64 / 1_000_000.0) * model.output_cost_per_million;
+
+    Ok(CompletionResponse {
+        assistant_message: ProviderMessage {
+            role: MessageRole::Assistant,
+            parts,
+        },
+        stream_deltas: deltas,
+        usage,
+        served_by_account: served_by_account.to_string(),
+    })
+}
+
 /// Parses either a JSON `/responses` payload or an SSE event stream (`event: ...` / `data: ...`)
 /// into a [`CompletionResponse`], preserving `encrypted_content` and cache token metrics.
 ///
@@ -798,6 +1026,15 @@ fn extract_responses_object(
         },
         served_by_account: served_by_account.to_string(),
     })
+}
+
+/// Returns `true` when `request` carries any [`MessagePart::Image`] block.
+#[must_use]
+pub fn request_has_image(request: &CompletionRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .any(ProviderMessage::has_image_parts)
 }
 
 /// Pure `tokio` + `reqwest` (`rustls`) HTTP provider client with automatic multi-account quota failover.

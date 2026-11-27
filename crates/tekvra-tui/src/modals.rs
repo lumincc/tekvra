@@ -378,7 +378,10 @@ impl CompletionPopupState {
 
 const BUILTIN_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("help", "Show available slash commands and shortcuts"),
-    ("model", "Switch active provider/model"),
+    (
+        "model",
+        "Switch active provider/model (bare /model opens picker)",
+    ),
     ("mode", "Switch permission mode (plan|build|auto|yolo)"),
     ("mcp", "Show connected MCP servers and tools"),
     ("review", "Run read-only code review over Git diffs"),
@@ -388,6 +391,20 @@ const BUILTIN_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("tasks", "Switch or steer active subagents (Ctrl-X)"),
     ("search", "Full-text search across session history"),
     ("revert", "Preview and revert conversation/files to turn"),
+    (
+        "undo",
+        "Undo the most recent user turn (files + transcript)",
+    ),
+    ("compact", "Manually compact context and show token delta"),
+    (
+        "skill",
+        "Inject a discovered SKILL.md (/skill <name> [prompt])",
+    ),
+    ("trust", "Inspect or toggle workspace folder trust"),
+    (
+        "copy",
+        "Copy latest reply/code block (OSC-52, /copy code|all)",
+    ),
     ("goal", "Set or clear autonomous completion condition"),
     ("reload", "Hot-reload opt-in Luau plugins"),
     ("quit", "Exit Tekvra TUI"),
@@ -577,6 +594,95 @@ pub fn build_completion_popup(
     }
 
     None
+}
+
+/// Interactive fuzzy-filterable `/model` picker modal opened when `/model` is submitted bare.
+#[derive(Debug, Clone)]
+pub struct ModelPickerState {
+    /// All selectable models as `(spec, description)` pairs.
+    pub all_models: Vec<(String, String)>,
+    /// Active fuzzy filter query typed by the user.
+    pub query: String,
+    /// Highlighted index within the filtered list.
+    pub selected: usize,
+}
+
+impl ModelPickerState {
+    /// Creates a [`ModelPickerState`] over `all_models`.
+    #[must_use]
+    pub fn new(all_models: Vec<(String, String)>) -> Self {
+        Self {
+            all_models,
+            query: String::new(),
+            selected: 0,
+        }
+    }
+
+    /// Fuzzy-filtered `(spec, description)` candidates in score order.
+    #[must_use]
+    pub fn filtered(&self) -> Vec<(String, String)> {
+        let mut scored: Vec<(u32, (String, String))> = self
+            .all_models
+            .iter()
+            .filter_map(|(spec, desc)| {
+                fuzzy_score_token(spec, &self.query)
+                    .map(|score| (score, (spec.clone(), desc.clone())))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.0.cmp(&b.1.0)));
+        scored.into_iter().map(|(_, m)| m).collect()
+    }
+
+    /// Moves highlight down within the filtered list.
+    pub fn next(&mut self) {
+        let len = self.filtered().len();
+        if len > 0 {
+            self.selected = (self.selected + 1) % len;
+        }
+    }
+
+    /// Moves highlight up within the filtered list.
+    pub fn prev(&mut self) {
+        let len = self.filtered().len();
+        if len > 0 {
+            self.selected = if self.selected == 0 {
+                len - 1
+            } else {
+                self.selected - 1
+            };
+        }
+    }
+
+    /// Appends `ch` to the filter query (resets selection to the top match).
+    pub fn push_filter_char(&mut self, ch: char) {
+        self.query.push(ch);
+        self.selected = 0;
+    }
+
+    /// Removes the last character from the filter query.
+    pub fn pop_filter_char(&mut self) {
+        self.query.pop();
+        self.selected = 0;
+    }
+
+    /// Returns the currently highlighted `provider/model` spec.
+    #[must_use]
+    pub fn selected_model(&self) -> Option<String> {
+        self.filtered()
+            .get(self.selected)
+            .map(|(spec, _)| spec.clone())
+    }
+}
+
+/// Folder-trust action dispatched from the TUI `/trust` command to the host runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustUiCommand {
+    /// Print whether the workspace root is trusted and what is withheld.
+    Status,
+    /// Grant canonical folder trust for the workspace root.
+    Allow,
+    /// Revoke canonical folder trust for the workspace root.
+    Revoke,
 }
 
 fn fuzzy_score_token(candidate: &str, query: &str) -> Option<u32> {

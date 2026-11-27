@@ -11,6 +11,10 @@ pub mod subagents;
 
 use thiserror::Error;
 
+pub use context::{
+    AttachmentExpansion, MAX_IMAGE_BYTES, MAX_IMAGES_PER_TURN, MAX_TEXT_FILE_BYTES,
+    MAX_TURN_TEXT_BYTES, SkillInvocation, expand_prompt_attachments, expand_skill_invocation,
+};
 pub use frame::{CompactionConfig, Frame, FrameSnapshot};
 pub use goal_and_review::{
     GoalVerdict, ReviewOutcome, ReviewTarget, collect_review_diff, evaluate_goal, run_code_review,
