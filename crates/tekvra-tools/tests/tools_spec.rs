@@ -249,7 +249,10 @@ async fn interactive_pty_prompt_write_stdin_and_failing_test_filter_with_tool_ou
     else {
         panic!("expected running PTY receipt, got {start_out:?}");
     };
-    assert!(prompt_out.contains("Enter token:"));
+    assert!(
+        prompt_out.contains("Enter token:"),
+        "prompt not captured; receipt output was {prompt_out:?}"
+    );
 
     // Deliver stdin via `write_stdin` (CR terminates the line on both platforms: Unix
     // line discipline maps it to NL, the Windows console treats it as Enter), polling
@@ -977,38 +980,32 @@ async fn streamable_http_sse_mcp_bearer_auth_and_list_changed_catalog_refresh() 
     );
 }
 
-/// Windows-only ConPTY diagnostics: prints what the PTY captures for cmd.exe, PowerShell
-/// and python probes so CI logs show where output capture breaks. Always passes; read the
-/// test's stdout in the CI log. Remove once the Windows shell backend is proven.
+/// Windows-only ConPTY diagnostics: ground-truth matrix for the Windows shell backend.
+/// Registry-path probes (Yolo) plus raw portable-pty probes varying environment, flags and
+/// arg encoding, each printing captured bytes, exit state and elapsed time. Always passes;
+/// read the test's stdout in the CI log (RUST_TEST_NOCAPTURE=1). Remove once proven.
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_pty_capture_diagnostics() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::io::Read;
     use tekvra_protocol::ToolOutput;
 
+    // --- registry path (exercises pty.rs shell_invocation + env sanitizer) ---
     let tmp = TempDir::new().expect("tempdir");
     let ws = tmp.path().join("repo");
     let state = tmp.path().join("state");
     std::fs::create_dir_all(&ws).expect("mkdir");
-    let ctx = make_ctx(ws, state, PermissionMode::Build, Vec::new());
+    let ctx = make_ctx(ws, state, PermissionMode::Yolo, Vec::new());
     let reg = NativeToolRegistry::new();
 
-    let probes: &[(&str, &str)] = &[
-        ("cmd", "cmd /c echo CMD_PROBE_OK"),
-        ("pwsh_present", ""),
-        ("ps", "Write-Output PS_PROBE_OK"),
-        ("ps_quoted", "Write-Output 'PS QUOTED OK'"),
-        ("python", "python -c \"print('PY_PROBE_OK')\""),
-    ];
-
-    for (label, cmd) in probes {
-        if *label == "pwsh_present" {
-            let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                .map(|dir| dir.join("pwsh.exe"))
-                .find(|candidate| candidate.is_file())
-                .is_some();
-            println!("PROBE pwsh_present: {found}");
-            continue;
-        }
+    for (label, cmd) in [
+        ("reg_cmd", "cmd /c echo CMD_PROBE_OK"),
+        ("reg_ps", "Write-Output PS_PROBE_OK"),
+        ("reg_python", "python -c \"print('PY_PROBE_OK')\""),
+    ] {
         let started = std::time::Instant::now();
         let out = reg
             .execute(
@@ -1022,16 +1019,196 @@ async fn windows_pty_capture_diagnostics() {
             Ok(ToolOutput::Terminal {
                 exit_code,
                 raw_output,
-                filtered_output,
                 session_id,
                 ..
-            }) => {
-                println!(
-                    "PROBE {label}: elapsed_ms={} exit={exit_code:?} running_sid={session_id:?} raw={raw_output:?} filtered={filtered_output:?}",
-                    started.elapsed().as_millis()
-                );
-            }
+            }) => println!(
+                "PROBE {label}: elapsed_ms={} exit={exit_code:?} running_sid={session_id:?} raw_bytes={} raw={raw_output:?}",
+                started.elapsed().as_millis(),
+                raw_output.len()
+            ),
             other => println!("PROBE {label}: ERROR {other:?}"),
         }
+    }
+
+    // --- raw portable-pty probes (isolate env / flags / arg encoding) ---
+    struct RawProbe {
+        label: &'static str,
+        program: &'static str,
+        args: Vec<String>,
+        full_env: bool,
+    }
+    let enc = |s: &str| B64.encode(s.encode_utf16().collect::<Vec<_>>());
+    let mk =
+        |label: &'static str, program: &'static str, args: Vec<String>, full_env: bool| RawProbe {
+            label,
+            program,
+            args,
+            full_env,
+        };
+    let probes = vec![
+        mk(
+            "raw_pwsh_plain",
+            "pwsh.exe",
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "Write-Output A1".into(),
+            ],
+            false,
+        ),
+        mk(
+            "raw_pwsh_full_env",
+            "pwsh.exe",
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "Write-Output A2".into(),
+            ],
+            true,
+        ),
+        mk(
+            "raw_pwsh_no_noninteractive",
+            "pwsh.exe",
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                "Write-Output A3".into(),
+            ],
+            false,
+        ),
+        mk(
+            "raw_powershell51",
+            "powershell.exe",
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "Write-Output A4".into(),
+            ],
+            false,
+        ),
+        mk(
+            "raw_pwsh_encoded",
+            "pwsh.exe",
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-EncodedCommand".into(),
+                enc("Write-Output A5"),
+            ],
+            false,
+        ),
+        mk(
+            "raw_cmd",
+            "cmd.exe",
+            vec!["/c".into(), "echo A6".into()],
+            false,
+        ),
+    ];
+
+    let pty_system = native_pty_system();
+    for probe in probes {
+        let started = std::time::Instant::now();
+        let pair = match pty_system.openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            Ok(pair) => pair,
+            Err(e) => {
+                println!("PROBE {}: openpty ERROR {e}", probe.label);
+                continue;
+            }
+        };
+        let mut cmd = CommandBuilder::new(probe.program);
+        for arg in &probe.args {
+            cmd.arg(arg);
+        }
+        cmd.cwd(std::env::temp_dir());
+        if probe.full_env {
+            for (k, v) in std::env::vars() {
+                cmd.env(k, v);
+            }
+        } else {
+            cmd.env_clear();
+            for k in [
+                "SystemRoot",
+                "SystemDrive",
+                "WINDIR",
+                "COMSPEC",
+                "PATHEXT",
+                "USERPROFILE",
+                "HOMEDRIVE",
+                "HOMEPATH",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "PROGRAMDATA",
+                "PROGRAMFILES",
+                "NUMBER_OF_PROCESSORS",
+                "PROCESSOR_ARCHITECTURE",
+                "PATH",
+                "TEMP",
+                "TMP",
+            ] {
+                if let Ok(v) = std::env::var(k) {
+                    cmd.env(k, v);
+                }
+            }
+        }
+        let mut child = match pair.slave.spawn_command(cmd) {
+            Ok(child) => child,
+            Err(e) => {
+                println!("PROBE {}: spawn ERROR {e}", probe.label);
+                continue;
+            }
+        };
+        drop(pair.slave);
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(e) => {
+                println!("PROBE {}: reader ERROR {e}", probe.label);
+                continue;
+            }
+        };
+        // Drain for up to 6s, recording bytes as they arrive.
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let captured_reader = Arc::clone(&captured);
+        let reader_task = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => captured_reader.lock().unwrap().extend_from_slice(&buf[..n]),
+                }
+            }
+        });
+        let mut exit = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(status)) = child.try_wait() {
+                exit = Some(status.exit_code());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let still_alive = exit.is_none();
+        let _ = child.kill();
+        let _ = reader_task.join();
+        let bytes = captured.lock().unwrap().clone();
+        println!(
+            "PROBE {}: elapsed_ms={} exit={exit:?} still_alive_after_window={still_alive} bytes={} text={:?}",
+            probe.label,
+            started.elapsed().as_millis(),
+            bytes.len(),
+            String::from_utf8_lossy(&bytes)
+        );
     }
 }
