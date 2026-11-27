@@ -62,3 +62,10 @@ The system SHALL connect enabled `[mcp_servers.<name>]` entries from trusted `te
 #### Scenario: HTTP JSON-RPC MCP server invoked and reported in `app-server`
 - **WHEN** trusted `tekvra.toml` enables an HTTP MCP server with `url` and a client calls `mcpServerStatus/list` or invokes `mcp_call`
 - **THEN** the gateway discovers tools via JSON-RPC `POST` to `url`, executes `tools/call` over HTTP, and reports the server's live tool map in `mcpServerStatus/list`
+
+### Requirement: Streamable HTTP `text/event-stream` MCP framing and catalog refresh
+The system SHALL accept both `application/json` and `text/event-stream` responses from HTTP MCP endpoints in `ConfiguredMcpGateway` and refresh cached `McpToolDescriptor` entries when a server notifies `notifications/tools/list_changed`, without mutating top-level LLM tool schemas.
+
+#### Scenario: HTTP MCP server responds with `text/event-stream`
+- **WHEN** an enabled HTTP MCP server replies to `tools/list` or `tools/call` with `Content-Type: text/event-stream` framing JSON-RPC `data:` events
+- **THEN** `ConfiguredMcpGateway` decodes the SSE stream, matches the JSON-RPC response `id`, and returns the result to Monty `code` or `mcpServerStatus/list`

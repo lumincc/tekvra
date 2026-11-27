@@ -87,6 +87,12 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     /// HTTP/SSE endpoint URL for remote MCP server.
     pub url: Option<String>,
+    /// Optional environment variable holding a Bearer token for HTTP MCP requests.
+    pub bearer_token_env_var: Option<String>,
+    /// Optional startup/handshake timeout override in seconds.
+    pub startup_timeout_sec: Option<u64>,
+    /// Optional per-tool call timeout override in seconds.
+    pub tool_timeout_sec: Option<u64>,
     /// Extra environment variables passed to stdio MCP server.
     pub env: BTreeMap<String, String>,
     /// Whether this server is enabled.

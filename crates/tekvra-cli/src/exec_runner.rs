@@ -21,6 +21,8 @@ pub struct ExecRunOptions {
     pub json_events: bool,
     /// Optional path to a JSON Schema file (`--output-schema <PATH>`) that the final output must satisfy.
     pub output_schema: Option<PathBuf>,
+    /// Optional path to write the final assistant message (`-o` / `--output-last-message <PATH>`).
+    pub output_file: Option<PathBuf>,
     /// Input stream format (`"text"` or `"stream-json"`).
     pub input_format: String,
     /// Output stream format (`"text"`, `"json"`, or `"stream-json"`).
@@ -154,24 +156,47 @@ pub async fn run_headless_exec(handle: SessionHandle, opts: ExecRunOptions) -> R
         if let Err(err) = validator.validate(&parsed) {
             return Err(SchemaValidationFailed(format!("{err}")).into());
         }
+        let pretty = serde_json::to_string_pretty(&parsed)?;
+        write_optional_output_file(opts.output_file.as_deref(), &pretty)?;
         if !emit_jsonl {
-            println!("{}", serde_json::to_string_pretty(&parsed)?);
+            println!("{pretty}");
         }
-    } else if !emit_jsonl {
-        if opts.output_format.eq_ignore_ascii_case("stream-json") {
-            println!(
-                "{}",
-                serde_json::to_string(&json!({
-                    "type": "result",
-                    "text": final_assistant_text,
-                }))?
-            );
-        } else {
-            println!("{final_assistant_text}");
+    } else {
+        write_optional_output_file(opts.output_file.as_deref(), &final_assistant_text)?;
+        if !emit_jsonl {
+            if opts.output_format.eq_ignore_ascii_case("stream-json") {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "type": "result",
+                        "text": final_assistant_text,
+                    }))?
+                );
+            } else {
+                println!("{final_assistant_text}");
+            }
         }
     }
 
     Ok(())
+}
+
+fn write_optional_output_file(path: Option<&std::path::Path>, content: &str) -> Result<()> {
+    let Some(target) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed creating parent directory for `-o {}`",
+                target.display()
+            )
+        })?;
+    }
+    std::fs::write(target, content)
+        .with_context(|| format!("failed writing output file `{}`", target.display()))
 }
 
 fn collect_input_prompts(cli_prompt: Option<&str>, input_format: &str) -> Result<Vec<String>> {

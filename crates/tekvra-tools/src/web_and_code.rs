@@ -299,16 +299,12 @@ impl MontyCodeSandbox {
     where
         F: FnMut(&str, &str) -> Result<(), ToolsError> + Send,
     {
-        let tool_list_json: Value = gateway
-            .as_ref()
-            .map(|gw| serde_json::to_value(gw.list_tools()).unwrap_or_else(|_| json!([])))
-            .unwrap_or_else(|| json!([]));
-
+        let gateway_for_vm = gateway.as_ref().map(Arc::clone);
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<PendingMcpBatch>();
         let code_owned = python_code.to_string();
 
         let vm_handle =
-            std::thread::spawn(move || drive_monty_vm(code_owned, tool_list_json, &batch_tx));
+            std::thread::spawn(move || drive_monty_vm(code_owned, gateway_for_vm, &batch_tx));
 
         let mcp_counter = Arc::new(AtomicU32::new(0));
 
@@ -372,7 +368,7 @@ impl MontyCodeSandbox {
 
 fn drive_monty_vm(
     script: String,
-    tool_list_json: Value,
+    gateway: Option<Arc<dyn McpGateway>>,
     batch_tx: &mpsc::UnboundedSender<PendingMcpBatch>,
 ) -> Result<(String, Option<Value>), ToolsError> {
     let mut writer_cb = MontyStdoutBuffer { buf: String::new() };
@@ -425,9 +421,15 @@ fn drive_monty_vm(
 
                 match fn_name.as_str() {
                     "mcp_list" => {
+                        let live_tool_list: Value = gateway
+                            .as_ref()
+                            .map(|gw| {
+                                serde_json::to_value(gw.list_tools()).unwrap_or_else(|_| json!([]))
+                            })
+                            .unwrap_or_else(|| json!([]));
                         progress = call
                             .resume(
-                                ExtFunctionResult::Return(json_to_monty(tool_list_json.clone())),
+                                ExtFunctionResult::Return(json_to_monty(live_tool_list)),
                                 print_writer.reborrow(),
                             )
                             .map_err(|e| ToolsError::CodeSandbox {

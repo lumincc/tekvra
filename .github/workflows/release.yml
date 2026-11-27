@@ -1,0 +1,161 @@
+# Release workflow:
+#   git tag v0.1.0
+#   git push origin v0.1.0
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Tag string to validate & package in dry-run mode (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  validate:
+    name: Validate Tag & Attribution
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Resolve release tag & verify Cargo.toml version parity
+        id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.version_tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          python3 scripts/ci_verify_packaging.py --verify-tag "${TAG}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+  verify-ci:
+    name: Full CI Suite
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs:
+      - validate
+      - verify-ci
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            native_smoke: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            native_smoke: true
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            native_smoke: false
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            native_smoke: true
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            native_smoke: true
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build release-lto tekvra binary
+        run: cargo build --locked --profile release-lto --bin tekvra --target "${{ matrix.target }}"
+      - name: Smoke-test native release binary
+        if: matrix.native_smoke
+        run: |
+          EXT=""
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            EXT=".exe"
+          fi
+          BIN="target/${{ matrix.target }}/release-lto/tekvra${EXT}"
+          EXPECTED_VER="tekvra ${{ needs.validate.outputs.tag }}"
+          EXPECTED_VER="${EXPECTED_VER/tekvra v/tekvra }"
+          ACTUAL_VER="$("${BIN}" --version | tr -d '\r')"
+          test "${ACTUAL_VER}" = "${EXPECTED_VER}"
+          "${BIN}" --help >/dev/null
+          "${BIN}" exec --help >/dev/null
+          "${BIN}" resume --help >/dev/null
+          "${BIN}" app-server --help >/dev/null
+      - name: Package archive & SHA-256 checksum
+        run: |
+          EXT=""
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            EXT=".exe"
+          fi
+          BIN="target/${{ matrix.target }}/release-lto/tekvra${EXT}"
+          python3 scripts/ci_verify_packaging.py \
+            --package-release \
+            --version "${{ needs.validate.outputs.tag }}" \
+            --target "${{ matrix.target }}" \
+            --binary "${BIN}" \
+            --out-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Assemble unified SHA256SUMS.txt & verify archives
+        working-directory: artifacts
+        run: |
+          cat *.sha256 | sort -k2 > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          ls -lh
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: Tekvra ${{ needs.validate.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/*.sha256
+            artifacts/SHA256SUMS.txt

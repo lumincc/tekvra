@@ -32,7 +32,9 @@ use crate::TuiError;
 use crate::cards::{ToolCardState, render_tool_card};
 use crate::markdown::render_markdown_lines;
 use crate::modals::{
-    ApprovalModalState, RevertOverlayState, SearchOverlayState, TasksOverlayState,
+    ApprovalModalState, CompletionKind, CompletionPopupState, RevertOverlayState,
+    SearchOverlayState, SessionsOverlayState, TasksOverlayState, build_completion_popup,
+    is_excluded_mention_path,
 };
 
 /// Single entry in the TUI transcript view (main session or subagent).
@@ -71,6 +73,8 @@ pub enum ActiveOverlay {
     Tasks(TasksOverlayState),
     /// `/search` FTS5 history session picker.
     Search(SearchOverlayState),
+    /// `/sessions` (`/resume`) recent session browser & fork picker.
+    Sessions(SessionsOverlayState),
     /// `/revert` workspace file-restoration preview.
     Revert(RevertOverlayState),
 }
@@ -95,6 +99,15 @@ pub enum TuiCommand {
     },
     /// Open `/tasks` overlay refreshed from `SubagentManager`.
     OpenTasksOverlay,
+    /// Open `/sessions` (`/resume`) interactive session browser refreshed from `StateIndex`.
+    OpenSessionsOverlay,
+    /// Switch active TUI session by resuming `session_id` (`fork = false`) or forking a child session (`fork = true`).
+    SwitchSession {
+        /// Target session identifier.
+        session_id: String,
+        /// `true` to fork a new session branch from `session_id`; `false` to resume `session_id`.
+        fork: bool,
+    },
     /// Execute FTS5 `/search <query>` against `StateIndex`.
     RunSearch {
         /// FTS5 query string.
@@ -130,9 +143,22 @@ pub type BoxReviewFuture =
 /// Boxed callback invoked on `/<name> <args>` for opt-in Luau plugin commands (`Ok(None)` = unknown command).
 pub type PluginCommandHandler = Box<dyn FnMut(&str, &str) -> Result<Option<String>, String> + Send>;
 
+/// Result returned when switching or forking a session in [`TuiRuntimeHooks::on_switch_session`].
+pub type SwitchSessionOutcome = (SessionHandle, Vec<RolloutRecord>);
+
+/// Boxed callback invoked when resuming or forking a session from `/sessions`.
+pub type SwitchSessionHandler =
+    Box<dyn FnMut(&str, bool) -> Result<SwitchSessionOutcome, String> + Send>;
+
 /// Optional host callbacks wired into [`run_fullscreen_tui`].
 #[derive(Default)]
 pub struct TuiRuntimeHooks {
+    /// Initial persisted rollout records when launching `tekvra resume` or `tekvra fork`.
+    pub initial_records: Vec<RolloutRecord>,
+    /// Pre-scanned non-sensitive workspace relative file paths for `@file` completion.
+    pub workspace_files: Vec<String>,
+    /// Extra `(name, description)` slash commands registered by active Luau plugins.
+    pub extra_slash_commands: Vec<(String, String)>,
     /// Invoked on `/reload` to rebuild opt-in Luau plugins.
     pub on_reload_plugins: Option<Box<dyn FnMut() -> Result<String, String> + Send>>,
     /// Invoked on `/<name> <args>` to execute a plugin-registered slash command (`Ok(None)` = unknown command).
@@ -141,6 +167,8 @@ pub struct TuiRuntimeHooks {
     pub on_mcp_status: Option<Box<dyn FnMut() -> String + Send>>,
     /// Invoked on `/review` to execute a read-only diff review pass.
     pub on_run_review: Option<Box<dyn FnMut(ReviewTarget) -> BoxReviewFuture + Send>>,
+    /// Invoked when the user selects a session to resume or fork in `/sessions`.
+    pub on_switch_session: Option<SwitchSessionHandler>,
 }
 
 /// Pure, deterministic full-screen TUI state machine (testable headlessly with `ratatui::backend::TestBackend`).
@@ -171,6 +199,12 @@ pub struct TuiApp {
     pub input_buffer: String,
     /// UTF-8 char-aligned byte cursor position within `input_buffer`.
     pub cursor_byte_pos: usize,
+    /// Cached non-sensitive workspace relative file paths for `@file` completion.
+    pub workspace_files: Vec<String>,
+    /// Extra `(name, description)` slash commands from active Luau plugins.
+    pub extra_slash_commands: Vec<(String, String)>,
+    /// Active inline `/` or `@file` fuzzy completion popup.
+    pub completion: Option<CompletionPopupState>,
     /// Active modal overlay.
     pub overlay: ActiveOverlay,
 }
@@ -197,8 +231,79 @@ impl TuiApp {
             scroll_offset: 0,
             input_buffer: String::new(),
             cursor_byte_pos: 0,
+            workspace_files: Vec::new(),
+            extra_slash_commands: Vec::new(),
+            completion: None,
             overlay: ActiveOverlay::None,
         }
+    }
+
+    /// Sets the cached workspace relative paths for `@file` completion (automatically filtering `.git` and `.env*` secrets).
+    pub fn set_workspace_files(&mut self, files: Vec<String>) {
+        let mut clean: Vec<String> = files
+            .into_iter()
+            .map(|p| p.replace('\\', "/"))
+            .filter(|p| !p.is_empty() && !is_excluded_mention_path(p))
+            .collect();
+        clean.sort();
+        clean.dedup();
+        self.workspace_files = clean;
+        self.refresh_completions();
+    }
+
+    /// Sets custom Luau plugin slash commands `(name, description)` for `/` completion.
+    pub fn set_extra_slash_commands(&mut self, cmds: Vec<(String, String)>) {
+        self.extra_slash_commands = cmds;
+        self.refresh_completions();
+    }
+
+    /// Recomputes `self.completion` from the current `input_buffer` and `cursor_byte_pos`.
+    pub fn refresh_completions(&mut self) {
+        self.completion = build_completion_popup(
+            &self.input_buffer,
+            self.cursor_byte_pos,
+            &self.workspace_files,
+            &self.extra_slash_commands,
+            8,
+        );
+    }
+
+    /// Accepts the currently highlighted candidate in `self.completion`, inserting it at the UTF-8 token span.
+    pub fn accept_completion(&mut self) -> bool {
+        let Some(popup) = self.completion.take() else {
+            return false;
+        };
+        let Some(cand) = popup.selected_candidate() else {
+            return false;
+        };
+        if popup.token_start <= popup.token_end
+            && popup.token_end <= self.input_buffer.len()
+            && self.input_buffer.is_char_boundary(popup.token_start)
+            && self.input_buffer.is_char_boundary(popup.token_end)
+        {
+            self.input_buffer
+                .replace_range(popup.token_start..popup.token_end, &cand.replacement);
+            self.cursor_byte_pos = popup.token_start + cand.replacement.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Replaces the active main session view with persisted [`RolloutRecord`]s (`resume` or `fork`).
+    pub fn load_main_rollout(
+        &mut self,
+        session_id: impl Into<String>,
+        active_model: impl Into<String>,
+        records: &[RolloutRecord],
+    ) {
+        self.session_id = session_id.into();
+        self.active_model = active_model.into();
+        self.viewing_subagent = None;
+        self.turn_running = false;
+        self.scroll_offset = 0;
+        self.selected_tool_card = None;
+        self.main_transcript = rollout_records_to_entries(records);
     }
 
     fn clamped_cursor(&self) -> usize {
@@ -223,6 +328,7 @@ impl TuiApp {
             .char_indices()
             .next_back()
             .map_or(0, |(idx, _)| idx);
+        self.refresh_completions();
     }
 
     /// Moves the composer cursor one Unicode scalar value to the right.
@@ -231,16 +337,19 @@ impl TuiApp {
         if let Some(ch) = self.input_buffer[pos..].chars().next() {
             self.cursor_byte_pos = pos + ch.len_utf8();
         }
+        self.refresh_completions();
     }
 
     /// Moves the composer cursor to the start of `input_buffer`.
     pub fn move_cursor_home(&mut self) {
         self.cursor_byte_pos = 0;
+        self.refresh_completions();
     }
 
     /// Moves the composer cursor to the end of `input_buffer`.
     pub fn move_cursor_end(&mut self) {
         self.cursor_byte_pos = self.input_buffer.len();
+        self.refresh_completions();
     }
 
     /// Inserts `ch` at the current UTF-8 cursor boundary.
@@ -248,6 +357,7 @@ impl TuiApp {
         let pos = self.clamped_cursor();
         self.input_buffer.insert(pos, ch);
         self.cursor_byte_pos = pos + ch.len_utf8();
+        self.refresh_completions();
     }
 
     /// Deletes the Unicode scalar immediately preceding the cursor.
@@ -256,6 +366,7 @@ impl TuiApp {
         if let Some((prev_idx, _)) = self.input_buffer[..pos].char_indices().next_back() {
             self.input_buffer.remove(prev_idx);
             self.cursor_byte_pos = prev_idx;
+            self.refresh_completions();
         }
     }
 
@@ -265,6 +376,7 @@ impl TuiApp {
         if pos < self.input_buffer.len() {
             self.input_buffer.remove(pos);
             self.cursor_byte_pos = pos;
+            self.refresh_completions();
         }
     }
 
@@ -353,49 +465,8 @@ impl TuiApp {
 
     /// Populates a subagent's transcript from persisted `.jsonl` [`RolloutRecord`]s.
     pub fn load_subagent_rollout(&mut self, task_id: &str, records: &[RolloutRecord]) {
-        let mut entries = Vec::new();
-        for rec in records {
-            match rec {
-                RolloutRecord::Message { message, .. } => {
-                    for part in &message.parts {
-                        if let tekvra_providers_shim::RoleText::User(t) =
-                            classify_message_part(message, part)
-                        {
-                            entries.push(TranscriptEntry::UserMessage(t));
-                        } else if let tekvra_providers_shim::RoleText::Assistant(t) =
-                            classify_message_part(message, part)
-                        {
-                            entries.push(TranscriptEntry::AssistantMessage {
-                                item_id: "hist".to_string(),
-                                reasoning: String::new(),
-                                markdown: t,
-                            });
-                        }
-                    }
-                }
-                RolloutRecord::ToolCard {
-                    call_id,
-                    tool_name,
-                    output,
-                    ..
-                } => {
-                    entries.push(TranscriptEntry::ToolCard(ToolCardState::new(
-                        call_id.clone(),
-                        tool_name.clone(),
-                        output.clone(),
-                    )));
-                }
-                RolloutRecord::SteeringNote { kind, text, .. } => {
-                    entries.push(TranscriptEntry::SystemBanner {
-                        tag: kind.clone(),
-                        text: text.clone(),
-                    });
-                }
-                _ => {}
-            }
-        }
         self.subagent_transcripts
-            .insert(task_id.to_string(), entries);
+            .insert(task_id.to_string(), rollout_records_to_entries(records));
     }
 
     /// Applies an incoming [`SessionEvent`] from the main session (or subagent stream) to the UI state.
@@ -519,6 +590,11 @@ impl TuiApp {
         self.overlay = ActiveOverlay::Tasks(TasksOverlayState::new(entries));
     }
 
+    /// Opens the `/sessions` (`/resume`) overlay populated with `sessions`.
+    pub fn open_sessions_overlay(&mut self, sessions: Vec<tekvra_storage::SessionSummary>) {
+        self.overlay = ActiveOverlay::Sessions(SessionsOverlayState::new(sessions));
+    }
+
     /// Handles a single keyboard event and returns the resulting [`TuiCommand`].
     pub fn handle_key(&mut self, key: KeyEvent) -> TuiCommand {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -634,6 +710,34 @@ impl TuiApp {
                 }
                 _ => TuiCommand::Noop,
             },
+            ActiveOverlay::Sessions(sessions) => match key.code {
+                KeyCode::Esc => {
+                    self.overlay = ActiveOverlay::None;
+                    TuiCommand::Noop
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    sessions.next();
+                    TuiCommand::Noop
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    sessions.prev();
+                    TuiCommand::Noop
+                }
+                KeyCode::Tab | KeyCode::Char('f') => {
+                    sessions.toggle_fork_mode();
+                    TuiCommand::Noop
+                }
+                KeyCode::Enter => {
+                    let target = sessions.selected_session_id().map(str::to_string);
+                    let fork = sessions.fork_mode;
+                    self.overlay = ActiveOverlay::None;
+                    match target {
+                        Some(session_id) => TuiCommand::SwitchSession { session_id, fork },
+                        None => TuiCommand::Noop,
+                    }
+                }
+                _ => TuiCommand::Noop,
+            },
             ActiveOverlay::Revert(rev) => match key.code {
                 KeyCode::Esc => {
                     self.overlay = ActiveOverlay::None;
@@ -703,6 +807,35 @@ impl TuiApp {
             return TuiCommand::Noop;
         }
 
+        // Inline `/` and `@file` fuzzy completion popup keyboard navigation
+        if let Some(popup) = &mut self.completion {
+            match key.code {
+                KeyCode::Down => {
+                    popup.next();
+                    return TuiCommand::Noop;
+                }
+                KeyCode::Up => {
+                    popup.prev();
+                    return TuiCommand::Noop;
+                }
+                KeyCode::Esc => {
+                    self.completion = None;
+                    return TuiCommand::Noop;
+                }
+                KeyCode::Tab => {
+                    let _ = self.accept_completion();
+                    return TuiCommand::Noop;
+                }
+                KeyCode::Enter
+                    if popup.kind == CompletionKind::WorkspaceFile || popup.navigated =>
+                {
+                    let _ = self.accept_completion();
+                    return TuiCommand::Noop;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::PageUp => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
@@ -741,6 +874,7 @@ impl TuiApp {
                 TuiCommand::Noop
             }
             KeyCode::Enter => {
+                self.completion = None;
                 let submitted = std::mem::take(&mut self.input_buffer);
                 self.cursor_byte_pos = 0;
                 let trimmed = submitted.trim();
@@ -753,9 +887,30 @@ impl TuiApp {
                 if trimmed == "/help" {
                     self.main_transcript.push(TranscriptEntry::SystemBanner {
                         tag: "help".to_string(),
-                        text: "Commands: /help, /model <provider/model>, /mode <plan|build|auto|yolo>, /goal <cond|clear>, /review [uncommitted|base <branch>|commit <sha>], /mcp, /tasks (Ctrl-X), /search <query>, /revert <turn_id>, /reload, /quit | Keys: Left/Right/Home/End/Delete, Ctrl-J newline, Shift-Tab cycle mode, r Raw/Filtered".to_string(),
+                        text: "Commands: /help, /model <provider/model>, /mode <plan|build|auto|yolo>, /sessions (/resume [id]), /fork <id>, /goal <cond|clear>, /review [uncommitted|base <branch>|commit <sha>], /mcp, /tasks (Ctrl-X), /search <query>, /revert <turn_id>, /reload, /quit | Keys: @file & / completion (Tab/Up/Down), Left/Right/Home/End/Delete, Ctrl-J newline, Shift-Tab cycle mode, r Raw/Filtered".to_string(),
                     });
                     return TuiCommand::Noop;
+                }
+                if trimmed == "/sessions" || trimmed == "/resume" {
+                    return TuiCommand::OpenSessionsOverlay;
+                }
+                if let Some(rest) = trimmed.strip_prefix("/resume ") {
+                    let sid = rest.trim();
+                    if !sid.is_empty() {
+                        return TuiCommand::SwitchSession {
+                            session_id: sid.to_string(),
+                            fork: false,
+                        };
+                    }
+                }
+                if let Some(rest) = trimmed.strip_prefix("/fork ") {
+                    let sid = rest.trim();
+                    if !sid.is_empty() {
+                        return TuiCommand::SwitchSession {
+                            session_id: sid.to_string(),
+                            fork: true,
+                        };
+                    }
                 }
                 if trimmed == "/tasks" {
                     return TuiCommand::OpenTasksOverlay;
@@ -900,10 +1055,15 @@ impl TuiApp {
         self.render_composer(frame, chunks[2]);
 
         match &self.overlay {
-            ActiveOverlay::None => {}
+            ActiveOverlay::None => {
+                if let Some(popup) = &self.completion {
+                    self.render_completion_popup(frame, chunks[2], popup);
+                }
+            }
             ActiveOverlay::Approval(modal) => self.render_approval_modal(frame, modal),
             ActiveOverlay::Tasks(tasks) => self.render_tasks_modal(frame, tasks),
             ActiveOverlay::Search(search) => self.render_search_modal(frame, search),
+            ActiveOverlay::Sessions(sessions) => self.render_sessions_modal(frame, sessions),
             ActiveOverlay::Revert(rev) => self.render_revert_modal(frame, rev),
         }
     }
@@ -1205,6 +1365,123 @@ impl TuiApp {
         );
         frame.render_widget(widget, area);
     }
+
+    fn render_completion_popup(
+        &self,
+        frame: &mut Frame<'_>,
+        composer_area: Rect,
+        popup: &CompletionPopupState,
+    ) {
+        let rows = u16::try_from(popup.candidates.len()).unwrap_or(8).min(8);
+        let height = rows.saturating_add(2);
+        if composer_area.y < height {
+            return;
+        }
+        let width = composer_area.width.min(84);
+        let popup_area = Rect {
+            x: composer_area.x,
+            y: composer_area.y.saturating_sub(height),
+            width,
+            height,
+        };
+        frame.render_widget(Clear, popup_area);
+
+        let lines: Vec<Line<'static>> = popup
+            .candidates
+            .iter()
+            .enumerate()
+            .map(|(idx, cand)| {
+                let sel = idx == popup.selected;
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {} {:<28} ", if sel { "▸" } else { " " }, cand.label),
+                        if sel {
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        },
+                    ),
+                    Span::styled(
+                        cand.description.clone(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            })
+            .collect();
+
+        let title = match popup.kind {
+            CompletionKind::SlashCommand => " Slash Commands (Tab/Enter select, Esc close) ",
+            CompletionKind::WorkspaceFile => " @File Mention (Tab/Enter select, Esc close) ",
+        };
+        let widget = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+        frame.render_widget(widget, popup_area);
+    }
+
+    fn render_sessions_modal(&self, frame: &mut Frame<'_>, sessions: &SessionsOverlayState) {
+        let area = centered_rect(82, 65, frame.area());
+        frame.render_widget(Clear, area);
+
+        let action_label = if sessions.fork_mode {
+            "FORK NEW BRANCH"
+        } else {
+            "RESUME IN PLACE"
+        };
+        let mut lines = vec![Line::from(Span::styled(
+            format!(
+                "Recent Indexed Sessions ({}) — Mode: [{}] (Tab/f toggles Resume/Fork)",
+                sessions.sessions.len(),
+                action_label
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))];
+
+        if sessions.sessions.is_empty() {
+            lines.push(Line::from(Span::raw("  (no saved sessions in StateIndex)")));
+        } else {
+            for (i, s) in sessions.sessions.iter().enumerate() {
+                let sel = i == sessions.selected;
+                let headline = s
+                    .title
+                    .as_deref()
+                    .filter(|t| !t.trim().is_empty())
+                    .or_else(|| (!s.preview.trim().is_empty()).then_some(s.preview.as_str()))
+                    .unwrap_or("(untitled session)");
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} {} [{}] {}",
+                        if sel { "▸" } else { " " },
+                        s.id,
+                        s.model,
+                        headline
+                    ),
+                    if sel {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                )));
+            }
+        }
+        lines.push(Line::from(Span::raw(
+            "Enter: Confirm | Tab/f: Toggle Resume/Fork | Up/Down: Navigate | Esc: Cancel",
+        )));
+
+        let widget = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Sessions (/sessions | /resume) "),
+        );
+        frame.render_widget(widget, area);
+    }
 }
 
 struct AltScreenGuard;
@@ -1229,7 +1506,7 @@ impl Drop for AltScreenGuard {
 /// # Errors
 /// Returns [`TuiError`] if terminal setup or session dispatch fails.
 pub async fn run_fullscreen_tui(
-    handle: SessionHandle,
+    mut handle: SessionHandle,
     state_index: Arc<Mutex<StateIndex>>,
     snapshots: WorkspaceSnapshotStore,
     mut hooks: TuiRuntimeHooks,
@@ -1239,7 +1516,17 @@ pub async fn run_fullscreen_tui(
     let mut terminal = Terminal::new(backend)?;
 
     let snap = handle.state_snapshot();
-    let mut app = TuiApp::new(handle.session_id(), snap.active_model, snap.mode);
+    let mut app = TuiApp::new(handle.session_id(), snap.active_model.clone(), snap.mode);
+    if !hooks.initial_records.is_empty() {
+        app.load_main_rollout(
+            handle.session_id().to_string(),
+            snap.active_model,
+            &hooks.initial_records,
+        );
+        hooks.initial_records.clear();
+    }
+    app.set_workspace_files(std::mem::take(&mut hooks.workspace_files));
+    app.set_extra_slash_commands(std::mem::take(&mut hooks.extra_slash_commands));
     let mut event_rx = handle.subscribe();
     let mut term_events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60 FPS
@@ -1275,6 +1562,42 @@ pub async fn run_fullscreen_tui(
                                 }
                             }
                             app.open_tasks_overlay(entries);
+                        }
+                        TuiCommand::OpenSessionsOverlay => {
+                            let sessions = state_index
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .list_sessions(false, 30, 0)
+                                .unwrap_or_default();
+                            app.open_sessions_overlay(sessions);
+                        }
+                        TuiCommand::SwitchSession { session_id, fork } => {
+                            if let Some(cb) = &mut hooks.on_switch_session {
+                                match cb(&session_id, fork) {
+                                    Ok((new_handle, records)) => {
+                                        handle = new_handle;
+                                        event_rx = handle.subscribe();
+                                        let new_snap = handle.state_snapshot();
+                                        app.mode = new_snap.mode;
+                                        app.load_main_rollout(
+                                            handle.session_id().to_string(),
+                                            new_snap.active_model,
+                                            &records,
+                                        );
+                                        let verb = if fork { "Forked into" } else { "Resumed" };
+                                        app.main_transcript.push(TranscriptEntry::SystemBanner {
+                                            tag: "session".to_string(),
+                                            text: format!("{verb} session `{}`", handle.session_id()),
+                                        });
+                                    }
+                                    Err(err) => {
+                                        app.main_transcript.push(TranscriptEntry::SystemBanner {
+                                            tag: "error".to_string(),
+                                            text: format!("Session switch failed: {err}"),
+                                        });
+                                    }
+                                }
+                            }
                         }
                         TuiCommand::RunSearch { query } => {
                             let hits = state_index
@@ -1368,6 +1691,51 @@ fn parse_tui_review_target(rest: &str) -> ReviewTarget {
     ReviewTarget::Custom {
         instructions: rest.to_string(),
     }
+}
+
+fn rollout_records_to_entries(records: &[RolloutRecord]) -> Vec<TranscriptEntry> {
+    let mut entries = Vec::new();
+    for rec in records {
+        match rec {
+            RolloutRecord::Message { message, .. } => {
+                for part in &message.parts {
+                    if let tekvra_providers_shim::RoleText::User(t) =
+                        classify_message_part(message, part)
+                    {
+                        entries.push(TranscriptEntry::UserMessage(t));
+                    } else if let tekvra_providers_shim::RoleText::Assistant(t) =
+                        classify_message_part(message, part)
+                    {
+                        entries.push(TranscriptEntry::AssistantMessage {
+                            item_id: "hist".to_string(),
+                            reasoning: String::new(),
+                            markdown: t,
+                        });
+                    }
+                }
+            }
+            RolloutRecord::ToolCard {
+                call_id,
+                tool_name,
+                output,
+                ..
+            } => {
+                entries.push(TranscriptEntry::ToolCard(ToolCardState::new(
+                    call_id.clone(),
+                    tool_name.clone(),
+                    output.clone(),
+                )));
+            }
+            RolloutRecord::SteeringNote { kind, text, .. } => {
+                entries.push(TranscriptEntry::SystemBanner {
+                    tag: kind.clone(),
+                    text: text.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    entries
 }
 
 mod tekvra_providers_shim {

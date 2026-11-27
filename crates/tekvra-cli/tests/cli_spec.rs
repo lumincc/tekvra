@@ -444,6 +444,122 @@ async fn cli_auth_login_device_code_loopback_pkce_and_startup_refresh_token_rene
     assert!(creds_raw.contains("at_pkce_browser_ok"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_exec_output_file_and_resume_last_and_fork_preserve_conversation() {
+    use tekvra_storage::StateIndex;
+
+    let base_url = spawn_mock_openai_server(vec![
+        "FIRST_TURN_SAVED",
+        "RESUMED_SECOND_TURN",
+        "FORKED_TURN",
+    ])
+    .await;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("repo");
+    let cfg_dir = tmp.path().join("cfg");
+    let state_dir = tmp.path().join("state");
+    let out_file = tmp.path().join("nested").join("last_msg.txt");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(&cfg_dir).expect("mkdir cfg");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+
+    std::fs::write(
+        cfg_dir.join("providers.toml"),
+        format!("version = 2\n\n[providers.openai]\nbase_url = \"{base_url}\"\n"),
+    )
+    .expect("write providers.toml");
+
+    let bin = env!("CARGO_BIN_EXE_tekvra");
+
+    // 1. `tekvra exec -o <file> "Initial prompt"` writes `-o` file and persists session in StateIndex!
+    let turn1 = Command::new(bin)
+        .current_dir(&ws)
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .env("OPENAI_API_KEY", "sk-test-resume")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .args([
+            "--no-plugins",
+            "exec",
+            "-o",
+            out_file.to_str().expect("utf8"),
+            "Initial prompt",
+        ])
+        .output()
+        .await
+        .expect("run turn 1");
+    assert!(turn1.status.success());
+    assert_eq!(
+        std::fs::read_to_string(&out_file).expect("read -o file"),
+        "FIRST_TURN_SAVED"
+    );
+
+    let idx = StateIndex::open(&state_dir).expect("open state index");
+    let sessions_after_1 = idx.list_sessions(false, 10, 0).expect("list sessions");
+    assert_eq!(sessions_after_1.len(), 1);
+    let orig_id = sessions_after_1[0].id.clone();
+
+    // 2. `tekvra resume --last --prompt "Follow-up prompt"` resumes `orig_id`!
+    let turn2 = Command::new(bin)
+        .current_dir(&ws)
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .env("OPENAI_API_KEY", "sk-test-resume")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .args([
+            "--no-plugins",
+            "resume",
+            "--last",
+            "--prompt",
+            "Follow-up prompt",
+        ])
+        .output()
+        .await
+        .expect("run resume --last");
+    assert!(
+        turn2.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&turn2.stderr)
+    );
+    assert!(String::from_utf8_lossy(&turn2.stdout).contains("RESUMED_SECOND_TURN"));
+
+    // 3. `tekvra fork <orig_id> --prompt "Branch prompt"` creates a second session with `parent_id = Some(orig_id)`!
+    let forked = Command::new(bin)
+        .current_dir(&ws)
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .env("OPENAI_API_KEY", "sk-test-resume")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .args([
+            "--no-plugins",
+            "fork",
+            &orig_id,
+            "--prompt",
+            "Branch prompt",
+        ])
+        .output()
+        .await
+        .expect("run fork");
+    assert!(
+        forked.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&forked.stderr)
+    );
+    let fork_stdout = String::from_utf8_lossy(&forked.stdout);
+    assert!(fork_stdout.contains("Forked session: thr_"));
+    assert!(fork_stdout.contains("FORKED_TURN"));
+
+    let sessions_after_fork = idx.list_sessions(false, 10, 0).expect("list sessions 2");
+    assert_eq!(sessions_after_fork.len(), 2);
+    assert!(
+        sessions_after_fork
+            .iter()
+            .any(|s| s.parent_id.as_deref() == Some(orig_id.as_str())),
+        "expected forked session to record parent_id={orig_id}"
+    );
+}
+
 fn tekvra_providers_url_query(raw_url: &str) -> std::collections::BTreeMap<String, String> {
     let (_, query) = raw_url.split_once('?').unwrap_or((raw_url, ""));
     let mut out = std::collections::BTreeMap::new();

@@ -277,3 +277,129 @@ fn utf8_cjk_composer_cursor_editing_and_slash_commands_with_plugin_dispatch() {
     assert!(screen.contains("Connected MCP servers: stdio_srv"));
     assert!(screen.contains("GREETINGS_FROM_LUAU:tekvra"));
 }
+
+#[test]
+fn fuzzy_slash_and_at_file_completion_excludes_secrets_and_sessions_picker_resumes_or_forks() {
+    use std::path::PathBuf;
+    use tekvra_storage::SessionSummary;
+
+    let mut app = TuiApp::new("thr_main_01", "openai/gpt-5.4-codex", PermissionMode::Build);
+    app.set_workspace_files(vec![
+        ".git/config".to_string(),
+        ".env".to_string(),
+        ".env.production".to_string(),
+        "secrets/prod.pem".to_string(),
+        "crates/tekvra-core/src/session.rs".to_string(),
+        "crates/tekvra-tui/src/app.rs".to_string(),
+        "README.md".to_string(),
+    ]);
+    app.set_extra_slash_commands(vec![(
+        "deploy".to_string(),
+        "Run Luau deploy helper".to_string(),
+    )]);
+
+    // Verify secret & `.git` paths were scrubbed from `workspace_files`
+    assert_eq!(
+        app.workspace_files,
+        vec![
+            "README.md".to_string(),
+            "crates/tekvra-core/src/session.rs".to_string(),
+            "crates/tekvra-tui/src/app.rs".to_string(),
+        ]
+    );
+
+    // 1. Slash command fuzzy completion (`/dep` -> Tab completes `/deploy `)
+    for ch in "/dep".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    assert!(app.completion.is_some());
+    let popup_screen = render_screen_text(&app, 120, 30);
+    assert!(popup_screen.contains("/deploy"));
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(app.input_buffer, "/deploy ");
+    assert!(app.completion.is_none());
+
+    app.input_buffer.clear();
+    app.cursor_byte_pos = 0;
+    app.refresh_completions();
+
+    // 2. `@file` fuzzy completion mid-sentence (`Inspect @core/session` -> Enter inserts `@crates/tekvra-core/src/session.rs `)
+    for ch in "Inspect @core/session".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    assert!(
+        app.completion.is_some(),
+        "expected @file popup for `@core/session`"
+    );
+    let file_popup_screen = render_screen_text(&app, 120, 30);
+    assert!(file_popup_screen.contains("@crates/tekvra-core/src/session.rs"));
+    assert!(!file_popup_screen.contains(".env"));
+    assert!(!file_popup_screen.contains("prod.pem"));
+
+    // Pressing Enter while `@file` popup is active inserts the path without prematurely submitting!
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        TuiCommand::Noop
+    );
+    assert_eq!(
+        app.input_buffer,
+        "Inspect @crates/tekvra-core/src/session.rs "
+    );
+
+    app.input_buffer.clear();
+    app.cursor_byte_pos = 0;
+    app.refresh_completions();
+
+    // 3. `/sessions` opens interactive session picker and supports Resume & Fork (`Tab`/`f`)
+    for ch in "/sessions".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        TuiCommand::OpenSessionsOverlay
+    );
+
+    app.open_sessions_overlay(vec![
+        SessionSummary {
+            id: "thr_recent_1".to_string(),
+            parent_id: None,
+            forked_from_turn_id: None,
+            cwd: PathBuf::from("/repo"),
+            project_id: "p1".to_string(),
+            model: "openai/gpt-5.4-codex".to_string(),
+            title: Some("Refactor MCP client".to_string()),
+            preview: "Refactor MCP".to_string(),
+            archived: false,
+            created_at: 100,
+            updated_at: 200,
+        },
+        SessionSummary {
+            id: "thr_older_2".to_string(),
+            parent_id: None,
+            forked_from_turn_id: None,
+            cwd: PathBuf::from("/repo"),
+            project_id: "p1".to_string(),
+            model: "anthropic/claude-sonnet-4-5".to_string(),
+            title: None,
+            preview: "Audit OAuth PKCE".to_string(),
+            archived: false,
+            created_at: 50,
+            updated_at: 120,
+        },
+    ]);
+
+    let sessions_screen = render_screen_text(&app, 120, 30);
+    assert!(sessions_screen.contains("Refactor MCP client"));
+    assert!(sessions_screen.contains("Audit OAuth PKCE"));
+
+    // Navigate Down to `thr_older_2`, toggle Fork mode (`Tab`), and press Enter!
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        TuiCommand::SwitchSession {
+            session_id: "thr_older_2".to_string(),
+            fork: true,
+        }
+    );
+}

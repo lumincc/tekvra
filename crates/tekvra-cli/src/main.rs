@@ -1,23 +1,24 @@
-//! Unified `tekvra` CLI binary entrypoint (`tekvra`, `exec`, `review`, `app-server`, `acp`, `auth`).
+//! Unified `tekvra` CLI binary entrypoint (`tekvra`, `exec`, `resume`, `fork`, `review`, `app-server`, `acp`, `auth`).
 
 mod exec_runner;
 
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use exec_runner::{ExecRunOptions, SchemaValidationFailed, run_headless_exec};
+use ignore::WalkBuilder;
 use tekvra_acp::{AcpServerDeps, serve_acp_stdio};
 use tekvra_app_server::{
     AppServerState, AppServerStateInit, parse_listen_endpoint, serve_endpoint,
 };
 use tekvra_config::{CliConfigOverrides, ConfigPaths, ResolvedConfig, load_config};
 use tekvra_core::{
-    CompactionConfig, PluginToolExecutor, ReviewTarget, SessionBootstrap, run_code_review,
-    spawn_session,
+    CompactionConfig, PluginToolExecutor, ReviewTarget, SessionBootstrap, SessionHandle,
+    run_code_review, spawn_session,
 };
 use tekvra_lua::{LuaHostOptions, PluginHost};
 use tekvra_protocol::PermissionMode;
@@ -27,9 +28,10 @@ use tekvra_providers::{
     SecretToken, StoredOAuthAccount, build_oauth_http_client, exchange_oauth_token,
     generate_pkce_pair, poll_device_code_token, refresh_oauth_account, request_device_code,
 };
-use tekvra_storage::{StateIndex, WorkspaceSnapshotStore};
-use tekvra_tools::{ConfiguredMcpGateway, McpGateway};
+use tekvra_storage::{RolloutLog, RolloutRecord, StateIndex, WorkspaceSnapshotStore, rollout_path};
+use tekvra_tools::{ConfiguredMcpGateway, McpGateway, is_sensitive_credential_path};
 use tekvra_tui::TuiRuntimeHooks;
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -86,6 +88,10 @@ struct Cli {
 enum Commands {
     /// Execute a prompt headlessly with optional JSONL events, `stream-json`, and `--output-schema` validation.
     Exec(ExecArgs),
+    /// Resume an existing session (`--last` or `<SESSION_ID>`) in TUI or headlessly with `--prompt`.
+    Resume(ResumeArgs),
+    /// Fork a new session branch from `<SESSION_ID>` in TUI or headlessly with `--prompt`.
+    Fork(ForkArgs),
     /// Run a dedicated read-only code review over Git diffs.
     Review(ReviewArgs),
     /// Run the Codex-compatible v2 JSON-RPC 2.0 `app-server` (`stdio://`, `unix://`, `ws://`).
@@ -106,12 +112,42 @@ struct ExecArgs {
     /// Validate final assistant JSON output against `<PATH>` JSON Schema.
     #[arg(long)]
     output_schema: Option<PathBuf>,
+    /// Write final assistant message text/JSON to `<PATH>`.
+    #[arg(short = 'o', long = "output-last-message")]
+    output_file: Option<PathBuf>,
     /// Input format (`text` or `stream-json`).
     #[arg(long, default_value = "text")]
     input_format: String,
     /// Output format (`text`, `json`, or `stream-json`).
     #[arg(long, default_value = "text")]
     output_format: String,
+}
+
+#[derive(Debug, Args)]
+struct ResumeArgs {
+    /// Explicit session ID to resume (omit when `--last` is passed).
+    session_id: Option<String>,
+    /// Resume the most recently updated non-archived session.
+    #[arg(long)]
+    last: bool,
+    /// Optional follow-up prompt to execute headlessly on the resumed session.
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Stream newline-delimited JSONL `SessionEvent` frames when `--prompt` is given.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ForkArgs {
+    /// Parent session ID to fork from.
+    session_id: String,
+    /// Optional follow-up prompt to execute headlessly on the forked session.
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Stream newline-delimited JSONL `SessionEvent` frames when `--prompt` is given.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -287,6 +323,8 @@ async fn try_main() -> Result<()> {
     if let Some(print_prompt) = cli.print_prompt {
         let mode = resolved.settings.agent.default_mode;
         let handle = spawn_cli_session(
+            None,
+            None,
             &resolved,
             &router,
             &driver,
@@ -301,6 +339,7 @@ async fn try_main() -> Result<()> {
                 prompt: Some(print_prompt),
                 json_events: false,
                 output_schema: None,
+                output_file: None,
                 input_format: "text".to_string(),
                 output_format: "text".to_string(),
                 mode,
@@ -313,6 +352,8 @@ async fn try_main() -> Result<()> {
         Some(Commands::Exec(args)) => {
             let mode = resolved.settings.agent.default_mode;
             let handle = spawn_cli_session(
+                None,
+                None,
                 &resolved,
                 &router,
                 &driver,
@@ -327,10 +368,115 @@ async fn try_main() -> Result<()> {
                     prompt: args.prompt,
                     json_events: args.json,
                     output_schema: args.output_schema,
+                    output_file: args.output_file,
                     input_format: args.input_format,
                     output_format: args.output_format,
                     mode,
                 },
+            )
+            .await
+        }
+        Some(Commands::Resume(args)) => {
+            let target_id =
+                if let Some(explicit) = args.session_id {
+                    explicit
+                } else if args.last {
+                    let latest = state_index
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .list_sessions(false, 1, 0)?;
+                    latest.into_iter().next().map(|s| s.id).ok_or_else(|| {
+                        anyhow::anyhow!("no saved sessions found to `--last` resume")
+                    })?
+                } else {
+                    bail!("pass a `<SESSION_ID>` or `--last` to `tekvra resume`");
+                };
+
+            let (handle, records) = open_resumed_or_forked_session(
+                &target_id,
+                false,
+                &resolved,
+                &router,
+                &driver,
+                &state_index,
+                mcp_gateway_opt.clone(),
+                plugin_exec_opt.clone(),
+                extra_tools.clone(),
+            )?;
+
+            if let Some(prompt) = args.prompt {
+                return run_headless_exec(
+                    handle,
+                    ExecRunOptions {
+                        prompt: Some(prompt),
+                        json_events: args.json,
+                        output_schema: None,
+                        output_file: None,
+                        input_format: "text".to_string(),
+                        output_format: "text".to_string(),
+                        mode: resolved.settings.agent.default_mode,
+                    },
+                )
+                .await;
+            }
+
+            launch_interactive_tui(
+                handle,
+                records,
+                resolved,
+                router,
+                driver,
+                state_index,
+                snapshots,
+                plugin_host,
+                mcp_gateway_opt,
+                plugin_exec_opt,
+                extra_tools,
+            )
+            .await
+        }
+        Some(Commands::Fork(args)) => {
+            let (handle, records) = open_resumed_or_forked_session(
+                &args.session_id,
+                true,
+                &resolved,
+                &router,
+                &driver,
+                &state_index,
+                mcp_gateway_opt.clone(),
+                plugin_exec_opt.clone(),
+                extra_tools.clone(),
+            )?;
+
+            if let Some(prompt) = args.prompt {
+                println!("Forked session: {}", handle.session_id());
+                return run_headless_exec(
+                    handle,
+                    ExecRunOptions {
+                        prompt: Some(prompt),
+                        json_events: args.json,
+                        output_schema: None,
+                        output_file: None,
+                        input_format: "text".to_string(),
+                        output_format: "text".to_string(),
+                        mode: resolved.settings.agent.default_mode,
+                    },
+                )
+                .await;
+            }
+
+            launch_interactive_tui(
+                handle,
+                records,
+                resolved,
+                router,
+                driver,
+                state_index,
+                snapshots,
+                plugin_host,
+                mcp_gateway_opt,
+                plugin_exec_opt,
+                extra_tools,
             )
             .await
         }
@@ -408,86 +554,153 @@ async fn try_main() -> Result<()> {
         Some(Commands::Auth(_)) => unreachable!("handled above"),
         None => {
             let handle = spawn_cli_session(
+                None,
+                None,
                 &resolved,
                 &router,
                 &driver,
                 &state_index,
                 mcp_gateway_opt.clone(),
+                plugin_exec_opt.clone(),
+                extra_tools.clone(),
+            )?;
+            launch_interactive_tui(
+                handle,
+                Vec::new(),
+                resolved,
+                router,
+                driver,
+                state_index,
+                snapshots,
+                plugin_host,
+                mcp_gateway_opt,
                 plugin_exec_opt,
                 extra_tools,
-            )?;
-            let host_for_reload = plugin_host.clone();
-            let host_for_cmd = plugin_host.clone();
-            let mcp_for_tui = mcp_gateway_opt.clone();
-            let review_cwd = resolved.cwd.clone();
-            let review_router = router.clone();
-            let review_driver = Arc::clone(&driver);
-            let review_agent_cfg = resolved.settings.agent.clone();
-
-            let hooks = TuiRuntimeHooks {
-                on_reload_plugins: Some(Box::new(move || {
-                    let rep = host_for_reload.reload().map_err(|e| e.to_string())?;
-                    Ok(format!(
-                        "Reloaded {} plugin(s) (vm_active={})",
-                        rep.loaded_plugins.len(),
-                        rep.vm_initialized
-                    ))
-                })),
-                on_plugin_command: Some(Box::new(move |name, args| {
-                    if !host_for_cmd.has_command(name) {
-                        return Ok(None);
-                    }
-                    host_for_cmd
-                        .invoke_command(name, args)
-                        .map(Some)
-                        .map_err(|e| e.to_string())
-                })),
-                on_mcp_status: Some(Box::new(move || {
-                    let Some(gw) = &mcp_for_tui else {
-                        return "No MCP servers connected.".to_string();
-                    };
-                    let tools = gw.list_tools();
-                    if tools.is_empty() {
-                        return "MCP gateway connected (0 tools advertised).".to_string();
-                    }
-                    let summary: Vec<String> = tools
-                        .iter()
-                        .map(|d| format!("{}/{}", d.server, d.tool))
-                        .collect();
-                    format!(
-                        "Connected MCP tools ({}): {}",
-                        tools.len(),
-                        summary.join(", ")
-                    )
-                })),
-                on_run_review: Some(Box::new(move |target| {
-                    let cwd_cl = review_cwd.clone();
-                    let router_cl = review_router.clone();
-                    let driver_cl = Arc::clone(&review_driver);
-                    let agent_cl = review_agent_cfg.clone();
-                    Box::pin(async move {
-                        let out = run_code_review(
-                            "tui_review",
-                            &cwd_cl,
-                            &target,
-                            &router_cl,
-                            driver_cl.as_ref(),
-                            &agent_cl,
-                        )
-                        .await
-                        .map_err(|e| e.to_string())?;
-                        Ok((out.summary, out.findings))
-                    })
-                })),
-            };
-
-            tekvra_tui::run_fullscreen_tui(handle, state_index, snapshots, hooks).await?;
-            Ok(())
+            )
+            .await
         }
     }
 }
 
-fn spawn_cli_session(
+#[allow(clippy::too_many_arguments)]
+async fn launch_interactive_tui(
+    handle: SessionHandle,
+    initial_records: Vec<RolloutRecord>,
+    resolved: ResolvedConfig,
+    router: ModelRouter,
+    driver: Arc<dyn ProviderDriver>,
+    state_index: Arc<Mutex<StateIndex>>,
+    snapshots: WorkspaceSnapshotStore,
+    plugin_host: PluginHost,
+    mcp_gateway_opt: Option<Arc<dyn McpGateway>>,
+    plugin_exec_opt: Option<Arc<dyn PluginToolExecutor>>,
+    extra_tools: Vec<tekvra_providers::ToolDefinition>,
+) -> Result<()> {
+    let workspace_files = scan_workspace_mention_files(&resolved.cwd, 4_000);
+    let extra_slash_commands: Vec<(String, String)> = plugin_host
+        .registered_commands()
+        .into_iter()
+        .map(|c| (c.name, c.description))
+        .collect();
+
+    let host_for_reload = plugin_host.clone();
+    let host_for_cmd = plugin_host;
+    let mcp_for_tui = mcp_gateway_opt.clone();
+    let review_cwd = resolved.cwd.clone();
+    let review_router = router.clone();
+    let review_driver = Arc::clone(&driver);
+    let review_agent_cfg = resolved.settings.agent.clone();
+
+    let sw_resolved = resolved;
+    let sw_router = router;
+    let sw_driver = driver;
+    let sw_index = Arc::clone(&state_index);
+    let sw_mcp = mcp_gateway_opt;
+    let sw_plug = plugin_exec_opt;
+    let sw_tools = extra_tools;
+
+    let hooks = TuiRuntimeHooks {
+        initial_records,
+        workspace_files,
+        extra_slash_commands,
+        on_reload_plugins: Some(Box::new(move || {
+            let rep = host_for_reload.reload().map_err(|e| e.to_string())?;
+            Ok(format!(
+                "Reloaded {} plugin(s) (vm_active={})",
+                rep.loaded_plugins.len(),
+                rep.vm_initialized
+            ))
+        })),
+        on_plugin_command: Some(Box::new(move |name, args| {
+            if !host_for_cmd.has_command(name) {
+                return Ok(None);
+            }
+            host_for_cmd
+                .invoke_command(name, args)
+                .map(Some)
+                .map_err(|e| e.to_string())
+        })),
+        on_mcp_status: Some(Box::new(move || {
+            let Some(gw) = &mcp_for_tui else {
+                return "No MCP servers connected.".to_string();
+            };
+            let tools = gw.list_tools();
+            if tools.is_empty() {
+                return "MCP gateway connected (0 tools advertised).".to_string();
+            }
+            let summary: Vec<String> = tools
+                .iter()
+                .map(|d| format!("{}/{}", d.server, d.tool))
+                .collect();
+            format!(
+                "Connected MCP tools ({}): {}",
+                tools.len(),
+                summary.join(", ")
+            )
+        })),
+        on_run_review: Some(Box::new(move |target| {
+            let cwd_cl = review_cwd.clone();
+            let router_cl = review_router.clone();
+            let driver_cl = Arc::clone(&review_driver);
+            let agent_cl = review_agent_cfg.clone();
+            Box::pin(async move {
+                let out = run_code_review(
+                    "tui_review",
+                    &cwd_cl,
+                    &target,
+                    &router_cl,
+                    driver_cl.as_ref(),
+                    &agent_cl,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok((out.summary, out.findings))
+            })
+        })),
+        on_switch_session: Some(Box::new(move |target_id, fork| {
+            open_resumed_or_forked_session(
+                target_id,
+                fork,
+                &sw_resolved,
+                &sw_router,
+                &sw_driver,
+                &sw_index,
+                sw_mcp.clone(),
+                sw_plug.clone(),
+                sw_tools.clone(),
+            )
+            .map_err(|e| e.to_string())
+        })),
+    };
+
+    tekvra_tui::run_fullscreen_tui(handle, state_index, snapshots, hooks).await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_resumed_or_forked_session(
+    source_session_id: &str,
+    fork: bool,
     resolved: &ResolvedConfig,
     router: &ModelRouter,
     driver: &Arc<dyn ProviderDriver>,
@@ -495,10 +708,91 @@ fn spawn_cli_session(
     mcp_gateway: Option<Arc<dyn McpGateway>>,
     plugin_executor: Option<Arc<dyn PluginToolExecutor>>,
     extra_plugin_tools: Vec<tekvra_providers::ToolDefinition>,
-) -> Result<tekvra_core::SessionHandle> {
+) -> Result<(SessionHandle, Vec<RolloutRecord>)> {
+    let source_path = rollout_path(&resolved.paths.state_dir, source_session_id);
+    if !source_path.is_file() {
+        bail!("session `{source_session_id}` rollout file does not exist");
+    }
+    let records = RolloutLog::read_records_readonly(&resolved.paths.state_dir, source_session_id)?;
+
+    let (effective_id, parent_id) = if fork {
+        let new_id = format!("thr_{}", Uuid::now_v7().simple());
+        let dst = rollout_path(&resolved.paths.state_dir, &new_id);
+        if let Some(parent_dir) = dst.parent() {
+            std::fs::create_dir_all(parent_dir)?;
+        }
+        let mut body = String::new();
+        for rec in &records {
+            if let Ok(line) = serde_json::to_string(rec) {
+                body.push_str(&line);
+                body.push('\n');
+            }
+        }
+        std::fs::write(&dst, body)?;
+        (new_id, Some(source_session_id.to_string()))
+    } else {
+        (source_session_id.to_string(), None)
+    };
+
+    let handle = spawn_cli_session(
+        Some(effective_id),
+        parent_id,
+        resolved,
+        router,
+        driver,
+        state_index,
+        mcp_gateway,
+        plugin_executor,
+        extra_plugin_tools,
+    )?;
+    Ok((handle, records))
+}
+
+fn scan_workspace_mention_files(root: &Path, max_files: usize) -> Vec<String> {
+    if !root.exists() {
+        return Vec::new();
+    }
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .filter_entry(|entry| entry.file_name() != ".git" && entry.file_name() != "target")
+        .build();
+
+    let mut out = Vec::new();
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if !path.is_file() || is_sensitive_credential_path(path) {
+            continue;
+        }
+        if let Ok(rel) = path.strip_prefix(root) {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if !rel_str.is_empty() && !tekvra_tui::is_excluded_mention_path(&rel_str) {
+                out.push(rel_str);
+                if out.len() >= max_files {
+                    break;
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_cli_session(
+    session_id: Option<String>,
+    parent_session_id: Option<String>,
+    resolved: &ResolvedConfig,
+    router: &ModelRouter,
+    driver: &Arc<dyn ProviderDriver>,
+    state_index: &Arc<Mutex<StateIndex>>,
+    mcp_gateway: Option<Arc<dyn McpGateway>>,
+    plugin_executor: Option<Arc<dyn PluginToolExecutor>>,
+    extra_plugin_tools: Vec<tekvra_providers::ToolDefinition>,
+) -> Result<SessionHandle> {
     Ok(spawn_session(SessionBootstrap {
-        session_id: None,
-        parent_session_id: None,
+        session_id,
+        parent_session_id,
         workspace_root: resolved.cwd.clone(),
         state_dir: resolved.paths.state_dir.clone(),
         config: resolved.clone(),

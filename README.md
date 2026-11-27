@@ -98,8 +98,8 @@ tekvra acp
 
 ### TUI Keyboard Shortcuts & Slash Commands
 
-- **Composer & Turn Control**: `Enter` submit (`Queue` while streaming), `Alt-Enter` steer while streaming (or insert newline when idle), `Ctrl-J` insert newline, `Left`/`Right`/`Home`/`End`/`Backspace`/`Delete` UTF-8 cursor editing, `Tab` toggle `Build` <-> `Plan`, `Ctrl-O` toggle Filtered/Raw tool output, `Ctrl-C` interrupt active turn (press twice within 1.5s when idle to exit).
-- **Built-In Slash Commands**: `/help`, `/model <provider/model>`, `/mode <plan|build|auto|yolo>`, `/mcp`, `/review [uncommitted|base <branch>|commit <sha>]`, `/undo`, `/compact`, `/steer <msg>`, `/queue <msg>`, `/quit`.
+- **Composer & Autocomplete**: Type `/` for fuzzy slash-command completion or `@` for non-sensitive workspace file completion (`Up`/`Down` navigate, `Tab`/`Enter` accept, `Esc` dismiss); `Enter` submit (`Guide` while streaming), `Alt-Enter` steer (`Replace`) while streaming (or insert newline when idle), `Ctrl-J` insert newline, `Left`/`Right`/`Home`/`End`/`Backspace`/`Delete` UTF-8 cursor editing, `Shift-Tab` cycle permission mode, `r` toggle Filtered/Raw tool output, `Ctrl-C` interrupt active turn (or exit when idle).
+- **Built-In Slash Commands**: `/help`, `/model <provider/model>`, `/mode <plan|build|auto|yolo>`, `/sessions` (`/resume [id]`), `/fork <id>`, `/mcp`, `/review [uncommitted|base <branch>|commit <sha>]`, `/tasks` (`Ctrl-X`), `/search <query>`, `/revert <turn_id>`, `/goal <cond|clear>`, `/reload`, `/quit`.
 
 ---
 
@@ -110,6 +110,7 @@ tekvra acp
 - [Native Tools, PTY, MCP & Permission Model](docs/tools-and-permissions.md)
 - [Codex v2 `app-server` & `acp` Protocol Guide](docs/app-server.md)
 - [Opt-In Sandboxed Luau Plugins](docs/plugins.md)
+- [CI/CD & Multi-Platform Release Pipeline](docs/ci-cd.md)
 
 ---
 
@@ -120,6 +121,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo deny --offline check licenses bans sources
+python3 scripts/ci_verify_packaging.py --check-workflows
 openspec validate --specs --strict
 ```
 

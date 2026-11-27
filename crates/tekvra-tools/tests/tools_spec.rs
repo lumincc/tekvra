@@ -711,29 +711,24 @@ for raw in sys.stdin:
         McpServerConfig {
             command: Some("python3".to_string()),
             args: vec![stdio_script.to_string_lossy().into_owned()],
-            url: None,
-            env: std::collections::BTreeMap::new(),
             enabled: true,
+            ..McpServerConfig::default()
         },
     );
     servers.insert(
         "http_srv".to_string(),
         McpServerConfig {
-            command: None,
-            args: Vec::new(),
             url: Some(format!("http://{http_addr}/mcp")),
-            env: std::collections::BTreeMap::new(),
             enabled: true,
+            ..McpServerConfig::default()
         },
     );
     servers.insert(
         "broken_srv".to_string(),
         McpServerConfig {
             command: Some("/nonexistent/mcp-binary-xyz".to_string()),
-            args: Vec::new(),
-            url: None,
-            env: std::collections::BTreeMap::new(),
             enabled: true,
+            ..McpServerConfig::default()
         },
     );
 
@@ -776,4 +771,162 @@ for raw in sys.stdin:
     };
     assert_eq!(mcp_calls, 2);
     assert_eq!(output.trim(), "2 TEKVRA 42");
+}
+
+#[tokio::test]
+async fn streamable_http_sse_mcp_bearer_auth_and_list_changed_catalog_refresh() {
+    use indexmap::IndexMap;
+    use std::fs;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tekvra_config::{AgentSettings, McpServerConfig};
+    use tekvra_tools::ConfiguredMcpGateway;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+    fs::create_dir_all(&state).expect("mkdir state");
+
+    let unlocked_v2 = Arc::new(AtomicBool::new(false));
+    let unlocked_srv = Arc::clone(&unlocked_v2);
+
+    let sse_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind sse mcp");
+    let sse_addr = sse_listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = sse_listener.accept().await {
+            let unlocked_inner = Arc::clone(&unlocked_srv);
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                let headers_lower = req_str
+                    .split("\r\n\r\n")
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if !headers_lower.contains("authorization: bearer mcp-secret-tok") {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunauthorized")
+                        .await;
+                    return;
+                }
+                let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("{}");
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(body_str) else {
+                    return;
+                };
+                let Some(mid) = msg.get("id").cloned() else {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    return;
+                };
+                let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                let mut sse_events = String::new();
+                let result = match method {
+                    "initialize" => json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": { "tools": { "listChanged": true } },
+                        "serverInfo": { "name": "sse-mcp", "version": "1.0" }
+                    }),
+                    "tools/list" => {
+                        let mut tools = vec![json!({
+                            "name": "unlock",
+                            "description": "Unlocks dynamic tool",
+                            "inputSchema": { "type": "object" }
+                        })];
+                        if unlocked_inner.load(Ordering::Acquire) {
+                            tools.push(json!({
+                                "name": "multiply",
+                                "description": "Multiplies two ints",
+                                "inputSchema": { "type": "object" }
+                            }));
+                        }
+                        json!({ "tools": tools })
+                    }
+                    "tools/call" => {
+                        let name = msg["params"]["name"].as_str().unwrap_or("");
+                        if name == "unlock" {
+                            unlocked_inner.store(true, Ordering::Release);
+                            sse_events.push_str(
+                                ": heartbeat\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\r\n\r\n",
+                            );
+                            json!({ "unlocked": true })
+                        } else {
+                            let args = &msg["params"]["arguments"];
+                            let prod =
+                                args["x"].as_i64().unwrap_or(0) * args["y"].as_i64().unwrap_or(0);
+                            json!({ "product": prod })
+                        }
+                    }
+                    _ => json!({}),
+                };
+                let rpc_resp = json!({ "jsonrpc": "2.0", "id": mid, "result": result }).to_string();
+                sse_events.push_str(&format!("event: message\r\ndata: {rpc_resp}\r\n\r\n"));
+                let http_resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse_events.len(),
+                    sse_events
+                );
+                let _ = stream.write_all(http_resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut env_map = std::collections::BTreeMap::new();
+    env_map.insert(
+        "TEST_SSE_MCP_TOKEN".to_string(),
+        "mcp-secret-tok".to_string(),
+    );
+
+    let mut servers = IndexMap::new();
+    servers.insert(
+        "sse_srv".to_string(),
+        McpServerConfig {
+            url: Some(format!("http://{sse_addr}/sse")),
+            bearer_token_env_var: Some("TEST_SSE_MCP_TOKEN".to_string()),
+            env: env_map,
+            enabled: true,
+            ..McpServerConfig::default()
+        },
+    );
+
+    let (gw, report) =
+        ConfiguredMcpGateway::connect_all(&servers, &ws, &AgentSettings::default()).await;
+    assert_eq!(report.connected_servers, vec!["sse_srv"]);
+    assert_eq!(gw.list_tools().len(), 1);
+
+    let codex_caps = ModelCapabilities::resolve("openai", "gpt-5.4-codex", None);
+    let schema_before = build_tool_definitions_for_model(&codex_caps);
+
+    let mut ctx = make_ctx(ws, state, PermissionMode::Auto, Vec::new());
+    ctx.mcp_gateway = Some(gw.clone());
+
+    let reg = NativeToolRegistry::new();
+    let out = reg
+        .execute(
+            &ctx,
+            "sse_mcp_1",
+            "code",
+            &json!({
+                "code": "before = len(mcp_list())\nawait mcp_call('sse_srv', 'unlock', {})\nafter = len(mcp_list())\nm = await mcp_call('sse_srv', 'multiply', {'x': 6, 'y': 7})\nprint(before, after, m['product'])"
+            }),
+        )
+        .await
+        .expect("streamable HTTP SSE + list_changed refresh in monty");
+
+    let ToolOutput::CodeExecution { output, mcp_calls } = out else {
+        panic!("expected CodeExecution");
+    };
+    assert_eq!(mcp_calls, 2);
+    assert_eq!(output.trim(), "1 2 42");
+    assert_eq!(
+        schema_before,
+        build_tool_definitions_for_model(&codex_caps),
+        "tools/list_changed catalog refresh must never mutate top-level LLM tool schemas"
+    );
 }
