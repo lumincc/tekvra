@@ -7,6 +7,7 @@ pub mod mcp_client;
 pub mod output_filter;
 pub mod patch;
 pub mod permissions;
+pub mod powershell_syntax;
 pub mod pty;
 pub mod registry;
 pub mod web_and_code;
@@ -26,9 +27,11 @@ pub use output_filter::{
 };
 pub use patch::{PatchHunk, apply_patch_to_workspace, parse_patch};
 pub use permissions::{
-    BashSubcommand, DecomposedBashCommand, PermissionDecision, PermissionEvaluator, ToolAction,
-    build_command_scope_ladder, decompose_bash_command,
+    BashSubcommand, DecomposedBashCommand, DecomposedShellCommand, PermissionDecision,
+    PermissionEvaluator, ShellSyntax, ToolAction, active_shell_syntax, build_command_scope_ladder,
+    decompose_bash_command, decompose_shell_command, decompose_shell_command_for,
 };
+pub use powershell_syntax::decompose_powershell_command;
 pub use pty::{
     PtyCommandRequest, PtyCompletionNotice, PtySessionManager, build_sanitized_shell_env,
 };

@@ -109,6 +109,45 @@ pub fn decompose_bash_command(command: &str) -> DecomposedBashCommand {
     }
 }
 
+/// Syntax family of the shell that will actually execute a command, mirroring
+/// `crate::pty`'s platform shell selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellSyntax {
+    /// POSIX shells (`/bin/bash` / `sh -c`) parsed with the tree-sitter-bash AST.
+    Bash,
+    /// Windows PowerShell (`pwsh.exe` / `powershell.exe -Command`) parsed with the
+    /// native lexical statement decomposition.
+    PowerShell,
+}
+
+/// Returns the syntax family of the platform shell `exec_command` will spawn.
+#[must_use]
+pub fn active_shell_syntax() -> ShellSyntax {
+    if cfg!(windows) {
+        ShellSyntax::PowerShell
+    } else {
+        ShellSyntax::Bash
+    }
+}
+
+/// Shared decomposition contract used by the evaluator regardless of shell syntax.
+pub type DecomposedShellCommand = DecomposedBashCommand;
+
+/// Decomposes `command` with the given syntax family.
+#[must_use]
+pub fn decompose_shell_command_for(syntax: ShellSyntax, command: &str) -> DecomposedShellCommand {
+    match syntax {
+        ShellSyntax::Bash => decompose_bash_command(command),
+        ShellSyntax::PowerShell => crate::powershell_syntax::decompose_powershell_command(command),
+    }
+}
+
+/// Decomposes `command` with the syntax family of the platform shell.
+#[must_use]
+pub fn decompose_shell_command(command: &str) -> DecomposedShellCommand {
+    decompose_shell_command_for(active_shell_syntax(), command)
+}
+
 fn walk_bash_ast(
     node: Node<'_>,
     source: &[u8],
@@ -411,6 +450,7 @@ pub struct PermissionEvaluator {
     rules: Vec<PermissionRule>,
     conversation_grants: Vec<ApprovalScope>,
     persisted_grants: Vec<ApprovalScope>,
+    syntax: ShellSyntax,
 }
 
 impl PermissionEvaluator {
@@ -430,7 +470,16 @@ impl PermissionEvaluator {
             rules,
             conversation_grants: Vec::new(),
             persisted_grants,
+            syntax: active_shell_syntax(),
         }
+    }
+
+    /// Overrides the shell syntax used for command decomposition (platform default is
+    /// [`active_shell_syntax`]; primarily for tests and explicit host overrides).
+    #[must_use]
+    pub fn with_shell_syntax(mut self, syntax: ShellSyntax) -> Self {
+        self.syntax = syntax;
+        self
     }
 
     /// Returns the current [`PermissionMode`].
@@ -617,13 +666,16 @@ impl PermissionEvaluator {
     }
 
     fn evaluate_shell(&self, item_id: &str, command: &str, cwd: &Path) -> PermissionDecision {
-        let decomposed = decompose_bash_command(command);
+        let decomposed = decompose_shell_command_for(self.syntax, command);
 
         // In `Plan` or `ReadOnly` mode, ONLY statically proven read-only commands without write redirects are allowed!
         if matches!(self.mode, PermissionMode::Plan | PermissionMode::ReadOnly) {
             let all_readonly = !decomposed.once_only
                 && !decomposed.subcommands.is_empty()
-                && decomposed.subcommands.iter().all(is_readonly_subcommand);
+                && decomposed
+                    .subcommands
+                    .iter()
+                    .all(|sub| is_readonly_subcommand(sub, self.syntax));
             if all_readonly {
                 return PermissionDecision::Allow;
             }
@@ -691,7 +743,7 @@ impl PermissionEvaluator {
                 });
             }
 
-            let covered = is_readonly_subcommand(sub)
+            let covered = is_readonly_subcommand(sub, self.syntax)
                 || self.matches_rule("exec_command", &sub_text, RuleAction::Allow)
                 || self.matches_rule("bash", &sub_text, RuleAction::Allow)
                 || self.is_scope_granted_for_subcommand(&sub.raw, &sub.tokens);
@@ -742,7 +794,7 @@ impl PermissionEvaluator {
                         "command `{command}` blocked by explicit `deny` rule"
                     ));
                 }
-                let decomposed = decompose_bash_command(command);
+                let decomposed = decompose_shell_command_for(self.syntax, command);
                 for sub in &decomposed.subcommands {
                     let sub_joined = sub.tokens.join(" ");
                     if self.matches_rule("exec_command", &sub_joined, RuleAction::Deny)
@@ -942,7 +994,50 @@ impl PermissionEvaluator {
     }
 }
 
-fn is_readonly_subcommand(sub: &BashSubcommand) -> bool {
+/// PowerShell cmdlets and (program, subcommand) pairs that never mutate state, matched
+/// case-insensitively on the program token (PowerShell is case-insensitive).
+const SAFE_READONLY_POWERSHELL_CMDS: &[&str] = &[
+    "get-childitem",
+    "get-content",
+    "get-item",
+    "get-itemproperty",
+    "get-location",
+    "get-process",
+    "get-service",
+    "get-help",
+    "get-command",
+    "get-member",
+    "select-string",
+    "select-object",
+    "where-object",
+    "foreach-object",
+    "measure-object",
+    "sort-object",
+    "group-object",
+    "compare-object",
+    "test-path",
+    "resolve-path",
+    "out-string",
+    "out-host",
+    "format-table",
+    "format-list",
+    "format-wide",
+];
+
+/// `true` for a numeric PS range literal (`1..300`): a value generator, never a writer.
+fn is_numeric_range(token: &str) -> bool {
+    match token.split_once("..") {
+        Some((low, high)) => {
+            !low.is_empty()
+                && !high.is_empty()
+                && low.chars().all(|c| c.is_ascii_digit())
+                && high.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+fn is_readonly_subcommand(sub: &BashSubcommand, syntax: ShellSyntax) -> bool {
     if sub.dynamic || !sub.write_redirects.is_empty() || sub.tokens.is_empty() {
         return false;
     }
@@ -950,13 +1045,26 @@ fn is_readonly_subcommand(sub: &BashSubcommand) -> bool {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(&sub.tokens[0]);
-    SAFE_READONLY_COMMANDS.iter().any(|allowed| {
-        if allowed.len() == 1 {
-            prog == allowed[0]
-        } else {
-            prog == allowed[0] && sub.tokens.get(1).is_some_and(|second| second == allowed[1])
+    match syntax {
+        ShellSyntax::Bash => SAFE_READONLY_COMMANDS.iter().any(|allowed| {
+            if allowed.len() == 1 {
+                prog == allowed[0]
+            } else {
+                prog == allowed[0] && sub.tokens.get(1).is_some_and(|second| second == allowed[1])
+            }
+        }),
+        ShellSyntax::PowerShell => {
+            let lowered = prog.to_ascii_lowercase();
+            let is_git_readonly = lowered == "git"
+                && matches!(
+                    sub.tokens.get(1).map(String::as_str),
+                    Some("status" | "diff" | "log" | "show" | "branch" | "rev-parse")
+                );
+            SAFE_READONLY_POWERSHELL_CMDS.contains(&lowered.as_str())
+                || is_numeric_range(&sub.tokens[0])
+                || is_git_readonly
         }
-    })
+    }
 }
 
 fn pattern_matches(pattern: &str, candidate: &str) -> bool {

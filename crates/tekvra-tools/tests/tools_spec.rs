@@ -15,8 +15,10 @@ use tekvra_providers::ModelCapabilities;
 use tekvra_storage::{StateIndex, WorkspaceSnapshotStore};
 use tekvra_tools::{
     McpGateway, McpToolDescriptor, MontyCodeSandbox, NativeToolRegistry, PermissionDecision,
-    PermissionEvaluator, PtySessionManager, SafeWebFetcher, ToolAction, ToolExecutionContext,
-    WorkspacePathLocks, build_tool_definitions_for_model, decompose_bash_command,
+    PermissionEvaluator, PtySessionManager, SafeWebFetcher, ShellSyntax, ToolAction,
+    ToolExecutionContext, WorkspacePathLocks, active_shell_syntax,
+    build_tool_definitions_for_model, decompose_bash_command, decompose_powershell_command,
+    decompose_shell_command_for,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -978,4 +980,177 @@ async fn streamable_http_sse_mcp_bearer_auth_and_list_changed_catalog_refresh() 
         build_tool_definitions_for_model(&codex_caps),
         "tools/list_changed catalog refresh must never mutate top-level LLM tool schemas"
     );
+}
+
+/// Windows PowerShell decomposition and evaluator decisions mirror the bash contract:
+/// readonly pipelines allow in `Plan`, destructive compounds and dynamic constructs
+/// degrade to prompts/once-only, and Unix behavior stays byte-identical.
+#[tokio::test]
+async fn powershell_decomposition_and_permission_decisions_mirror_bash_contract() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("repo");
+    std::fs::create_dir_all(&ws).expect("mkdir");
+    let canon_ws = std::fs::canonicalize(&ws).expect("canon");
+
+    // 1. Native decomposition: pipeline splits, redirect targets surface, dynamic
+    //    constructs (`iex`, `& $var`, nested `-Command`) force once_only.
+    let decomp = decompose_powershell_command(
+        "Get-ChildItem src -Recurse | Select-String pattern; Remove-Item temp/",
+    );
+    assert!(!decomp.once_only);
+    assert_eq!(decomp.subcommands.len(), 3);
+    assert_eq!(
+        decomp.subcommands[0].tokens,
+        vec!["Get-ChildItem", "src", "-Recurse"]
+    );
+    assert_eq!(
+        decomp.subcommands[1].tokens,
+        vec!["Select-String", "pattern"]
+    );
+    assert_eq!(decomp.subcommands[2].tokens, vec!["Remove-Item", "temp/"]);
+
+    let redirected = decompose_powershell_command("Get-Content log.txt *> C:\\out\\all.txt");
+    assert_eq!(
+        redirected.subcommands[0].write_redirects,
+        vec!["C:\\out\\all.txt"]
+    );
+
+    for dynamic in [
+        "Invoke-Expression \"$user_input\"",
+        "& $scriptPath -Force",
+        "pwsh -Command \"Write-Output nested\"",
+    ] {
+        assert!(
+            decompose_powershell_command(dynamic).once_only,
+            "expected once_only for `{dynamic}`"
+        );
+    }
+
+    // 2. Facade regression: bash syntax delegation must equal `decompose_bash_command`;
+    //    on the platform shell (`active_shell_syntax`) it applies to the facade too.
+    let bash_decomp = decompose_shell_command_for(ShellSyntax::Bash, "git status && rm -rf build/");
+    assert_eq!(
+        bash_decomp,
+        decompose_bash_command("git status && rm -rf build/")
+    );
+
+    // 3. Plan mode: PS readonly pipelines allow; destructive compounds and dynamic
+    //    commands deny with guidance.
+    let ps_eval = || {
+        PermissionEvaluator::new(
+            PermissionMode::Plan,
+            canon_ws.clone(),
+            Some(canon_ws.clone()),
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_shell_syntax(ShellSyntax::PowerShell)
+    };
+    for readonly in [
+        "Get-ChildItem src -Recurse | Select-String pattern",
+        "1..300 | ForEach-Object { $_ }",
+        "git status",
+    ] {
+        match ps_eval().evaluate(
+            "ps-plan",
+            &ToolAction::Shell {
+                command: readonly.to_string(),
+                cwd: canon_ws.clone(),
+            },
+        ) {
+            PermissionDecision::Allow => {}
+            other => panic!("expected Allow for PS readonly `{readonly}`, got {other:?}"),
+        }
+    }
+    for blocked in [
+        "Get-ChildItem src; Remove-Item temp/",
+        "iex $payload",
+        "Get-Content log.txt > out.txt",
+    ] {
+        match ps_eval().evaluate(
+            "ps-plan",
+            &ToolAction::Shell {
+                command: blocked.to_string(),
+                cwd: canon_ws.clone(),
+            },
+        ) {
+            PermissionDecision::Deny { reason } => {
+                assert!(
+                    reason.contains("plan"),
+                    "denial must guide to plan: {reason}"
+                );
+            }
+            other => panic!("expected Deny for PS `{blocked}` in Plan, got {other:?}"),
+        }
+    }
+
+    // 4. Build mode: `Remove-Item` in a compound prompts on the specific subcommand;
+    //    once_only write redirects also prompt (never silently allowed).
+    let build_eval = PermissionEvaluator::new(
+        PermissionMode::Build,
+        canon_ws.clone(),
+        Some(canon_ws.clone()),
+        Vec::new(),
+        Vec::new(),
+    )
+    .with_shell_syntax(ShellSyntax::PowerShell);
+    let PermissionDecision::Prompt(rm_prompt) = build_eval.evaluate(
+        "ps-build",
+        &ToolAction::Shell {
+            command: "Get-ChildItem src; Remove-Item temp/".to_string(),
+            cwd: canon_ws.clone(),
+        },
+    ) else {
+        panic!("expected Prompt for PS compound with `Remove-Item`");
+    };
+    assert_eq!(rm_prompt.summary, "Remove-Item temp/");
+
+    let PermissionDecision::Prompt(redirect_prompt) = build_eval.evaluate(
+        "ps-build",
+        &ToolAction::Shell {
+            command: "Get-Content log.txt > out.txt".to_string(),
+            cwd: canon_ws.clone(),
+        },
+    ) else {
+        panic!("expected Prompt for PS write redirect");
+    };
+    assert!(!redirect_prompt.ladder.is_empty());
+
+    // 5. Explicit deny rules decompose PS commands: `Remove-Item /` matches the subcommand.
+    let deny_rules = vec![PermissionRule {
+        tool: "exec_command".to_string(),
+        pattern: "Remove-Item /".to_string(),
+        action: RuleAction::Deny,
+    }];
+    let deny_eval = PermissionEvaluator::new(
+        PermissionMode::Yolo,
+        canon_ws.clone(),
+        Some(canon_ws.clone()),
+        deny_rules,
+        Vec::new(),
+    )
+    .with_shell_syntax(ShellSyntax::PowerShell);
+    match deny_eval.evaluate(
+        "ps-deny",
+        &ToolAction::Shell {
+            command: "Get-ChildItem /; Remove-Item /".to_string(),
+            cwd: canon_ws.clone(),
+        },
+    ) {
+        PermissionDecision::Deny { reason } => {
+            assert!(
+                reason.contains("Remove-Item /"),
+                "explicit deny must name the rule: {reason}"
+            );
+        }
+        other => panic!("expected explicit Deny under Yolo for PS rule match, got {other:?}"),
+    }
+
+    // 6. Unix regression: on a bash platform the facade must keep producing bash
+    //    decomposition for the same command (byte-identical behavior guarantee).
+    if active_shell_syntax() == ShellSyntax::Bash {
+        let facade = decompose_shell_command_for(active_shell_syntax(), "cargo build --release");
+        let direct = decompose_bash_command("cargo build --release");
+        assert_eq!(facade, direct);
+    }
 }
