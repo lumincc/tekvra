@@ -299,7 +299,13 @@ async fn lsp_tool_registry_arm_authorizes_reads_and_reports_bounded_errors() {
     std::fs::create_dir_all(deny_ws.join(".git")).expect("mkdir deny ws");
     std::fs::create_dir_all(&deny_state).expect("mkdir deny state");
     std::fs::write(deny_ws.join("broken.rs"), "fn a() {}\n").expect("write deny file");
-    let deny_target = deny_ws.join("broken.rs").to_string_lossy().into_owned();
+    // The evaluator compares canonical paths; mirror `make_ctx`'s canonicalization so the
+    // rule matches identically on Linux, macOS (/private prefix), and Windows (\\?\ prefix).
+    let deny_ws_canon = std::fs::canonicalize(&deny_ws).expect("canonicalize deny ws");
+    let deny_target = deny_ws_canon
+        .join("broken.rs")
+        .to_string_lossy()
+        .into_owned();
     let deny = vec![PermissionRule {
         tool: "lsp_diagnostics".to_string(),
         pattern: deny_target,
