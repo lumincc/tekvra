@@ -8,8 +8,8 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tekvra_core::SessionHandle;
 use tekvra_protocol::{
-    ApprovalResolution, GrantLifetime, InputDeliveryMode, PermissionMode, SessionCommand,
-    SessionEvent,
+    ApprovalResolution, GrantLifetime, InputDeliveryMode, InputImage, PermissionMode,
+    SessionCommand, SessionEvent,
 };
 
 /// Options for headless `tekvra exec` / `--print`.
@@ -29,6 +29,8 @@ pub struct ExecRunOptions {
     pub output_format: String,
     /// Active permission mode.
     pub mode: PermissionMode,
+    /// Pre-validated `-i/--image` attachments sent with the first turn.
+    pub images: Vec<InputImage>,
 }
 
 /// Exit code distinction for CLI callers (`2` = schema validation failure).
@@ -83,6 +85,7 @@ pub async fn run_headless_exec(handle: SessionHandle, opts: ExecRunOptions) -> R
             .send(SessionCommand::SubmitInput {
                 prompt: effective_prompt,
                 delivery: InputDeliveryMode::Next,
+                images: opts.images.clone(),
             })
             .await?;
 

@@ -15,6 +15,12 @@ pub struct FileDiffEntry {
     pub change_kind: FileChangeKind,
     /// Unified diff text for rendering and inspection.
     pub unified_diff: String,
+    /// Full pre-mutation file text when retained (ACP structured `diff` blocks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    /// Full post-mutation file text when retained (ACP structured `diff` blocks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
     /// Count of added lines.
     pub additions: u32,
     /// Count of deleted lines.

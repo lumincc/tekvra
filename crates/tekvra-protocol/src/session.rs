@@ -33,6 +33,19 @@ pub enum RevertScope {
     ConversationAndFiles,
 }
 
+/// Multimodal image attachment supplied on the wire by CLI/TUI frontends and converted into
+/// provider `MessagePart::Image` blocks by the session runner (never stored in rollouts directly).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputImage {
+    /// IANA media type (`image/png`, `image/jpeg`, `image/webp`, `image/gif`).
+    pub media_type: String,
+    /// Base64-encoded image bytes.
+    pub data_base64: String,
+    /// Optional display path (workspace-relative or absolute) for diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+}
+
 /// Token and prompt-cache usage metrics for a turn or session.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -70,6 +83,9 @@ pub enum SessionCommand {
         prompt: String,
         /// Delivery behavior if a turn is already active.
         delivery: InputDeliveryMode,
+        /// Multimodal image attachments appended after the prompt text part.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<InputImage>,
     },
     /// Interrupt the currently running turn.
     InterruptTurn,
@@ -91,6 +107,15 @@ pub enum SessionCommand {
     RevertTo {
         /// Target turn/message id.
         target_id: String,
+        /// Revert mode (`ConversationOnly`, `FilesOnly`, `ConversationAndFiles`).
+        scope: RevertScope,
+    },
+    /// Manually compact the context into a fresh frame generation, reporting token deltas
+    /// via [`SessionEvent::CompactionCompleted`].
+    Compact,
+    /// Atomically revert the most recent user turn (conversation and/or workspace file
+    /// snapshots) by delegating to the latest `TurnStarted` rollout record.
+    UndoLastTurn {
         /// Revert mode (`ConversationOnly`, `FilesOnly`, `ConversationAndFiles`).
         scope: RevertScope,
     },
@@ -225,6 +250,17 @@ pub enum SessionEvent {
         turn_id: String,
         /// Usage snapshot.
         usage: TokenUsage,
+    },
+    /// Manual (or automatic) context compaction finished under a new frame generation.
+    CompactionCompleted {
+        /// Session/thread id.
+        thread_id: String,
+        /// New frame generation after compaction.
+        generation: u64,
+        /// Estimated token count before compaction.
+        before_tokens: u64,
+        /// Estimated token count after compaction.
+        after_tokens: u64,
     },
     /// Configuration or policy warning (e.g., non-kernel-sandbox notice).
     ConfigWarning {

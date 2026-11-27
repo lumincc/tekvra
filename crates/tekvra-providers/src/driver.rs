@@ -1,6 +1,7 @@
 //! Provider-neutral conversation messages, tool schemas, and OpenAI `/responses` wire driver
 //! with stateless `reasoning.encrypted_content` replay and explicit cache breakpoints.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -68,6 +69,16 @@ pub enum MessagePart {
         #[serde(default)]
         is_error: bool,
     },
+    /// Multimodal user image block (`PNG`, `JPEG`, `WEBP`, `GIF`) encoded as base64.
+    Image {
+        /// IANA media type (`image/png`, `image/jpeg`, `image/webp`, `image/gif`).
+        media_type: String,
+        /// Base64-encoded image bytes (without the `data:` URL prefix).
+        data_base64: String,
+        /// Optional workspace-relative source path for diagnostics.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_path: Option<String>,
+    },
 }
 
 /// Single entry in the append-only prompt frame sent to an LLM provider.
@@ -102,6 +113,14 @@ impl ProviderMessage {
                 cache_breakpoint: false,
             }],
         }
+    }
+
+    /// Returns `true` when any part of this message is an [`MessagePart::Image`] block.
+    #[must_use]
+    pub fn has_image_parts(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| matches!(p, MessagePart::Image { .. }))
     }
 }
 
@@ -204,11 +223,25 @@ pub fn build_openai_responses_payload(
             MessageRole::User => {
                 let mut content = Vec::new();
                 for part in &msg.parts {
-                    if let MessagePart::Text { text, .. } = part {
-                        content.push(json!({
-                            "type": "input_text",
-                            "text": text,
-                        }));
+                    match part {
+                        MessagePart::Text { text, .. } => {
+                            content.push(json!({
+                                "type": "input_text",
+                                "text": text,
+                            }));
+                        }
+                        MessagePart::Image {
+                            media_type,
+                            data_base64,
+                            ..
+                        } => {
+                            content.push(json!({
+                                "type": "input_image",
+                                "image_url": format!("data:{media_type};base64,{data_base64}"),
+                                "detail": "auto",
+                            }));
+                        }
+                        _ => {}
                     }
                 }
                 if !content.is_empty() {
@@ -264,6 +297,7 @@ pub fn build_openai_responses_payload(
                             }));
                         }
                         MessagePart::ToolResult { .. } => {}
+                        MessagePart::Image { .. } => {}
                     }
                 }
             }
@@ -367,10 +401,24 @@ pub fn build_anthropic_messages_payload(
                         MessagePart::Text { text, .. } => {
                             Some(json!({ "type": "text", "text": text }))
                         }
+                        MessagePart::Image {
+                            media_type,
+                            data_base64,
+                            ..
+                        } => Some(json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": data_base64,
+                            }
+                        })),
                         _ => None,
                     })
                     .collect();
-                messages.push(json!({ "role": "user", "content": content }));
+                if !content.is_empty() {
+                    messages.push(json!({ "role": "user", "content": content }));
+                }
             }
             MessageRole::Assistant => {
                 let mut content = Vec::new();
@@ -464,10 +512,37 @@ pub fn build_chat_completions_payload(
                 }
             }
             MessageRole::User => {
-                for p in &msg.parts {
-                    if let MessagePart::Text { text, .. } = p {
-                        messages.push(json!({ "role": "user", "content": text }));
+                let has_images = msg.has_image_parts();
+                if !has_images {
+                    // Preserve plain string `content` for maximum local-server compatibility.
+                    for p in &msg.parts {
+                        if let MessagePart::Text { text, .. } = p {
+                            messages.push(json!({ "role": "user", "content": text }));
+                        }
                     }
+                } else {
+                    let mut content = Vec::new();
+                    for p in &msg.parts {
+                        match p {
+                            MessagePart::Text { text, .. } => {
+                                content.push(json!({ "type": "text", "text": text }));
+                            }
+                            MessagePart::Image {
+                                media_type,
+                                data_base64,
+                                ..
+                            } => {
+                                content.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!("data:{media_type};base64,{data_base64}"),
+                                    }
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+                    messages.push(json!({ "role": "user", "content": content }));
                 }
             }
             MessageRole::Assistant => {
@@ -761,6 +836,14 @@ impl ProviderDriver for HttpProviderDriver {
         model: &ModelCapabilities,
         request: &CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
+        // Reject unsupported multimodal requests BEFORE any network I/O or account selection.
+        if request_has_image(request) && !model.supports_vision {
+            return Err(ProviderError::UnsupportedModality {
+                model: model.spec.clone(),
+                modality: "image".to_string(),
+            });
+        }
+
         loop {
             let candidate = {
                 let pool = self.accounts.lock().expect("account pool lock poisoned");
@@ -776,9 +859,16 @@ impl ProviderDriver for HttpProviderDriver {
                     format!("{}/messages", provider.base_url),
                     build_anthropic_messages_payload(model, request),
                 ),
-                WireProtocol::OpenAiChatCompletions | WireProtocol::GeminiGenerateContent => (
+                WireProtocol::OpenAiChatCompletions => (
                     format!("{}/chat/completions", provider.base_url),
                     build_chat_completions_payload(model, request),
+                ),
+                WireProtocol::GeminiGenerateContent => (
+                    format!(
+                        "{}/models/{}:streamGenerateContent",
+                        provider.base_url, model.model_id
+                    ),
+                    build_gemini_payload(model, request),
                 ),
             };
 
@@ -792,6 +882,8 @@ impl ProviderDriver for HttpProviderDriver {
                 req_builder = req_builder
                     .header("x-api-key", candidate.token.expose())
                     .header("anthropic-version", "2023-06-01");
+            } else if model.protocol == WireProtocol::GeminiGenerateContent {
+                req_builder = req_builder.header("x-goog-api-key", candidate.token.expose());
             } else {
                 req_builder = req_builder.header(
                     "authorization",
@@ -857,9 +949,10 @@ impl ProviderDriver for HttpProviderDriver {
                 WireProtocol::OpenAiResponses => {
                     parse_openai_responses_body(&raw_body, model, &candidate.name)
                 }
-                WireProtocol::AnthropicMessages
-                | WireProtocol::OpenAiChatCompletions
-                | WireProtocol::GeminiGenerateContent => {
+                WireProtocol::GeminiGenerateContent => {
+                    parse_gemini_body(&raw_body, model, &candidate.name)
+                }
+                WireProtocol::AnthropicMessages | WireProtocol::OpenAiChatCompletions => {
                     parse_generic_completion(&raw_body, model, &candidate.name)
                 }
             };

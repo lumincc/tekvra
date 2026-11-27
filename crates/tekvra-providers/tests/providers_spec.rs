@@ -11,7 +11,8 @@ use tekvra_providers::{
     AccountCandidate, AccountPin, AccountPool, CompletionRequest, CredentialStore,
     HttpProviderDriver, JobRole, LoopbackOAuthListener, MessagePart, MessageRole, ModelRouter,
     ProviderDefinition, ProviderDriver, ProviderMessage, ProviderRegistry, SecretToken,
-    ToolDefinition, WireProtocol, exchange_oauth_token, generate_pkce_pair,
+    ToolDefinition, WireProtocol, build_anthropic_messages_payload, build_chat_completions_payload,
+    build_gemini_payload, build_openai_responses_payload, exchange_oauth_token, generate_pkce_pair,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

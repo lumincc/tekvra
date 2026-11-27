@@ -203,6 +203,8 @@ pub struct ProviderEntryConfig {
     pub base_url: Option<String>,
     /// Default environment variable name for API key lookup.
     pub api_key_env: Option<String>,
+    /// Optional override forcing vision (`MessagePart::Image`) support for this provider's models.
+    pub supports_vision: Option<bool>,
     /// Configured accounts in failover priority order.
     pub accounts: Vec<ProviderAccountConfig>,
     /// Extra static HTTP headers.

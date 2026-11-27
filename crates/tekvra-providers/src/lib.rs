@@ -43,6 +43,14 @@ pub enum ProviderError {
         /// Allowed effort strings.
         supported: Vec<String>,
     },
+    /// Image (multimodal) attachment submitted to a model with `supports_vision == false`.
+    #[error("model `{model}` does not support {modality} input; pick a vision-capable model")]
+    UnsupportedModality {
+        /// Target model spec.
+        model: String,
+        /// Rejected modality name (`"image"`).
+        modality: String,
+    },
     /// Malformed `--account PROVIDER:NAME` pin string.
     #[error("invalid account pin `{raw}`; expected `PROVIDER:NAME`")]
     InvalidAccountPin {

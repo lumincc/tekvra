@@ -22,6 +22,22 @@ For GPT-5+, o-series, and Codex models, Tekvra uses `POST /v1/responses` with:
   - Stored OAuth credentials with an elapsed `expires_at_epoch_secs` and valid `refresh_token` automatically renew via `grant_type=refresh_token` during runtime initialization (`TEKVRA_OAUTH_*` environment overrides are supported for custom/enterprise OAuth endpoints).
 - `AccountPool` tracks quota windows and HTTP 429 / `insufficient_quota` responses, automatically rotating to the next healthy account unless pinned via `--account PROVIDER:NAME`.
 
+## Multimodal (Vision) Input
+
+Image attachments (`MessagePart::Image { media_type, data_base64, source_path }`) are encoded natively per wire protocol and gated by `ModelCapabilities::supports_vision` **before any network I/O**:
+
+| Provider / protocol | Image encoding |
+| --- | --- |
+| OpenAI `/responses` | `input_image` content blocks with `data:image/<mt>;base64,...` URLs (`detail: "auto"`) |
+| OpenAI `/chat/completions` | `image_url` content parts alongside `text` parts |
+| Anthropic `/v1/messages` | base64 `image` source blocks |
+| Gemini `streamGenerateContent` | native `inlineData { mimeType, data }` parts |
+
+- Built-in heuristics flag vision-capable models (`gpt-4o`/`gpt-5`/o-series/Codex, Claude 3.5+/4+, Gemini 1.5+/2.x/3.x).
+- Any provider or model can be forced on/off with `supports_vision = true|false` on the `[providers.<id>]` entry in `providers.toml` (`ProviderDefinition::supports_vision_override`).
+- Requests carrying images against a non-vision model fail fast with `ProviderError::UnsupportedModality` and never reach the network.
+- The CLI attaches images with repeatable `-i/--image <PATH>` (png/jpg/jpeg/webp/gif, max 10 MiB each) on `tekvra`, `tekvra exec`, `tekvra resume`, and `tekvra fork`; in the TUI/protocol, `SessionCommand::SubmitInput { images: Vec<InputImage> }` carries them.
+
 ## Role-Based Model Routing
 
 `[models]` in `tekvra.toml` allows independent model bindings for `main`, `plan`, `subagent`, `compact`, `review`, `goal`, `title`, and `fast`. Switching between `Plan` and `Build` modes routes new turns to the bound model without rewriting earlier transcript messages.

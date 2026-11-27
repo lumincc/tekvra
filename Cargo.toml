@@ -20,7 +20,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Tekvra Contributors"]
-repository = "https://github.com/tekvra/tekvra"
+repository = "https://github.com/lumincc/tekvra"
 rust-version = "1.99"
 
 [workspace.lints.rust]

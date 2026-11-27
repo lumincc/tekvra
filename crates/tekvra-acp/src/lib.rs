@@ -20,6 +20,10 @@ use tekvra_tools::McpGateway;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+
+/// Pending server->client `session/request_permission` requests keyed by serialized JSON-RPC id.
+type PendingPermissionsMap = Arc<Mutex<BTreeMap<String, (String, oneshot::Sender<Value>)>>>;
 
 /// Errors returned by `tekvra-acp`.
 #[derive(Debug, Error)]
@@ -181,6 +185,20 @@ where
                     if let Some(h) = handle_opt {
                         let _ = h.send(SessionCommand::InterruptTurn).await;
                     }
+                    // Fail closed every pending permission request for this session.
+                    let mut pending = pending_permissions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let stale: Vec<String> = pending
+                        .iter()
+                        .filter(|(_, (owner, _))| owner == sid)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for key in stale {
+                        if let Some((_, resp_tx)) = pending.remove(&key) {
+                            drop(resp_tx); // receiver observes Err -> Deny
+                        }
+                    }
                 }
                 send_acp_ok(&out_tx, req.id, json!({}));
             }
@@ -199,12 +217,15 @@ where
                 if let Some(h) = handle_opt {
                     let tx_clone = out_tx.clone();
                     let req_id = req.id;
+                    let pending_permissions = Arc::clone(&pending_permissions);
+                    let next_outbound_rpc_id = Arc::clone(&next_outbound_rpc_id);
                     tokio::spawn(async move {
                         let mut rx = h.subscribe();
                         let _ = h
                             .send(SessionCommand::SubmitInput {
                                 prompt: prompt_text,
                                 delivery: InputDeliveryMode::Next,
+                                images: Vec::new(),
                             })
                             .await;
                         let mut stop_reason = "end_turn";
@@ -228,7 +249,7 @@ where
                                 SessionEvent::ItemCompleted {
                                     item_id,
                                     text,
-                                    tool_output: Some(_),
+                                    tool_output,
                                     ..
                                 } => {
                                     emit_acp_update(
@@ -243,15 +264,44 @@ where
                                     );
                                 }
                                 SessionEvent::ApprovalRequested { prompt, .. } => {
-                                    // Auto-resolve Once in non-interactive ACP unless mode changed
+                                    // Bidirectional `session/request_permission` (ACP 3.1):
+                                    // ask the editor, fail closed on EOF/cancel or an
+                                    // unrecognized outcome.
+                                    let rpc_id =
+                                        next_outbound_rpc_id.fetch_add(1, AtomicOrdering::SeqCst);
+                                    let (resp_tx, resp_rx) = oneshot::channel::<Value>();
+                                    let pending_key =
+                                        serde_json::to_string(&json!(rpc_id)).unwrap_or_default();
+                                    pending_permissions
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .insert(pending_key, (sid.clone(), resp_tx));
+                                    let raw = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": rpc_id,
+                                        "method": "session/request_permission",
+                                        "params": {
+                                            "sessionId": sid,
+                                            "toolCall": {
+                                                "toolCallId": prompt.approval_id,
+                                                "title": prompt.summary,
+                                            },
+                                            "options": [
+                                                { "optionId": "allow_once", "name": "Allow once", "kind": "allow_once" },
+                                                { "optionId": "allow_always", "name": "Allow always", "kind": "allow_always" },
+                                                { "optionId": "reject_once", "name": "Reject", "kind": "reject_once" }
+                                            ]
+                                        }
+                                    });
+                                    tx_clone.send(raw.to_string()).ok();
+                                    let resolution = match resp_rx.await {
+                                        Ok(result) => map_acp_permission_result(&result),
+                                        Err(_) => ApprovalResolution::Deny { reason: None },
+                                    };
                                     let _ = h
                                         .send(SessionCommand::ResolveApproval {
                                             approval_id: prompt.approval_id,
-                                            resolution: ApprovalResolution::Approve {
-                                                scope: None,
-                                                lifetime: GrantLifetime::Once,
-                                                confirmed_broad: false,
-                                            },
+                                            resolution,
                                         })
                                         .await;
                                 }
@@ -274,6 +324,32 @@ where
 
     let _ = writer_task.await;
     Ok(())
+}
+
+/// Maps an ACP `session/request_permission` response into a core [`ApprovalResolution`].
+///
+/// Recognizes `{"outcome":{"outcome":"selected","optionId":"allow_once|allow_always|..."}}`
+/// (and a bare `optionId` fallback). Anything else — including malformed results — denies.
+#[must_use]
+pub fn map_acp_permission_result(result: &Value) -> ApprovalResolution {
+    let outcome = result.get("outcome").unwrap_or(result);
+    let option_id = outcome
+        .get("optionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match option_id {
+        "allow_once" => ApprovalResolution::Approve {
+            scope: None,
+            lifetime: GrantLifetime::Once,
+            confirmed_broad: false,
+        },
+        "allow_always" => ApprovalResolution::Approve {
+            scope: None,
+            lifetime: GrantLifetime::Project,
+            confirmed_broad: false,
+        },
+        _ => ApprovalResolution::Deny { reason: None },
+    }
 }
 
 fn extract_acp_prompt(params: &Value) -> String {

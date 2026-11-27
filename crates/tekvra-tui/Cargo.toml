@@ -17,6 +17,7 @@ tekvra-storage = { workspace = true }
 tekvra-core = { workspace = true }
 
 crossterm = { workspace = true }
+base64 = { workspace = true }
 futures = { workspace = true }
 pulldown-cmark = { workspace = true }
 ratatui = { workspace = true }

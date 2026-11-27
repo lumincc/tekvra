@@ -9,7 +9,9 @@ pub use permissions::{
     ApprovalPrompt, ApprovalResolution, ApprovalScope, GrantLifetime, PermissionMode, RuleAction,
     ScopeLadderOption,
 };
-pub use session::{InputDeliveryMode, RevertScope, SessionCommand, SessionEvent, TokenUsage};
+pub use session::{
+    InputDeliveryMode, InputImage, RevertScope, SessionCommand, SessionEvent, TokenUsage,
+};
 pub use tools::{
     FileChangeKind, FileDiffEntry, ReviewFinding, SearchMatch, SymbolOutline, ToolOutput,
 };

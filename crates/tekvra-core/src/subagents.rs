@@ -200,6 +200,7 @@ impl SubagentManager {
             .send(SessionCommand::SubmitInput {
                 prompt: req.prompt,
                 delivery: InputDeliveryMode::Next,
+                images: Vec::new(),
             })
             .await?;
 
@@ -268,7 +269,11 @@ impl SubagentManager {
                 })?
         };
         handle
-            .send(SessionCommand::SubmitInput { prompt, delivery })
+            .send(SessionCommand::SubmitInput {
+                prompt,
+                delivery,
+                images: Vec::new(),
+            })
             .await
     }
 

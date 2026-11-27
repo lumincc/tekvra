@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ConfigError;
 use crate::trust::canonicalize_or_clean;
 
 /// Single discovered instruction file (`AGENTS.md` or `AGENTS.override.md`).

@@ -434,6 +434,14 @@ pub(crate) fn render_messages_for_summary(messages: &[ProviderMessage]) -> Strin
                         truncate_chars(output, 1_200)
                     ));
                 }
+                MessagePart::Image {
+                    media_type,
+                    source_path,
+                    ..
+                } => {
+                    let origin = source_path.as_deref().unwrap_or("<inline>");
+                    buf.push_str(&format!("[Image {media_type} {origin}]\n"));
+                }
                 MessagePart::Reasoning { summary, .. } if !summary.is_empty() => {
                     buf.push_str(&format!("[Reasoning]: {}\n", summary.join(" ")));
                 }
@@ -473,6 +481,11 @@ fn message_byte_estimate(msg: &ProviderMessage) -> usize {
                 ..
             } => name.len() + arguments_json.len() + 24,
             MessagePart::ToolResult { output, .. } => output.len() + 24,
+            MessagePart::Image {
+                media_type,
+                data_base64,
+                ..
+            } => media_type.len() + (data_base64.len() * 3 / 4) + 32,
         })
         .sum()
 }

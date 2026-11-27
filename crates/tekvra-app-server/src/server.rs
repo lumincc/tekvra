@@ -781,6 +781,7 @@ impl JsonRpcConnection {
             .send(SessionCommand::SubmitInput {
                 prompt: prompt_text,
                 delivery: InputDeliveryMode::Next,
+                images: Vec::new(),
             })
             .await
             .map_err(|e| (-32603, e.to_string()))?;
@@ -803,6 +804,7 @@ impl JsonRpcConnection {
             .send(SessionCommand::SubmitInput {
                 prompt: extract_prompt_text(&inputs),
                 delivery: InputDeliveryMode::Guide,
+                images: Vec::new(),
             })
             .await
             .map_err(|e| (-32603, e.to_string()))?;

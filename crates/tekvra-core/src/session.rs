@@ -10,11 +10,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tekvra_config::ResolvedConfig;
 use tekvra_protocol::{
-    ApprovalPrompt, ApprovalResolution, FileDiffEntry, InputDeliveryMode, PermissionMode,
-    RevertScope, SessionCommand, SessionEvent, TokenUsage, ToolOutput,
+    ApprovalPrompt, ApprovalResolution, FileDiffEntry, InputDeliveryMode, InputImage,
+    PermissionMode, RevertScope, SessionCommand, SessionEvent, TokenUsage, ToolOutput,
 };
 use tekvra_providers::{
-    MessagePart, MessageRole, ModelRouter, ProviderDriver, ProviderMessage, StreamDelta,
+    JobRole, MessagePart, MessageRole, ModelRouter, ProviderDriver, ProviderMessage, StreamDelta,
     ToolDefinition,
 };
 use tekvra_storage::{
@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::CoreError;
+use crate::context::{SkillInvocation, expand_prompt_attachments, expand_skill_invocation};
 use crate::frame::{CompactionConfig, Frame, extract_assistant_text};
 use crate::goal_and_review::{accumulate_usage, evaluate_goal};
 use crate::steering::{SteeringDetector, ToolFailureTracker};
@@ -39,6 +40,8 @@ use crate::subagents::{
 
 type QuestionAnswers = BTreeMap<String, Vec<String>>;
 type PendingApprovalsMap = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalResolution>>>>;
+/// Queued user input: prompt text plus pre-validated image attachments.
+type PendingUserInput = (String, Vec<InputImage>);
 type PendingQuestionsMap = Arc<Mutex<HashMap<String, oneshot::Sender<QuestionAnswers>>>>;
 
 /// Optional external plugin tool executor (`tekvra-lua` registers here ONLY when `experimental.lua_plugins = true`).
@@ -69,6 +72,8 @@ pub struct SessionRuntimeState {
     pub plan_markdown: String,
     /// Cumulative token/cache/cost usage.
     pub cumulative_usage: TokenUsage,
+    /// Context window of the active model (tokens) for utilization telemetry.
+    pub context_window: u64,
     /// Latest `Frame` prefix snapshot for testing and diagnostics.
     pub last_frame_snapshot: Option<crate::frame::FrameSnapshot>,
 }
@@ -163,11 +168,18 @@ impl SessionHandle {
 }
 
 enum RunnerWork {
-    UserTurn(String),
+    UserTurn {
+        prompt: String,
+        images: Vec<InputImage>,
+    },
     RevertTo {
         target_id: String,
         scope: RevertScope,
     },
+    UndoLastTurn {
+        scope: RevertScope,
+    },
+    Compact,
     SetGoal(Option<String>),
     SetMode(PermissionMode),
     SwitchModel(String),
@@ -380,6 +392,7 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
         goal: None,
         plan_markdown: String::new(),
         cumulative_usage: TokenUsage::default(),
+        context_window: initial_caps.context_window,
         last_frame_snapshot: Some(frame.snapshot()),
     }));
 
@@ -432,7 +445,11 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .cancel();
                     }
-                    SessionCommand::SubmitInput { prompt, delivery } => {
+                    SessionCommand::SubmitInput {
+                        prompt,
+                        delivery,
+                        images,
+                    } => {
                         if router_running.load(Ordering::SeqCst) {
                             match delivery {
                                 InputDeliveryMode::Next => {
@@ -442,13 +459,13 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
                                     router_guide
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .push_back(prompt);
+                                        .push_back((prompt, images));
                                 }
                                 InputDeliveryMode::Replace => {
                                     *router_replace
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                        Some(prompt);
+                                        Some((prompt, images));
                                     router_cancel
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -456,11 +473,17 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
                                 }
                             }
                         } else {
-                            let _ = router_work_tx.send(RunnerWork::UserTurn(prompt));
+                            let _ = router_work_tx.send(RunnerWork::UserTurn { prompt, images });
                         }
                     }
                     SessionCommand::RevertTo { target_id, scope } => {
                         let _ = router_work_tx.send(RunnerWork::RevertTo { target_id, scope });
+                    }
+                    SessionCommand::UndoLastTurn { scope } => {
+                        let _ = router_work_tx.send(RunnerWork::UndoLastTurn { scope });
+                    }
+                    SessionCommand::Compact => {
+                        let _ = router_work_tx.send(RunnerWork::Compact);
                     }
                     SessionCommand::SetGoal { condition } => {
                         let _ = router_work_tx.send(RunnerWork::SetGoal(condition));
@@ -526,13 +549,13 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
 
         loop {
             // Priority 1: if a `Replace` prompt preempted the previous turn, run it immediately!
-            let replaced_prompt = actor
+            let replaced = actor
                 .replace_slot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
-            if let Some(prompt) = replaced_prompt {
-                actor.run_user_turn(prompt).await;
+            if let Some((prompt, images)) = replaced {
+                actor.run_user_turn(prompt, images).await;
                 continue;
             }
 
@@ -601,14 +624,14 @@ struct SessionActor {
     shared_state: Arc<Mutex<SessionRuntimeState>>,
     is_turn_running: Arc<AtomicBool>,
     current_cancel: Arc<Mutex<CancellationToken>>,
-    guide_inbox: Arc<Mutex<VecDeque<String>>>,
-    replace_slot: Arc<Mutex<Option<String>>>,
+    guide_inbox: Arc<Mutex<VecDeque<PendingUserInput>>>,
+    replace_slot: Arc<Mutex<Option<PendingUserInput>>>,
 }
 
 impl SessionActor {
     async fn handle_work(&mut self, work: RunnerWork) {
         match work {
-            RunnerWork::UserTurn(prompt) => self.run_user_turn(prompt).await,
+            RunnerWork::UserTurn { prompt, images } => self.run_user_turn(prompt, images).await,
             RunnerWork::SetGoal(condition) => {
                 self.active_goal = condition;
                 self.sync_shared_state();
@@ -768,12 +791,55 @@ impl SessionActor {
         self.execute_turn_loop(turn_id).await;
     }
 
-    async fn run_user_turn(&mut self, prompt: String) {
+    async fn run_user_turn(&mut self, prompt: String, images: Vec<InputImage>) {
         let turn_id = format!("turn_{}", Uuid::now_v7().simple());
         let now = jiff::Timestamp::now().as_second();
 
+        // Zero-roundtrip preprocessing: `@path` / `@path#L<n>-L<m>` attachments and `/skill` bodies.
+        let expansion = expand_prompt_attachments(&prompt, &self.workspace_root);
+        for warning in &expansion.warnings {
+            let _ = self.event_tx.send(SessionEvent::ConfigWarning {
+                summary: warning.clone(),
+                details: None,
+            });
+        }
+        let effective_text = match expand_skill_invocation(&expansion.text, &self.config.skills) {
+            SkillInvocation::None => expansion.text,
+            SkillInvocation::Expanded { expanded } => expanded,
+            SkillInvocation::Unknown { name } => {
+                let _ = self.event_tx.send(SessionEvent::ConfigWarning {
+                    summary: format!(
+                        "Unknown skill `{name}`; continuing without skill instructions."
+                    ),
+                    details: None,
+                });
+                expansion.text
+            }
+        };
+
+        let mut parts: Vec<MessagePart> = Vec::new();
+        let has_images = !expansion.images.is_empty() || !images.is_empty();
+        if !effective_text.is_empty() || !has_images {
+            parts.push(MessagePart::Text {
+                text: effective_text,
+                cache_breakpoint: false,
+            });
+        }
+        parts.extend(expansion.images);
+        for img in images {
+            parts.push(MessagePart::Image {
+                media_type: img.media_type,
+                data_base64: img.data_base64,
+                source_path: img.source_path,
+            });
+        }
+        let original_indexed_text = prompt.clone();
+        let user_msg = ProviderMessage {
+            role: MessageRole::User,
+            parts,
+        };
+
         let before = self.frame.snapshot();
-        let user_msg = ProviderMessage::user_text(prompt.clone());
         self.frame.push_message(user_msg.clone());
         let _ = self.frame.assert_append_only(&before);
 
@@ -794,7 +860,7 @@ impl SessionActor {
             let _ = idx.index_message_text(&self.session_id, &turn_id, "user", &prompt);
             if let Ok(Some(mut summary)) = idx.get_session(&self.session_id) {
                 if summary.preview.is_empty() {
-                    summary.preview = prompt.chars().take(120).collect();
+                    summary.preview = original_indexed_text.chars().take(120).collect();
                 }
                 summary.updated_at = now;
                 let _ = idx.upsert_session(&summary);
@@ -1252,7 +1318,7 @@ impl SessionActor {
     }
 
     fn drain_guides_into_frame(&mut self, turn_id: &str) -> bool {
-        let drained: Vec<String> = {
+        let drained: Vec<PendingUserInput> = {
             let mut q = self
                 .guide_inbox
                 .lock()
@@ -1263,8 +1329,25 @@ impl SessionActor {
             return false;
         }
         let before = self.frame.snapshot();
-        for guide_text in drained {
-            let msg = ProviderMessage::user_text(guide_text.clone());
+        for (guide_text, images) in drained {
+            let mut parts: Vec<MessagePart> = Vec::new();
+            if !guide_text.is_empty() || images.is_empty() {
+                parts.push(MessagePart::Text {
+                    text: guide_text.clone(),
+                    cache_breakpoint: false,
+                });
+            }
+            for img in images {
+                parts.push(MessagePart::Image {
+                    media_type: img.media_type,
+                    data_base64: img.data_base64,
+                    source_path: img.source_path,
+                });
+            }
+            let msg = ProviderMessage {
+                role: MessageRole::User,
+                parts,
+            };
             self.frame.push_message(msg.clone());
             let _ = self.append_rollout(RolloutRecord::Message {
                 turn_id: turn_id.to_string(),
@@ -1385,6 +1468,11 @@ impl SessionActor {
             .route_for_mode(self.mode)
             .map(|(_, c)| c.spec)
             .unwrap_or_else(|_| self.config.settings.model.clone());
+        let context_window = self
+            .router
+            .route_for_mode(self.mode)
+            .map(|(_, c)| c.context_window)
+            .unwrap_or(0);
         let plan_md = self
             .plan_markdown
             .lock()
@@ -1399,6 +1487,7 @@ impl SessionActor {
         st.goal.clone_from(&self.active_goal);
         st.plan_markdown = plan_md;
         st.cumulative_usage = self.cumulative_usage;
+        st.context_window = context_window;
         st.last_frame_snapshot = Some(self.frame.snapshot());
     }
 }

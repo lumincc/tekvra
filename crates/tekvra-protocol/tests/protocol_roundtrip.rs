@@ -18,6 +18,7 @@ fn internal_session_and_tool_output_roundtrip() {
     let cmd = SessionCommand::SubmitInput {
         prompt: "run cargo test".to_string(),
         delivery: InputDeliveryMode::Guide,
+        images: Vec::new(),
     };
     let encoded = serde_json::to_string(&cmd).expect("serialize SessionCommand");
     let decoded: SessionCommand =
@@ -35,6 +36,8 @@ fn internal_session_and_tool_output_roundtrip() {
                 moved_from: None,
                 change_kind: FileChangeKind::Update,
                 unified_diff: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
+                old_text: Some("old".to_string()),
+                new_text: Some("new".to_string()),
                 additions: 1,
                 deletions: 1,
             }],

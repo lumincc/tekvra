@@ -90,6 +90,25 @@ tekvra auth login openai
 tekvra auth login openai --device-code
 tekvra auth status
 
+# Manage MCP servers, workspace trust, and shell completions without a session
+tekvra mcp list
+tekvra mcp add filesystem --command npx -- -y @modelcontextprotocol/server-filesystem .
+tekvra mcp add remote_docs --url https://mcp.example.com/rpc --bearer-env DOCS_MCP_TOKEN
+tekvra mcp remove filesystem
+tekvra mcp test remote_docs
+tekvra trust status && tekvra trust allow && tekvra trust revoke
+tekvra completion bash | source /dev/stdin   # zsh | fish | powershell also supported
+
+# Isolated Git worktrees (`tekvra/<name>` branches under <state_dir>/worktrees/)
+tekvra worktree list
+tekvra worktree create feat-refactor
+tekvra worktree remove feat-refactor
+tekvra --worktree feat-refactor exec "refactor the parser"
+
+# Multimodal prompts: attach images (repeatable) and inject SKILL.md instructions
+tekvra exec -i screenshot.png -i diagram.jpg "Find the misaligned button"
+tekvra exec --skill review-api "Audit the HTTP handlers"
+
 # Start Codex v2 app-server (stdio or authenticated WebSocket) or ACP bridge
 tekvra app-server --listen stdio://
 tekvra app-server --listen ws://127.0.0.1:8765
@@ -98,8 +117,9 @@ tekvra acp
 
 ### TUI Keyboard Shortcuts & Slash Commands
 
-- **Composer & Autocomplete**: Type `/` for fuzzy slash-command completion or `@` for non-sensitive workspace file completion (`Up`/`Down` navigate, `Tab`/`Enter` accept, `Esc` dismiss); `Enter` submit (`Guide` while streaming), `Alt-Enter` steer (`Replace`) while streaming (or insert newline when idle), `Ctrl-J` insert newline, `Left`/`Right`/`Home`/`End`/`Backspace`/`Delete` UTF-8 cursor editing, `Shift-Tab` cycle permission mode, `r` toggle Filtered/Raw tool output, `Ctrl-C` interrupt active turn (or exit when idle).
-- **Built-In Slash Commands**: `/help`, `/model <provider/model>`, `/mode <plan|build|auto|yolo>`, `/sessions` (`/resume [id]`), `/fork <id>`, `/mcp`, `/review [uncommitted|base <branch>|commit <sha>]`, `/tasks` (`Ctrl-X`), `/search <query>`, `/revert <turn_id>`, `/goal <cond|clear>`, `/reload`, `/quit`.
+- **Composer & Autocomplete**: Type `/` for fuzzy slash-command completion, `@` for non-sensitive workspace file completion, or a `/skill <prefix>` argument for fuzzy SKILL.md completion (`Up`/`Down` navigate, `Tab`/`Enter` accept, `Esc` dismiss); `Enter` submit (`Guide` while streaming), `Alt-Enter` steer (`Replace`) while streaming (or insert newline when idle), `Ctrl-J` insert newline, `Left`/`Right`/`Home`/`End`/`Backspace`/`Delete` UTF-8 cursor editing, `Shift-Tab` cycle permission mode, `r` toggle Filtered/Raw tool output, mouse wheel scrolls the transcript, `Ctrl-C` interrupt active turn (or exit when idle).
+- **Built-In Slash Commands**: `/help`, `/model [<provider/model>]` (bare `/model` opens the fuzzy model picker modal), `/mode <plan|build|auto|yolo>`, `/sessions` (`/resume [id]`), `/fork <id>`, `/mcp`, `/review [uncommitted|base <branch>|commit <sha>]`, `/tasks` (`Ctrl-X`), `/search <query>`, `/revert <turn_id>`, `/undo` (revert the latest turn), `/compact` (manual context compaction with a token-delta banner), `/skill <name> [prompt]`, `/trust <status|allow|revoke>`, `/copy [code|all]` (OSC-52 clipboard export), `/goal <cond|clear>`, `/reload`, `/quit`.
+- **Prompt Attachments**: `@path/to/file` inlines a bounded file block, `@path#L10-L25` limits the range, sensitive credential paths are withheld with a warning, and `@@` escapes a literal `@`.
 
 ---
 
@@ -122,7 +142,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo deny --offline check licenses bans sources
 python3 scripts/ci_verify_packaging.py --check-workflows
-openspec validate --specs --strict
 ```
 
 ## License

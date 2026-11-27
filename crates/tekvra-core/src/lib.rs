@@ -2,6 +2,7 @@
 //! Caudra-style automatic steering nudges, durable steerable `task` subagents,
 //! tool-less `/goal` transcript evaluator, and read-only `/review` workflow.
 
+pub mod context;
 pub mod frame;
 pub mod goal_and_review;
 pub mod session;

@@ -13,6 +13,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+
 use futures::StreamExt;
 use ratatui::Frame;
 use ratatui::Terminal;
@@ -77,6 +78,8 @@ pub enum ActiveOverlay {
     Sessions(SessionsOverlayState),
     /// `/revert` workspace file-restoration preview.
     Revert(RevertOverlayState),
+    /// `/model` interactive fuzzy model picker.
+    ModelPicker(ModelPickerState),
 }
 
 /// High-level command emitted by [`TuiApp::handle_key`] to be executed by the async host loop.
@@ -134,6 +137,18 @@ pub enum TuiCommand {
         /// Remaining argument string.
         args: String,
     },
+    /// Export `text` to the terminal clipboard via ANSI OSC-52 (with native pipe fallback).
+    CopyToClipboard {
+        /// Text payload (latest fenced code block or full assistant reply).
+        text: String,
+        /// Short banner label (`"code block"` or `"reply"`).
+        label: String,
+    },
+    /// Inspect or toggle workspace folder trust through the host trust store.
+    RunTrust {
+        /// Concrete trust action.
+        action: TrustUiCommand,
+    },
 }
 
 /// Boxed future returned by the host `/review` callback in [`TuiRuntimeHooks`].
@@ -142,6 +157,9 @@ pub type BoxReviewFuture =
 
 /// Boxed callback invoked on `/<name> <args>` for opt-in Luau plugin commands (`Ok(None)` = unknown command).
 pub type PluginCommandHandler = Box<dyn FnMut(&str, &str) -> Result<Option<String>, String> + Send>;
+
+/// Boxed callback for `/trust <status|allow|revoke>`: maps the action to a status banner message.
+pub type TrustCommandHandler = Box<dyn FnMut(TrustUiCommand) -> Result<String, String> + Send>;
 
 /// Result returned when switching or forking a session in [`TuiRuntimeHooks::on_switch_session`].
 pub type SwitchSessionOutcome = (SessionHandle, Vec<RolloutRecord>);
@@ -159,6 +177,12 @@ pub struct TuiRuntimeHooks {
     pub workspace_files: Vec<String>,
     /// Extra `(name, description)` slash commands registered by active Luau plugins.
     pub extra_slash_commands: Vec<(String, String)>,
+    /// Discovered `(name, description)` SKILL.md packages for `/skill` completion.
+    pub discovered_skills: Vec<(String, String)>,
+    /// Selectable `(provider/model, description)` entries for the interactive `/model` picker.
+    pub available_models: Vec<(String, String)>,
+    /// Invoked on `/trust <status|allow|revoke>` against the host trust store.
+    pub on_trust_command: Option<TrustCommandHandler>,
     /// Invoked on `/reload` to rebuild opt-in Luau plugins.
     pub on_reload_plugins: Option<Box<dyn FnMut() -> Result<String, String> + Send>>,
     /// Invoked on `/<name> <args>` to execute a plugin-registered slash command (`Ok(None)` = unknown command).
@@ -203,6 +227,12 @@ pub struct TuiApp {
     pub workspace_files: Vec<String>,
     /// Extra `(name, description)` slash commands from active Luau plugins.
     pub extra_slash_commands: Vec<(String, String)>,
+    /// Discovered `(name, description)` SKILL.md packages for `/skill` completion.
+    pub skills: Vec<(String, String)>,
+    /// Selectable models for the interactive `/model` picker.
+    pub available_models: Vec<(String, String)>,
+    /// Context window (tokens) of the active model for utilization telemetry.
+    pub context_window: u64,
     /// Active inline `/` or `@file` fuzzy completion popup.
     pub completion: Option<CompletionPopupState>,
     /// Active modal overlay.
@@ -233,6 +263,9 @@ impl TuiApp {
             cursor_byte_pos: 0,
             workspace_files: Vec::new(),
             extra_slash_commands: Vec::new(),
+            skills: Vec::new(),
+            available_models: Vec::new(),
+            context_window: 0,
             completion: None,
             overlay: ActiveOverlay::None,
         }
@@ -257,6 +290,18 @@ impl TuiApp {
         self.refresh_completions();
     }
 
+    /// Sets discovered `(name, description)` SKILL.md packages for `/skill` completion.
+    pub fn set_discovered_skills(&mut self, skills: Vec<(String, String)>) {
+        self.skills = skills;
+        self.refresh_completions();
+    }
+
+    /// Sets selectable models and the active model context window for telemetry.
+    pub fn set_model_catalog(&mut self, models: Vec<(String, String)>, context_window: u64) {
+        self.available_models = models;
+        self.context_window = context_window;
+    }
+
     /// Recomputes `self.completion` from the current `input_buffer` and `cursor_byte_pos`.
     pub fn refresh_completions(&mut self) {
         self.completion = build_completion_popup(
@@ -264,6 +309,7 @@ impl TuiApp {
             self.cursor_byte_pos,
             &self.workspace_files,
             &self.extra_slash_commands,
+            &self.skills,
             8,
         );
     }
@@ -558,6 +604,14 @@ impl TuiApp {
             SessionEvent::TokenUsageUpdated { usage, .. } if !is_subagent => {
                 self.usage = usage;
             }
+            SessionEvent::CompactionCompleted {
+                generation,
+                before_tokens,
+                after_tokens,
+                ..
+            } if !is_subagent => {
+                self.apply_compaction_banner(generation, before_tokens, after_tokens);
+            }
             SessionEvent::ConfigWarning { summary, details } => {
                 let msg = match details {
                     Some(d) => format!("{summary}: {d}"),
@@ -593,6 +647,62 @@ impl TuiApp {
     /// Opens the `/sessions` (`/resume`) overlay populated with `sessions`.
     pub fn open_sessions_overlay(&mut self, sessions: Vec<tekvra_storage::SessionSummary>) {
         self.overlay = ActiveOverlay::Sessions(SessionsOverlayState::new(sessions));
+    }
+
+    /// Handles a mouse event: wheel scrolling adjusts the transcript viewport by 3 lines
+    /// without touching the composer buffer or cursor position.
+    pub fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> TuiCommand {
+        use crossterm::event::MouseEventKind;
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_add(3);
+            }
+            _ => {}
+        }
+        TuiCommand::Noop
+    }
+
+    /// Appends a token-delta banner for a finished [`SessionEvent::CompactionCompleted`].
+    pub fn apply_compaction_banner(&mut self, generation: u64, before: u64, after: u64) {
+        let saved = before.saturating_sub(after);
+        let pct = if before > 0 {
+            (saved as f64 / before as f64) * 100.0
+        } else {
+            0.0
+        };
+        self.main_transcript.push(TranscriptEntry::SystemBanner {
+            tag: "compact".to_string(),
+            text: format!(
+                "Context compacted to generation {generation}: {before} -> {after} estimated tokens (saved {saved}, {pct:.0}%)"
+            ),
+        });
+    }
+
+    /// Appends a clipboard-export confirmation banner.
+    pub fn apply_copy_result(&mut self, label: &str, byte_len: usize) {
+        self.main_transcript.push(TranscriptEntry::SystemBanner {
+            tag: "copy".to_string(),
+            text: format!(
+                "Copied {label} ({byte_len} bytes) to the terminal clipboard via OSC-52."
+            ),
+        });
+    }
+
+    /// Returns the Markdown body of the most recent assistant message, if any.
+    #[must_use]
+    pub fn latest_assistant_markdown(&self) -> Option<String> {
+        self.main_transcript
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                TranscriptEntry::AssistantMessage { markdown, .. } => {
+                    (!markdown.trim().is_empty()).then(|| markdown.clone())
+                }
+                _ => None,
+            })
     }
 
     /// Handles a single keyboard event and returns the resulting [`TuiCommand`].
@@ -755,6 +865,41 @@ impl TuiApp {
                 }
                 _ => TuiCommand::Noop,
             },
+            ActiveOverlay::ModelPicker(picker) => match key.code {
+                KeyCode::Esc => {
+                    self.overlay = ActiveOverlay::None;
+                    TuiCommand::Noop
+                }
+                KeyCode::Down => {
+                    picker.next();
+                    TuiCommand::Noop
+                }
+                KeyCode::Up => {
+                    picker.prev();
+                    TuiCommand::Noop
+                }
+                KeyCode::Backspace => {
+                    picker.pop_filter_char();
+                    TuiCommand::Noop
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    picker.push_filter_char(ch);
+                    TuiCommand::Noop
+                }
+                KeyCode::Enter => {
+                    let Some(model) = picker.selected_model() else {
+                        return TuiCommand::Noop;
+                    };
+                    self.overlay = ActiveOverlay::None;
+                    self.active_model = model.clone();
+                    self.main_transcript.push(TranscriptEntry::SystemBanner {
+                        tag: "model".to_string(),
+                        text: format!("Switched active model to `{model}`"),
+                    });
+                    TuiCommand::Session(SessionCommand::SwitchModel { model })
+                }
+                _ => TuiCommand::Noop,
+            },
             ActiveOverlay::None => self.handle_normal_key(key),
         }
     }
@@ -827,7 +972,9 @@ impl TuiApp {
                     return TuiCommand::Noop;
                 }
                 KeyCode::Enter
-                    if popup.kind == CompletionKind::WorkspaceFile || popup.navigated =>
+                    if popup.kind == CompletionKind::WorkspaceFile
+                        || popup.kind == CompletionKind::SkillName
+                        || popup.navigated =>
                 {
                     let _ = self.accept_completion();
                     return TuiCommand::Noop;
@@ -990,6 +1137,29 @@ impl TuiApp {
                         turn_id: tid.to_string(),
                     };
                 }
+                // `/skill <name> [prompt]` is expanded by the session runner, not the plugin host.
+                if trimmed == "/skill" || trimmed.starts_with("/skill ") {
+                    let arg = trimmed.strip_prefix("/skill").unwrap_or_default().trim();
+                    if arg.is_empty() {
+                        self.main_transcript.push(TranscriptEntry::SystemBanner {
+                            tag: "error".to_string(),
+                            text: "Usage: `/skill <name> [prompt]`".to_string(),
+                        });
+                        return TuiCommand::Noop;
+                    }
+                    self.main_transcript
+                        .push(TranscriptEntry::UserMessage(trimmed.to_string()));
+                    let delivery = if self.turn_running {
+                        InputDeliveryMode::Guide
+                    } else {
+                        InputDeliveryMode::Next
+                    };
+                    return TuiCommand::Session(SessionCommand::SubmitInput {
+                        prompt: trimmed.to_string(),
+                        delivery,
+                        images: Vec::new(),
+                    });
+                }
                 if let Some(after_slash) = trimmed.strip_prefix('/') {
                     let mut parts = after_slash.splitn(2, char::is_whitespace);
                     let cmd_name = parts.next().unwrap_or_default();
@@ -1030,6 +1200,7 @@ impl TuiApp {
                 TuiCommand::Session(SessionCommand::SubmitInput {
                     prompt: trimmed.to_string(),
                     delivery,
+                    images: Vec::new(),
                 })
             }
             _ => TuiCommand::Noop,
@@ -1065,6 +1236,7 @@ impl TuiApp {
             ActiveOverlay::Search(search) => self.render_search_modal(frame, search),
             ActiveOverlay::Sessions(sessions) => self.render_sessions_modal(frame, sessions),
             ActiveOverlay::Revert(rev) => self.render_revert_modal(frame, rev),
+            ActiveOverlay::ModelPicker(picker) => self.render_model_picker(frame, picker),
         }
     }
 
@@ -1079,7 +1251,7 @@ impl TuiApp {
             .map(|g| format!(" | GOAL:{g}"))
             .unwrap_or_default();
         let status_text = format!(
-            " TEKVRA | {} | mode={:?} | model={} | in={} (cache {:.0}%) out={} ${:.4}{}",
+            " TEKVRA | {} | mode={:?} | model={} | in={} (cache {:.0}%) out={} ${:.4}{ctx_pct}{}",
             view_label,
             self.mode,
             self.active_model,
@@ -1414,6 +1586,7 @@ impl TuiApp {
         let title = match popup.kind {
             CompletionKind::SlashCommand => " Slash Commands (Tab/Enter select, Esc close) ",
             CompletionKind::WorkspaceFile => " @File Mention (Tab/Enter select, Esc close) ",
+            CompletionKind::SkillName => " Skills (/skill <name>, Tab/Enter select, Esc close) ",
         };
         let widget = Paragraph::new(lines).block(
             Block::default()
@@ -1422,6 +1595,54 @@ impl TuiApp {
                 .border_style(Style::default().fg(Color::Cyan)),
         );
         frame.render_widget(widget, popup_area);
+    }
+
+    fn render_model_picker(&self, frame: &mut Frame<'_>, picker: &ModelPickerState) {
+        let area = centered_rect(72, 55, frame.area());
+        frame.render_widget(Clear, area);
+
+        let filtered = picker.filtered();
+        let mut lines = vec![Line::from(Span::styled(
+            format!(
+                "Select model ({} match(es)) — filter: `{}`",
+                filtered.len(),
+                picker.query
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))];
+        if filtered.is_empty() {
+            lines.push(Line::from(Span::raw("  (no models match the filter)")));
+        } else {
+            for (i, (spec, description)) in filtered.iter().enumerate() {
+                let sel = i == picker.selected;
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{} {spec}", if sel { "▸" } else { " " }),
+                        if sel {
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                    Span::styled(
+                        format!("  {description}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+        lines.push(Line::from(Span::raw(
+            "Enter: Switch Model | Up/Down: Navigate | Type: Fuzzy Filter | Esc: Cancel",
+        )));
+
+        let widget = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Model Picker (/model) "),
+        );
+        frame.render_widget(widget, area);
     }
 
     fn render_sessions_modal(&self, frame: &mut Frame<'_>, sessions: &SessionsOverlayState) {
@@ -1489,16 +1710,26 @@ struct AltScreenGuard;
 impl AltScreenGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(Self)
     }
 }
 
 impl Drop for AltScreenGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
+}
+
+/// Exports `text` to the terminal clipboard via ANSI OSC-52 (base64, clipboard selection).
+fn copy_to_clipboard_osc52(text: &str) {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(format!("\x1b]52;c;{encoded}\x07").as_bytes());
+    let _ = stdout.flush();
 }
 
 /// Runs the 60 FPS full-screen Alternate-Screen TUI attached to `handle`.
@@ -1527,6 +1758,11 @@ pub async fn run_fullscreen_tui(
     }
     app.set_workspace_files(std::mem::take(&mut hooks.workspace_files));
     app.set_extra_slash_commands(std::mem::take(&mut hooks.extra_slash_commands));
+    app.set_discovered_skills(std::mem::take(&mut hooks.discovered_skills));
+    app.set_model_catalog(
+        std::mem::take(&mut hooks.available_models),
+        snap.context_window,
+    );
     let mut event_rx = handle.subscribe();
     let mut term_events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60 FPS
@@ -1540,8 +1776,9 @@ pub async fn run_fullscreen_tui(
                 app.apply_session_event(sev);
             }
             Some(Ok(ev)) = term_events.next() => {
-                if let Event::Key(key) = ev {
-                    match app.handle_key(key) {
+                match ev {
+                    Event::Key(key) => {
+                        match app.handle_key(key) {
                         TuiCommand::Noop => {}
                         TuiCommand::Quit => break,
                         TuiCommand::Session(cmd) => {
@@ -1661,13 +1898,75 @@ pub async fn run_fullscreen_tui(
                                 .map_or(Ok(None), |cb| cb(&name, &args));
                             app.apply_plugin_command_result(&name, res);
                         }
+                        TuiCommand::CopyToClipboard { text, label } => {
+                            let byte_len = text.len();
+                            copy_to_clipboard_osc52(&text);
+                            app.apply_copy_result(&label, byte_len);
+                        }
+                        TuiCommand::RunTrust { action } => {
+                            let msg = match &mut hooks.on_trust_command {
+                                Some(cb) => cb(action).unwrap_or_else(|err| err),
+                                None => {
+                                    "Trust store unavailable: no trust hook registered by the host."
+                                        .to_string()
+                                }
+                            };
+                            app.main_transcript.push(TranscriptEntry::SystemBanner {
+                                tag: "trust".to_string(),
+                                text: msg,
+                            });
+                        }
+                        }
                     }
+                    Event::Mouse(mouse) => {
+                        app.handle_mouse(mouse);
+                    }
+                    Event::Paste(text) => {
+                        for ch in text.chars() {
+                            app.insert_char_at_cursor(ch);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Extracts the last fenced ``` code block body from `markdown`, if present.
+#[must_use]
+pub fn extract_last_fenced_code_block(markdown: &str) -> Option<String> {
+    let mut open: Option<usize> = None;
+    let mut last_block: Option<String> = None;
+    let mut current: Vec<&str> = Vec::new();
+    let mut in_block = false;
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        if !in_block && trimmed.starts_with("```") {
+            in_block = true;
+            open = Some(trimmed.len());
+            current.clear();
+        } else if in_block && trimmed.starts_with("```") {
+            in_block = false;
+            let body = current.join("\n");
+            if !body.trim().is_empty() {
+                last_block = Some(body);
+            }
+            let _ = open;
+        } else if in_block {
+            current.push(line);
+        }
+    }
+    // Tolerate an unclosed fence: treat everything after the last opening as the block.
+    if in_block && !current.is_empty() {
+        let body = current.join("\n");
+        if !body.trim().is_empty() {
+            last_block = Some(body);
+        }
+    }
+    last_block
 }
 
 fn parse_tui_review_target(rest: &str) -> ReviewTarget {
@@ -1780,6 +2079,7 @@ fn event_thread_id(ev: &SessionEvent) -> Option<&str> {
         | SessionEvent::PlanUpdated { thread_id, .. }
         | SessionEvent::ReviewCompleted { thread_id, .. }
         | SessionEvent::TokenUsageUpdated { thread_id, .. }
+        | SessionEvent::CompactionCompleted { thread_id, .. }
         | SessionEvent::TurnCompleted { thread_id, .. } => Some(thread_id.as_str()),
         SessionEvent::ConfigWarning { .. } => None,
     }

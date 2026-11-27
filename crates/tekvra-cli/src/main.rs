@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use exec_runner::{ExecRunOptions, SchemaValidationFailed, run_headless_exec};
 use ignore::WalkBuilder;
 use tekvra_acp::{AcpServerDeps, serve_acp_stdio};
@@ -32,6 +32,14 @@ use tekvra_storage::{RolloutLog, RolloutRecord, StateIndex, WorkspaceSnapshotSto
 use tekvra_tools::{ConfiguredMcpGateway, McpGateway, is_sensitive_credential_path};
 use tekvra_tui::TuiRuntimeHooks;
 use uuid::Uuid;
+
+mod ops;
+
+use ops::{
+    ConfigScope, McpAction, McpAddSpec, TrustAction, apply_skill_flag, ensure_worktree,
+    ensure_worktree_name, generate_completion, handle_mcp_command, handle_trust_command,
+    load_image_attachments,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -80,6 +88,18 @@ struct Cli {
     #[arg(short = 'p', long = "print")]
     print_prompt: Option<String>,
 
+    /// Attach an image (repeatable; png/jpg/jpeg/webp/gif, max 10 MiB each) to the first turn.
+    #[arg(short = 'i', long = "image", global = true)]
+    image_paths: Vec<PathBuf>,
+
+    /// Inject the discovered SKILL.md `<NAME>` into the prompt (`--skill review-api`).
+    #[arg(long, global = true)]
+    skill: Option<String>,
+
+    /// Create/reuse the managed git worktree `<NAME>` (`tekvra/<NAME>`) for this run.
+    #[arg(long, global = true)]
+    worktree: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -100,6 +120,14 @@ enum Commands {
     Acp,
     /// Manage OAuth and API key credentials (`login`, `status`, `logout`).
     Auth(AuthArgs),
+    /// Manage configured MCP servers (`list`, `add`, `remove`, `test`).
+    Mcp(McpArgs),
+    /// Inspect or toggle workspace folder trust (`status`, `allow`, `revoke`).
+    Trust(TrustArgs),
+    /// Emit a shell completion script (`bash`, `zsh`, `fish`, `powershell`).
+    Completion(CompletionArgs),
+    /// Create or reuse a managed git worktree without starting a session.
+    Worktree(WorktreeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -218,6 +246,92 @@ enum AuthAction {
     },
 }
 
+#[derive(Debug, Args)]
+struct McpArgs {
+    #[command(subcommand)]
+    action: McpSubAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum McpSubAction {
+    /// List configured MCP servers (`name  kind  state`).
+    List,
+    /// Add or overwrite an MCP server entry in `tekvra.toml` (comment-preserving).
+    Add {
+        /// Registry key under `[mcp_servers.<NAME>]`.
+        name: String,
+        /// Stdio server executable (mutually exclusive with `--url`).
+        #[arg(long)]
+        command: Option<String>,
+        /// Stdio server arguments (`tekvra mcp add fs --command npx -- -y @modelcontextprotocol/server-fs`).
+        #[arg(last = true)]
+        command_args: Vec<String>,
+        /// HTTP/SSE endpoint URL (mutually exclusive with `--command`).
+        #[arg(long)]
+        url: Option<String>,
+        /// Environment variable holding the Bearer token for HTTP servers.
+        #[arg(long = "bearer-env")]
+        bearer_env: Option<String>,
+        /// Edit the user-global config instead of `<workspace>/tekvra.toml`.
+        #[arg(long, default_value = "project")]
+        scope: String,
+    },
+    /// Remove an MCP server entry from `tekvra.toml`.
+    Remove {
+        /// Registry key to remove.
+        name: String,
+    },
+    /// Run a one-shot handshake against `<NAME>` and list its advertised tools.
+    Test {
+        /// Registry key to test.
+        name: String,
+    },
+}
+
+#[derive(Debug, Args)]
+struct TrustArgs {
+    #[command(subcommand)]
+    action: TrustSubAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum TrustSubAction {
+    /// Print whether the workspace root is trusted.
+    Status,
+    /// Grant folder trust for the workspace root.
+    Allow,
+    /// Revoke folder trust for the workspace root.
+    Revoke,
+}
+
+#[derive(Debug, Args)]
+struct CompletionArgs {
+    /// Target shell (`bash`, `zsh`, `fish`, `powershell`).
+    shell: String,
+}
+
+#[derive(Debug, Args)]
+struct WorktreeArgs {
+    #[command(subcommand)]
+    action: WorktreeSubAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorktreeSubAction {
+    /// List managed worktrees for the current repository.
+    List,
+    /// Create (or reuse) the managed worktree `tekvra/<NAME>`.
+    Create {
+        /// Worktree name `[A-Za-z0-9._-]+`; checkout lands under `<state_dir>/worktrees/<repo-slug>/<NAME>`.
+        name: String,
+    },
+    /// Remove the managed worktree `<NAME>` (its branch `tekvra/<NAME>` is kept).
+    Remove {
+        /// Worktree name to remove.
+        name: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -273,6 +387,21 @@ async fn try_main() -> Result<()> {
         resolved.settings.agent.default_mode = parse_mode(mode_str)?;
     }
 
+    // Managed worktree: run inside `<state_dir>/worktrees/<repo-slug>/<name>` on `tekvra/<name>`.
+    if let Some(name) = &cli.worktree {
+        let outcome = ensure_worktree(&resolved.cwd, &resolved.paths.state_dir, name)?;
+        // Worktrees are Tekvra-managed checkouts: trust them like the primary workspace.
+        let mut store = tekvra_config::TrustStore::load(&resolved.paths.state_dir)?;
+        store.grant_trust(&outcome.path)?;
+        eprintln!(
+            "worktree: {} on {} ({})",
+            outcome.path.display(),
+            outcome.branch,
+            if outcome.created { "created" } else { "reused" }
+        );
+        resolved.cwd = outcome.path;
+    }
+
     if let Some(Commands::Auth(auth_args)) = cli.command {
         return handle_auth_command(&resolved, auth_args).await;
     }
@@ -322,6 +451,8 @@ async fn try_main() -> Result<()> {
 
     if let Some(print_prompt) = cli.print_prompt {
         let mode = resolved.settings.agent.default_mode;
+        let images = load_image_attachments(&cli.image_paths)?;
+        let prompt = apply_skill_flag(cli.skill.as_deref(), Some(print_prompt))?;
         let handle = spawn_cli_session(
             None,
             None,
@@ -336,13 +467,14 @@ async fn try_main() -> Result<()> {
         return run_headless_exec(
             handle,
             ExecRunOptions {
-                prompt: Some(print_prompt),
+                prompt,
                 json_events: false,
                 output_schema: None,
                 output_file: None,
                 input_format: "text".to_string(),
                 output_format: "text".to_string(),
                 mode,
+                images,
             },
         )
         .await;
@@ -351,6 +483,8 @@ async fn try_main() -> Result<()> {
     match cli.command {
         Some(Commands::Exec(args)) => {
             let mode = resolved.settings.agent.default_mode;
+            let images = load_image_attachments(&cli.image_paths)?;
+            let prompt = apply_skill_flag(cli.skill.as_deref(), args.prompt)?;
             let handle = spawn_cli_session(
                 None,
                 None,
@@ -365,13 +499,14 @@ async fn try_main() -> Result<()> {
             run_headless_exec(
                 handle,
                 ExecRunOptions {
-                    prompt: args.prompt,
+                    prompt,
                     json_events: args.json,
                     output_schema: args.output_schema,
                     output_file: args.output_file,
                     input_format: args.input_format,
                     output_format: args.output_format,
                     mode,
+                    images,
                 },
             )
             .await
@@ -405,6 +540,9 @@ async fn try_main() -> Result<()> {
             )?;
 
             if let Some(prompt) = args.prompt {
+                let images = load_image_attachments(&cli.image_paths)?;
+                let prompt =
+                    apply_skill_flag(cli.skill.as_deref(), Some(prompt))?.expect("prompt present");
                 return run_headless_exec(
                     handle,
                     ExecRunOptions {
@@ -415,6 +553,7 @@ async fn try_main() -> Result<()> {
                         input_format: "text".to_string(),
                         output_format: "text".to_string(),
                         mode: resolved.settings.agent.default_mode,
+                        images,
                     },
                 )
                 .await;
@@ -432,6 +571,7 @@ async fn try_main() -> Result<()> {
                 mcp_gateway_opt,
                 plugin_exec_opt,
                 extra_tools,
+                available_models,
             )
             .await
         }
@@ -450,6 +590,9 @@ async fn try_main() -> Result<()> {
 
             if let Some(prompt) = args.prompt {
                 println!("Forked session: {}", handle.session_id());
+                let images = load_image_attachments(&cli.image_paths)?;
+                let prompt =
+                    apply_skill_flag(cli.skill.as_deref(), Some(prompt))?.expect("prompt present");
                 return run_headless_exec(
                     handle,
                     ExecRunOptions {
@@ -460,6 +603,7 @@ async fn try_main() -> Result<()> {
                         input_format: "text".to_string(),
                         output_format: "text".to_string(),
                         mode: resolved.settings.agent.default_mode,
+                        images,
                     },
                 )
                 .await;
@@ -477,6 +621,7 @@ async fn try_main() -> Result<()> {
                 mcp_gateway_opt,
                 plugin_exec_opt,
                 extra_tools,
+                available_models,
             )
             .await
         }
@@ -552,6 +697,10 @@ async fn try_main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Auth(_)) => unreachable!("handled above"),
+        Some(Commands::Mcp(_))
+        | Some(Commands::Trust(_))
+        | Some(Commands::Completion(_))
+        | Some(Commands::Worktree(_)) => unreachable!("handled above"),
         None => {
             let handle = spawn_cli_session(
                 None,
@@ -576,6 +725,7 @@ async fn try_main() -> Result<()> {
                 mcp_gateway_opt,
                 plugin_exec_opt,
                 extra_tools,
+                available_models,
             )
             .await
         }
@@ -595,6 +745,7 @@ async fn launch_interactive_tui(
     mcp_gateway_opt: Option<Arc<dyn McpGateway>>,
     plugin_exec_opt: Option<Arc<dyn PluginToolExecutor>>,
     extra_tools: Vec<tekvra_providers::ToolDefinition>,
+    available_models: Vec<(String, String)>,
 ) -> Result<()> {
     let workspace_files = scan_workspace_mention_files(&resolved.cwd, 4_000);
     let extra_slash_commands: Vec<(String, String)> = plugin_host

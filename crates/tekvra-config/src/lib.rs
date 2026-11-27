@@ -11,7 +11,7 @@ use thiserror::Error;
 
 pub use discovery::{
     InstructionDoc, SkillMetadata, discover_instructions, discover_skills, find_git_root,
-    merge_instructions_markdown,
+    load_skill_body, merge_instructions_markdown, strip_yaml_frontmatter,
 };
 pub use loader::{CliConfigOverrides, ConfigPaths, ResolvedConfig, load_config};
 pub use schema::{

@@ -191,6 +191,26 @@ async fn wait_for_turn_complete(rx: &mut tokio::sync::broadcast::Receiver<Sessio
     }
 }
 
+/// Flattens all `Text` parts of every message in `request` for plain-substring assertions
+/// (avoids JSON quote-escaping false negatives).
+fn flat_text(request: &CompletionRequest) -> String {
+    request
+        .messages
+        .iter()
+        .map(|m| {
+            m.parts
+                .iter()
+                .filter_map(|p| match p {
+                    MessagePart::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n----\n")
+}
+
 #[tokio::test]
 async fn append_only_frame_plan_to_build_prefix_stability_compaction_and_non_destructive_guide() {
     // 1. Direct `Frame::assert_append_only` check + mutation detection

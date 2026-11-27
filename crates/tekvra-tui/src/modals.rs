@@ -312,6 +312,8 @@ pub enum CompletionKind {
     SlashCommand,
     /// `@path/to/file` workspace file mention completion.
     WorkspaceFile,
+    /// `<name>` argument completion directly following `/skill`.
+    SkillName,
 }
 
 /// Single ranked candidate in [`CompletionPopupState`].
@@ -431,13 +433,15 @@ impl PathHasSecretExt {
 }
 
 /// Computes the inline fuzzy-completion popup for `input[..cursor_byte_pos]`, if the cursor is
-/// currently positioned inside a leading `/command` token or an `@file` mention token.
+/// currently positioned inside a leading `/command` token, an `@file` mention token, or a
+/// `<name>` argument token directly following `/skill`.
 #[must_use]
 pub fn build_completion_popup(
     input: &str,
     cursor_byte_pos: usize,
     workspace_files: &[String],
     extra_slash_commands: &[(String, String)],
+    skills: &[(String, String)],
     max_items: usize,
 ) -> Option<CompletionPopupState> {
     let pos = cursor_byte_pos.min(input.len());
@@ -449,6 +453,39 @@ pub fn build_completion_popup(
         idx + before[idx..].chars().next().map_or(1, char::len_utf8)
     });
     let token = &before[token_start..pos];
+
+    // 0. `/skill <name>` argument completion (second token right after the `/skill` command)
+    if token_start > 0 {
+        let before_token = before[..token_start].trim_end();
+        if before_token == "/skill" {
+            let query = token.to_ascii_lowercase();
+            let mut candidates = Vec::new();
+            for (name, description) in skills {
+                if let Some(score) = fuzzy_score_token(name, &query) {
+                    candidates.push(CompletionCandidate {
+                        replacement: name.clone(),
+                        label: name.clone(),
+                        description: description.clone(),
+                        score,
+                    });
+                }
+            }
+            candidates.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.label.cmp(&b.label)));
+            candidates.truncate(max_items.max(1));
+            if candidates.is_empty() {
+                return None;
+            }
+            return Some(CompletionPopupState {
+                kind: CompletionKind::SkillName,
+                token_start,
+                token_end: pos,
+                query,
+                candidates,
+                selected: 0,
+                navigated: false,
+            });
+        }
+    }
 
     // 1. Leading `/command` completion (only when `/` starts at byte 0 with no whitespace yet)
     if token_start == 0

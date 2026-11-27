@@ -455,6 +455,8 @@ pub async fn apply_patch_to_workspace(
                     moved_from,
                     change_kind: kind,
                     unified_diff,
+                    old_text: Some(old_text),
+                    new_text: Some(new_text),
                     additions,
                     deletions,
                 });
@@ -475,6 +477,8 @@ pub async fn apply_patch_to_workspace(
                     moved_from: None,
                     change_kind: FileChangeKind::Delete,
                     unified_diff,
+                    old_text: Some(old_text),
+                    new_text: Some(String::new()),
                     additions,
                     deletions,
                 });

@@ -13,15 +13,17 @@ use thiserror::Error;
 
 pub use app::{
     ActiveOverlay, BoxReviewFuture, PluginCommandHandler, SwitchSessionHandler,
-    SwitchSessionOutcome, TranscriptEntry, TuiApp, TuiCommand, TuiRuntimeHooks, run_fullscreen_tui,
+    SwitchSessionOutcome, TranscriptEntry, TuiApp, TuiCommand, TuiRuntimeHooks,
+    extract_last_fenced_code_block, run_fullscreen_tui,
 };
 pub use cards::{ToolCardState, render_tool_card};
 pub use highlight::{CodeHighlighter, highlight_unified_diff};
 pub use markdown::render_markdown_lines;
 pub use modals::{
     ApprovalModalState, CompletionCandidate, CompletionKind, CompletionPopupState,
-    RevertOverlayState, RevertPreviewItem, SearchOverlayState, SessionsOverlayState,
-    TasksOverlayState, build_completion_popup, is_excluded_mention_path,
+    ModelPickerState, RevertOverlayState, RevertPreviewItem, SearchOverlayState,
+    SessionsOverlayState, TasksOverlayState, TrustUiCommand, build_completion_popup,
+    is_excluded_mention_path,
 };
 
 /// Errors produced by `tekvra-tui`.

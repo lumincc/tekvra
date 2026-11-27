@@ -11,9 +11,20 @@ Triggered on every push to `main` / `release/**`, every pull request, and via `w
 | `fmt` | `ubuntu-24.04` | `cargo fmt --all -- --check` + `python3 scripts/ci_verify_packaging.py --check-workflows` |
 | `lint` | `ubuntu-24.04` | `cargo clippy --locked --workspace --all-targets -- -D warnings` |
 | `test` | `ubuntu-24.04`, `macos-latest` | `cargo test --locked --workspace` across all 11 crates |
-| `windows` | `windows-latest` | Windows Clippy check + `cargo build --locked --bin tekvra` |
+| `windows` | `windows-latest` | Windows Clippy check + `cargo test --locked --workspace` + `cargo build --locked --bin tekvra` |
 | `deny` | `ubuntu-24.04` | `cargo deny --locked check advisories licenses bans sources` |
 | `ci-gate` | `ubuntu-24.04` | Single required branch-protection check (`CI`) aggregating all upstream jobs |
+
+## 1b. Checksum-Verified Installers
+
+`install.sh` (Linux/macOS, POSIX bash) and `install.ps1` (Windows PowerShell) install the release binary:
+
+1. Detect host OS/architecture and select the matching release archive (`tekvra-<tag>-<target>.tar.gz|zip`).
+2. Download the archive **and** `SHA256SUMS.txt` from the release assets.
+3. Verify the archive digest against `SHA256SUMS.txt`; any mismatch aborts with a non-zero exit status **before** placing a binary into the install prefix.
+4. Install `tekvra` into `$TEKVRA_INSTALL_PREFIX/bin` (default `~/.local/bin` on POSIX, `%LOCALAPPDATA%\Programs\tekvra\bin` on Windows).
+
+Environment knobs: `TEKVRA_VERSION` (tag, default `v0.1.0`), `TEKVRA_INSTALL_PREFIX`, and `TEKVRA_DOWNLOAD_PREFIX` (override the release base URL; supports `file://` for offline smoke tests, e.g. the mismatch-rejection test in `crates/tekvra-cli/tests/cli_spec.rs`).
 
 ## 2. Tagged Multi-Target Release CD (`.github/workflows/release.yml`)
 

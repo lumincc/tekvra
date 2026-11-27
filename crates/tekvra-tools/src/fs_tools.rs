@@ -201,6 +201,8 @@ pub async fn file_write(
                 FileChangeKind::Add
             },
             unified_diff,
+            old_text: if existed { Some(old_text) } else { None },
+            new_text: Some(content.to_string()),
             additions,
             deletions,
         }],
@@ -298,6 +300,8 @@ pub async fn file_edit(
             moved_from: None,
             change_kind: FileChangeKind::Update,
             unified_diff,
+            old_text: Some(original),
+            new_text: Some(updated),
             additions,
             deletions,
         }],

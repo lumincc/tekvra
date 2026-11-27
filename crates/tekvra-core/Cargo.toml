@@ -19,6 +19,7 @@ tekvra-storage = { workspace = true }
 tekvra-tools = { workspace = true }
 
 async-trait = { workspace = true }
+base64 = { workspace = true }
 jiff = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }

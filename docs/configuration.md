@@ -23,6 +23,16 @@ Global TOML files carry `version = 2`. When Tekvra encounters an older supported
 
 Opening an untrusted repository withholds `.tekvra/tekvra.toml` (including project MCP servers), `.tekvra/providers.toml`, `.env` variables, `.tekvra/init.lua`, and project `allow`/`ask` permission rules until the user explicitly grants trust for that canonical directory. Project `deny` rules in `.tekvra/permissions.toml` are enforced immediately.
 
+Trust state lives in `~/.local/share/tekvra/trusted_folders.toml` and is managed with the `tekvra trust` subcommand (no session, plugin, or MCP startup):
+
+```bash
+tekvra trust status   # print whether the workspace root is trusted
+tekvra trust allow    # grant trust for the canonical workspace root
+tekvra trust revoke   # revoke trust for the canonical workspace root
+```
+
+Inside the TUI, `/trust <status|allow|revoke>` dispatches the same operations against the same store.
+
 ## Global-Only Experimental Flags
 
 `[experimental]` flags—including `experimental.lua_plugins = true`—are honored **only** from global `~/.config/tekvra/tekvra.toml` (or CLI `--enable`), never from a project `.tekvra/tekvra.toml`.
@@ -53,3 +63,18 @@ tool_timeout_sec = 30
 ```
 
 Enabled servers are connected at startup via `ConfiguredMcpGateway` (`initialize` -> `notifications/initialized` -> `tools/list`) and exposed inside Monty `code` (`mcp_list()` / `await mcp_call(...)`) as well as `/mcp` and `mcpServerStatus/list` without mutating top-level LLM tool schemas.
+
+### Managing MCP Servers from the CLI (`tekvra mcp`)
+
+The `tekvra mcp` subcommand family manages `[mcp_servers.*]` entries **without starting a session, Lua VM, or gateway**:
+
+```bash
+tekvra mcp list                              # "name  kind(stdio|http)  state(enabled|disabled)"
+tekvra mcp add filesystem --command npx -- -y @modelcontextprotocol/server-filesystem .
+tekvra mcp add remote_docs --url https://mcp.example.com/rpc --bearer-env DOCS_MCP_TOKEN
+tekvra mcp add fs2 --command uvx --scope user  # write to ~/.config/tekvra/tekvra.toml
+tekvra mcp remove filesystem                 # removes from the scope that defines it
+tekvra mcp test remote_docs                  # one-shot handshake; prints discovered tool names
+```
+
+`add`/`remove` edit `<repo>/.tekvra/tekvra.toml` (project scope, the default) or the user-global file via `toml_edit::DocumentMut`, so unrelated comments and formatting survive the mutation. `--command` (stdio) and `--url` (HTTP) are mutually exclusive; trailing arguments after `--` become the stdio argv. `test` performs a one-shot `initialize` + `tools/list` handshake against a single server and prints `name/tool` pairs (non-zero exit when the handshake fails).

@@ -45,3 +45,15 @@ During active turns, the server sends correlated JSON-RPC requests to the client
 - `item/fileChange/requestApproval`
 - `item/tool/requestUserInput`
 - `mcpServer/elicitation/request`
+
+### ACP `session/request_permission`
+
+On every `SessionEvent::ApprovalRequested`, the ACP bridge sends a correlated `session/request_permission` request offering `allow_once`, `allow_always`, and `reject_once` options. Pending requests are tracked per JSON-RPC id; inbound client *response* frames (`{"id": ..., "result": ...}` with no `method`) resolve them:
+
+- `{"outcome": {"outcome": "selected", "optionId": "allow_once"}}` approves once.
+- `optionId: "allow_always"` approves with a project-lifetime grant.
+- Any other outcome, a malformed result, `session/cancel`, or EOF **fails closed** with `Deny` (the approval task observes a dropped oneshot channel).
+
+### Structured `diff` blocks
+
+`ItemCompleted` events carrying `ToolOutput::Diff` emit `tool_call_update` notifications with `content: [{ "type": "diff", "path", "oldText", "newText" }]` (one per file, `kind: "edit"|"delete"`), driven by the `old_text`/`new_text` fields retained on `FileDiffEntry`.

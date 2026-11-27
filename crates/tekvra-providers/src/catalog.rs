@@ -42,6 +42,8 @@ pub struct ModelCapabilities {
     pub supported_efforts: Vec<String>,
     /// Whether explicit prompt-cache breakpoints are supported.
     pub supports_cache_breakpoints: bool,
+    /// Whether this model accepts multimodal image (`MessagePart::Image`) user blocks.
+    pub supports_vision: bool,
     /// Maximum context window in tokens.
     pub context_window: u64,
     /// USD per 1M uncached input tokens.
@@ -100,6 +102,32 @@ impl ModelCapabilities {
             Vec::new()
         };
 
+        // Vision heuristics: GPT-4o/GPT-5/o-series/Codex, Claude 3.5+/4+, Gemini 1.5+/2.x+.
+        let supports_vision = match provider {
+            "openai" | "github-copilot" => {
+                lower_model.starts_with("gpt-4o")
+                    || lower_model.starts_with("gpt-5")
+                    || lower_model.starts_with("o1")
+                    || lower_model.starts_with("o3")
+                    || lower_model.starts_with("o4")
+                    || lower_model.contains("codex")
+            }
+            "anthropic" => {
+                lower_model.contains("claude-3-5")
+                    || lower_model.contains("claude-3.5")
+                    || lower_model.contains("claude-4")
+                    || lower_model.contains("sonnet-4")
+                    || lower_model.contains("opus-4")
+                    || lower_model.contains("haiku-4")
+            }
+            "gemini" => {
+                lower_model.contains("gemini-1.5")
+                    || lower_model.contains("gemini-2")
+                    || lower_model.contains("gemini-3")
+            }
+            _ => false,
+        };
+
         Self {
             spec: format!("{provider}/{model_id}"),
             provider: provider.to_string(),
@@ -113,6 +141,7 @@ impl ModelCapabilities {
                 protocol,
                 WireProtocol::OpenAiResponses | WireProtocol::AnthropicMessages
             ),
+            supports_vision,
             context_window: if provider == "gemini" {
                 1_000_000
             } else {
@@ -170,6 +199,9 @@ pub struct ProviderDefinition {
     pub default_protocol: WireProtocol,
     /// Default environment variable holding an API key.
     pub default_api_key_env: Option<String>,
+    /// Optional `providers.toml` override forcing `ModelCapabilities::supports_vision` for
+    /// every model on this provider (`Some(true)` for local vision servers, `Some(false)` to deny).
+    pub supports_vision_override: Option<bool>,
     /// Extra static HTTP headers.
     pub headers: BTreeMap<String, String>,
     /// Featured model identifiers for discovery (`model/list`).
@@ -294,6 +326,7 @@ impl ProviderRegistry {
                     base_url: url.to_string(),
                     default_protocol: proto,
                     default_api_key_env: env_key.map(str::to_string),
+                    supports_vision_override: None,
                     headers: BTreeMap::new(),
                     featured_models: models.into_iter().map(str::to_string).collect(),
                 },
@@ -323,6 +356,7 @@ impl ProviderRegistry {
                 if let Some(env_name) = &entry.api_key_env {
                     existing.default_api_key_env = Some(env_name.clone());
                 }
+                existing.supports_vision_override = entry.supports_vision;
                 for (hk, hv) in &entry.headers {
                     existing.headers.insert(hk.clone(), hv.clone());
                 }
@@ -340,6 +374,7 @@ impl ProviderRegistry {
                             .to_string(),
                         default_protocol: proto.unwrap_or(WireProtocol::OpenAiChatCompletions),
                         default_api_key_env: entry.api_key_env.clone(),
+                        supports_vision_override: entry.supports_vision,
                         headers: entry.headers.clone(),
                         featured_models: Vec::new(),
                     },
@@ -380,7 +415,10 @@ impl ProviderRegistry {
                 })?;
         let protocol_override =
             (def.id != "openai" && def.id != "github-copilot").then_some(def.default_protocol);
-        let caps = ModelCapabilities::resolve(&def.id, model_id, protocol_override);
+        let mut caps = ModelCapabilities::resolve(&def.id, model_id, protocol_override);
+        if let Some(vision) = def.supports_vision_override {
+            caps.supports_vision = vision;
+        }
         Ok((def, caps))
     }
 }
