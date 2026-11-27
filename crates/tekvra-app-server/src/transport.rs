@@ -2,7 +2,9 @@
 //! (with optional `Authorization: Bearer <token>` capability authentication).
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
