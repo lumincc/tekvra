@@ -1273,43 +1273,13 @@ fn installer_ps1_verifies_sha256_and_installs_nested_bundle() {
     // The packager fixture only builds the x86_64 archive, so on ARM64 hosts
     // this exercises install.ps1's documented fall-back from aarch64 (probed,
     // missing) to x86_64-pc-windows-msvc. On ARM64 hosts we ALSO package the
-    // native aarch64 archive with a distinct payload and assert the installer
-    // picks it over the x86_64 fallback.
+    // native aarch64 archive (packaged right after the x86_64 fixture below,
+    // where the python interpreter is already resolved) with a distinct payload
+    // and assert the installer picks it over the x86_64 fallback.
     let arm64_host = std::env::var("PROCESSOR_ARCHITECTURE")
         .map(|v| v.eq_ignore_ascii_case("ARM64"))
         .unwrap_or(false);
     let arm64_payload_path = payload_dir.join("tekvra-arm64.exe");
-    let arm64_archive_name = "tekvra-v0.1.0-aarch64-pc-windows-msvc.zip";
-    if arm64_host {
-        // A DIFFERENT PE than the x86_64 payload so the byte-comparison can tell
-        // which archive the installer actually pulled.
-        let ps_exe = std::path::Path::new(&system_root)
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe");
-        std::fs::copy(&ps_exe, &arm64_payload_path).expect("copy powershell.exe as arm64 payload");
-        let packaged_arm = StdCommand::new(&python)
-            .args([
-                packager,
-                "--package-release",
-                "--version",
-                "v0.1.0",
-                "--target",
-                "aarch64-pc-windows-msvc",
-                "--binary",
-            ])
-            .arg(&arm64_payload_path)
-            .arg("--out-dir")
-            .arg(&dist_versioned)
-            .output()
-            .expect("run ci_verify_packaging.py --package-release (arm64)");
-        assert!(
-            packaged_arm.status.success(),
-            "arm64 packaging fixture failed: {}",
-            String::from_utf8_lossy(&packaged_arm.stderr)
-        );
-    }
     let target = "x86_64-pc-windows-msvc";
     let archive_name = format!("tekvra-v0.1.0-{target}.zip");
     let packager = concat!(
@@ -1338,6 +1308,38 @@ fn installer_ps1_verifies_sha256_and_installs_nested_bundle() {
         "packaging fixture failed: {}",
         String::from_utf8_lossy(&packaged.stderr)
     );
+
+    // ARM64 host: package the native aarch64 archive with a DIFFERENT PE than
+    // the x86_64 payload so the byte-comparison can tell which archive the
+    // installer actually pulled (native pick vs Prism-emulated fallback).
+    if arm64_host {
+        let ps_exe = std::path::Path::new(&system_root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        std::fs::copy(&ps_exe, &arm64_payload_path).expect("copy powershell.exe as arm64 payload");
+        let packaged_arm = StdCommand::new(&python)
+            .args([
+                packager,
+                "--package-release",
+                "--version",
+                "v0.1.0",
+                "--target",
+                "aarch64-pc-windows-msvc",
+                "--binary",
+            ])
+            .arg(&arm64_payload_path)
+            .arg("--out-dir")
+            .arg(&dist_versioned)
+            .output()
+            .expect("run ci_verify_packaging.py --package-release (arm64)");
+        assert!(
+            packaged_arm.status.success(),
+            "arm64 packaging fixture failed: {}",
+            String::from_utf8_lossy(&packaged_arm.stderr)
+        );
+    }
 
     // Mirror the publish job's `cat *.sha256 | sort -k2 > SHA256SUMS.txt`.
     let sums_line = std::fs::read_to_string(dist_versioned.join(format!("{archive_name}.sha256")))
