@@ -1120,7 +1120,23 @@ fn installer_sh_verifies_sha256_and_rejects_mismatch() {
     std::fs::create_dir_all(&payload_dir).expect("mkdir payload");
     std::fs::write(payload_dir.join("tekvra"), "#!/bin/sh\necho FAKE_TEKVRA\n")
         .expect("write fake bin");
-    let archive = dist_versioned.join("tekvra-v0.1.0-x86_64-unknown-linux-gnu.tar.gz");
+    // Mirror install.sh's host detection so the fixture matches what the
+    // installer will request on this machine.
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let target = format!(
+        "{}-{}",
+        std::env::consts::ARCH,
+        match os {
+            "linux" => "unknown-linux-gnu",
+            "darwin" => "apple-darwin",
+            other => other,
+        }
+    );
+    let archive_name = format!("tekvra-v0.1.0-{target}.tar.gz");
+    let archive = dist_versioned.join(&archive_name);
     let tar = StdCommand::new("tar")
         .args(["-czf"])
         .arg(&archive)
@@ -1131,20 +1147,24 @@ fn installer_sh_verifies_sha256_and_rejects_mismatch() {
         .expect("tar");
     assert!(tar.status.success(), "tar failed");
 
-    let digest = StdCommand::new("sha256sum")
-        .arg(&archive)
+    // macOS ships `shasum -a 256` instead of GNU `sha256sum`.
+    let has_sha256sum = StdCommand::new("sha256sum")
+        .arg("--version")
         .output()
-        .expect("sha256sum");
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let mut digest_cmd = StdCommand::new(if has_sha256sum { "sha256sum" } else { "shasum" });
+    if !has_sha256sum {
+        digest_cmd.args(["-a", "256"]);
+    }
+    let digest = digest_cmd.arg(&archive).output().expect("sha256");
     let good_digest = String::from_utf8_lossy(&digest.stdout)
         .split_whitespace()
         .next()
         .expect("digest")
         .to_string();
-    let good_sums = format!("{good_digest}  tekvra-v0.1.0-x86_64-unknown-linux-gnu.tar.gz\n");
-    let bad_sums = format!(
-        "{}  tekvra-v0.1.0-x86_64-unknown-linux-gnu.tar.gz\n",
-        "0".repeat(64)
-    );
+    let good_sums = format!("{good_digest}  {archive_name}\n");
+    let bad_sums = format!("{}  {archive_name}\n", "0".repeat(64));
 
     let installer = concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh");
     let download_prefix = format!("file://{}", dist.display());

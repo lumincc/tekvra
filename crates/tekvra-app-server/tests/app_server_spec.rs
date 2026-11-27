@@ -318,8 +318,12 @@ async fn websocket_bearer_auth_and_bidirectional_command_approval_and_denial() {
                 parts: vec![MessagePart::ToolCall {
                     call_id: "call_ws_1".to_string(),
                     name: "exec_command".to_string(),
-                    arguments_json: json!({ "command": "python3 -c \"print('WS_APPROVED_OK')\"" })
-                        .to_string(),
+                    // Windows runners expose `python`, not `python3`.
+                    arguments_json: if cfg!(windows) {
+                        json!({ "command": "python -c \"print('WS_APPROVED_OK')\"" }).to_string()
+                    } else {
+                        json!({ "command": "python3 -c \"print('WS_APPROVED_OK')\"" }).to_string()
+                    },
                 }],
             },
             stream_deltas: Vec::new(),
@@ -346,8 +350,11 @@ async fn websocket_bearer_auth_and_bidirectional_command_approval_and_denial() {
                 parts: vec![MessagePart::ToolCall {
                     call_id: "call_ws_2".to_string(),
                     name: "exec_command".to_string(),
-                    arguments_json: json!({ "command": "python3 -c \"print('MUST_NOT_RUN')\"" })
-                        .to_string(),
+                    arguments_json: if cfg!(windows) {
+                        json!({ "command": "python -c \"print('MUST_NOT_RUN')\"" }).to_string()
+                    } else {
+                        json!({ "command": "python3 -c \"print('MUST_NOT_RUN')\"" }).to_string()
+                    },
                 }],
             },
             stream_deltas: Vec::new(),
