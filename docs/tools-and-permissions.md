@@ -25,7 +25,7 @@ All built-in tools live in `crates/tekvra-tools` and operate with zero Lua runti
 
 Tekvra intentionally omits local OS kernel sandboxes (Landlock/seccomp/Seatbelt) and instead enforces transparent, inspectable consent boundaries:
 
-1. **Bash AST Subcommand Decomposition**: Every `exec_command` invocation is parsed via `tree-sitter-bash` into constituent subcommands across `&&`, `||`, `;`, `|`, subshells, `$()`, and redirections. Compound lines like `git status && rm -rf build/` evaluate each subcommand independently. Dynamic or unparseable constructs (`eval`, `bash -c "$VAR"`) allow `Once`-only approval.
+1. **Bash AST Subcommand Decomposition**: Every `exec_command` invocation is parsed via `tree-sitter-bash` into constituent subcommands across `&&`, `||`, `;`, `|`, subshells, `$()`, and redirections. Compound lines like `git status && rm -rf build/` evaluate each subcommand independently. Dynamic or unparseable constructs (`eval`, `bash -c "$VAR"`) allow `Once`-only approval. Payloads run through the platform shell — `/bin/bash` (or `sh`) on Unix, `pwsh.exe`/`powershell.exe -Command` on Windows; on Windows, PowerShell syntax is parsed with the bash AST and unparseable lines degrade to `Once`-only prompts (fail-safe).
 2. **Execution Modes**:
    - `Plan` / `ReadOnly`: Read-only workspace inspection and (`Plan` only) `plan` updates; file writes and non-read-only commands are rejected before touching disk.
    - `Build`: Workspace file mutations allowed; unapproved shell commands, external paths, `webfetch`, and MCP calls prompt.

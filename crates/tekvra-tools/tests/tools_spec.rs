@@ -197,9 +197,6 @@ async fn single_editor_model_routing_and_multi_file_apply_patch_with_move_and_sn
 }
 
 #[tokio::test]
-// exec_command runs payloads through a POSIX shell (`/bin/bash -c`); Windows
-// runners have no such shell, so the interactive-PTY scenarios cannot run there.
-#[cfg_attr(windows, ignore = "exec_command requires a POSIX shell (/bin/bash -c)")]
 async fn interactive_pty_prompt_write_stdin_and_failing_test_filter_with_tool_output_paging() {
     let tmp = TempDir::new().expect("tempdir");
     let ws = tmp.path().join("repo");
@@ -209,6 +206,20 @@ async fn interactive_pty_prompt_write_stdin_and_failing_test_filter_with_tool_ou
     let ctx = make_ctx(ws, state, PermissionMode::Auto, Vec::new());
     let reg = NativeToolRegistry::new();
 
+    // Windows runs payloads through PowerShell; shell startup is slower there, so use a
+    // generous yield window and poll write_stdin until exit instead of a single call.
+    let (prompt_cmd, prompt_yield_ms) = if cfg!(windows) {
+        (
+            "Write-Host -NoNewline 'Enter token: '; $tok = [Console]::ReadLine(); Write-Output \"GOT:$tok\"",
+            10_000_u64,
+        )
+    } else {
+        (
+            "printf 'Enter token: '; read tok; printf 'GOT:%s\\n' \"$tok\"",
+            200_u64,
+        )
+    };
+
     // 1. Interactive process prompting for stdin without exiting in initial yield window
     let start_out = reg
         .execute(
@@ -216,8 +227,8 @@ async fn interactive_pty_prompt_write_stdin_and_failing_test_filter_with_tool_ou
             "pty1",
             "exec_command",
             &json!({
-                "cmd": "printf 'Enter token: '; read tok; printf 'GOT:%s\\n' \"$tok\"",
-                "yield_time_ms": 200
+                "cmd": prompt_cmd,
+                "yield_time_ms": prompt_yield_ms
             }),
         )
         .await
@@ -234,41 +245,67 @@ async fn interactive_pty_prompt_write_stdin_and_failing_test_filter_with_tool_ou
     };
     assert!(prompt_out.contains("Enter token:"));
 
-    // Deliver stdin via `write_stdin`
-    let finish_out = reg
-        .execute(
-            &ctx,
-            "pty2",
-            "write_stdin",
-            &json!({
-                "session_id": sid,
-                "chars": "codex42\n",
-                "yield_time_ms": 1500
-            }),
-        )
-        .await
-        .expect("write_stdin");
-
-    let ToolOutput::Terminal {
-        session_id: None,
-        exit_code: Some(0),
-        filtered_output: done_text,
-        ..
-    } = finish_out
-    else {
-        panic!("expected completed PTY output, got {finish_out:?}");
+    // Deliver stdin via `write_stdin` (CR terminates the line on both platforms: Unix
+    // line discipline maps it to NL, the Windows console treats it as Enter), polling
+    // until the session exits since the shell may emit output over several wakeups.
+    let mut done_exit = None;
+    let mut done_text = String::new();
+    let mut chars = "codex42\r".to_string();
+    for _ in 0..50 {
+        let out = reg
+            .execute(
+                &ctx,
+                "pty2",
+                "write_stdin",
+                &json!({
+                    "session_id": sid.clone(),
+                    "chars": chars,
+                    "yield_time_ms": 1500
+                }),
+            )
+            .await
+            .expect("write_stdin");
+        chars = String::new();
+        let ToolOutput::Terminal {
+            session_id,
+            exit_code,
+            filtered_output,
+            ..
+        } = out
+        else {
+            panic!("expected PTY terminal output");
+        };
+        done_text.push_str(&filtered_output);
+        if session_id.is_none() {
+            done_exit = exit_code;
+            break;
+        }
+    }
+    let Some(exit_code) = done_exit else {
+        panic!("PTY session never exited; collected: {done_text}");
     };
+    assert_eq!(exit_code, 0);
     assert!(done_text.contains("GOT:codex42"), "got: {done_text}");
 
     // 2. Failing build/test command with CR progress bars + 400 lines of noise -> non-zero exit preserved,
     // `[filtered: ...]` summary + `output_id`, and raw log searchable via `tool_output`!
-    let noisy_fail_cmd = concat!(
-        "printf 'Progress 10%%\\rProgress 50%%\\rProgress 100%%\\n'; ",
-        "i=1; while [ $i -le 300 ]; do echo \"   Compiling dep_$i v0.1.0\"; i=$((i+1)); done; ",
-        "echo 'test auth::critical_case ... FAILED'; ",
-        "echo 'CRITICAL_ASSERTION_MARKER_991'; ",
-        "exit 101"
-    );
+    let noisy_fail_cmd = if cfg!(windows) {
+        concat!(
+            "Write-Host \"Progress 10%`rProgress 50%`rProgress 100%\"; ",
+            "for ($i = 1; $i -le 300; $i++) { Write-Output \"   Compiling dep_$i v0.1.0\" }; ",
+            "Write-Output 'test auth::critical_case ... FAILED'; ",
+            "Write-Output 'CRITICAL_ASSERTION_MARKER_991'; ",
+            "exit 101"
+        )
+    } else {
+        concat!(
+            "printf 'Progress 10%%\\rProgress 50%%\\rProgress 100%%\\n'; ",
+            "i=1; while [ $i -le 300 ]; do echo \"   Compiling dep_$i v0.1.0\"; i=$((i+1)); done; ",
+            "echo 'test auth::critical_case ... FAILED'; ",
+            "echo 'CRITICAL_ASSERTION_MARKER_991'; ",
+            "exit 101"
+        )
+    };
 
     let fail_out = reg
         .execute(
@@ -277,7 +314,7 @@ async fn interactive_pty_prompt_write_stdin_and_failing_test_filter_with_tool_ou
             "exec_command",
             &json!({
                 "cmd": noisy_fail_cmd,
-                "yield_time_ms": 3000
+                "yield_time_ms": if cfg!(windows) { 20_000 } else { 3_000 }
             }),
         )
         .await

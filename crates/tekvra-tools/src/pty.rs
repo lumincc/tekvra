@@ -1,5 +1,6 @@
 //! Interactive Tokio PTY session engine (`exec_command`, `write_stdin`, resize, terminate,
 //! foreground-to-background promotion) with sanitized shell environments and retained raw output.
+//! Payloads run through the platform shell: `/bin/bash`/`sh` on Unix, PowerShell on Windows.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -18,7 +19,32 @@ use crate::ToolsError;
 use crate::output_filter::filter_command_output;
 
 const SAFE_HOST_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TEMP", "TMP",
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    // Windows: children spawned through ConPTY fail without these (SystemRoot is
+    // required by Winsock/crypto init; the rest keep shells and toolchains happy).
+    "SystemRoot",
+    "SystemDrive",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
 ];
 
 /// Notification emitted when a backgrounded PTY command finishes so the session actor can wake at a safe turn boundary.
@@ -73,6 +99,52 @@ pub fn build_sanitized_shell_env(settings: &AgentSettings) -> BTreeMap<String, S
     env_map
 }
 
+/// Resolves the shell used to run `exec_command` payloads: `/bin/bash` (or `sh`) on Unix,
+/// PowerShell on Windows — `pwsh.exe` (PowerShell 7) when found on `PATH`, else the
+/// always-present `powershell.exe`. Returns the program plus the arguments that make it
+/// run `command` as a single script string.
+fn shell_invocation(command: &str) -> (String, Vec<String>) {
+    #[cfg(unix)]
+    {
+        let shell = if Path::new("/bin/bash").is_file() {
+            "/bin/bash"
+        } else {
+            "sh"
+        };
+        (
+            shell.to_string(),
+            vec!["-c".to_string(), command.to_string()],
+        )
+    }
+    #[cfg(windows)]
+    {
+        let program = if find_on_path("pwsh.exe").is_some() {
+            "pwsh.exe"
+        } else {
+            "powershell.exe"
+        };
+        (
+            program.to_string(),
+            vec![
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                command.to_string(),
+            ],
+        )
+    }
+}
+
+#[cfg(windows)]
+fn find_on_path(file_name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path_var| {
+        std::env::split_paths(&path_var)
+            .map(|dir| dir.join(file_name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
 struct PtySharedBuffer {
     full_raw: String,
     unread_cursor: usize,
@@ -121,7 +193,8 @@ impl PtySessionManager {
         }
     }
 
-    /// Spawns `req.command` inside a real pseudo-terminal with a sanitized environment.
+    /// Spawns `req.command` in the platform shell (POSIX `/bin/bash -c`, Windows PowerShell
+    /// `-Command`) inside a real pseudo-terminal with a sanitized environment.
     /// Returns completed output directly if it exits within the yield/foreground window, or returns
     /// an active `session_id` receipt so `write_stdin`, `resize`, or background completion can continue.
     ///
@@ -145,14 +218,11 @@ impl PtySessionManager {
                 message: format!("failed to allocate PTY: {e}"),
             })?;
 
-        let shell_bin = if Path::new("/bin/bash").is_file() {
-            "/bin/bash"
-        } else {
-            "sh"
-        };
+        let (shell_bin, shell_args) = shell_invocation(&req.command);
         let mut cmd = CommandBuilder::new(shell_bin);
-        cmd.arg("-c");
-        cmd.arg(&req.command);
+        for arg in shell_args {
+            cmd.arg(arg);
+        }
         cmd.cwd(&req.cwd);
         cmd.env_clear();
         for (k, v) in build_sanitized_shell_env(settings) {
