@@ -1037,7 +1037,13 @@ async fn windows_pty_capture_diagnostics() {
         args: Vec<String>,
         full_env: bool,
     }
-    let enc = |s: &str| B64.encode(s.encode_utf16().collect::<Vec<_>>());
+    let enc = |s: &str| {
+        B64.encode(
+            s.encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<u8>>(),
+        )
+    };
     let mk =
         |label: &'static str, program: &'static str, args: Vec<String>, full_env: bool| RawProbe {
             label,
