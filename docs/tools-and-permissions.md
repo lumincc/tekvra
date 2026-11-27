@@ -10,6 +10,8 @@ All built-in tools live in `crates/tekvra-tools` and operate with zero Lua runti
 - **Workspace Discovery & Code Outline**:
   - `file_read`, `file_glob`, and `file_grep` enforce output caps and skip `.git` as well as sensitive credential files (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa`, `id_ed25519`, `.npmrc`, `.pypirc`, `.netrc`) during scans, reporting `truncated` and `skipped_sensitive_files` explicitly.
   - `file_index` extracts structural symbol outlines with exact 1-based line ranges via native `tree-sitter` grammars (Rust, Python, Go, JavaScript, TypeScript/TSX, Bash).
+  - `view_image` inspects workspace images (PNG/JPEG/GIF/WEBP) and returns a full base64 `ToolOutput::Image` payload; vision-capable models additionally receive a real `MessagePart::Image` attachment (a trailing user message, append-only) while other hosts see a concise text summary.
+  - All read/search/index tools (`file_read`, `file_glob`, `file_grep`, `file_index`, `view_image`) route through the same permission ladder (`ToolAction::ReadWorkspace`), so explicit `deny` rules hold everywhere; the concurrent `batch` tool accepts only this read-only allowlist (run via `futures::future::try_join_all`, results kept in order) and rejects mutating tools with a validation error.
 - **Interactive PTY Engine (`exec_command` & `write_stdin`)**:
   - Commands run inside a real pseudo-terminal (`portable-pty`) with a sanitized environment (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, `TMPDIR` plus `AgentSettings` passthroughs/overrides).
   - Commands awaiting stdin or exceeding `yield_time_ms` return a live `session_id` receipt without restarting, allowing `write_stdin`, `resize`, `terminate`, and background completion notifications.
@@ -20,6 +22,7 @@ All built-in tools live in `crates/tekvra-tools` and operate with zero Lua runti
   - `code` executes inside `monty` with zero direct host OS, filesystem, environment, or network access.
   - `ConfiguredMcpGateway` connects enabled `[mcp_servers.<name>]` entries over child-process `stdio` JSON-RPC 2.0 (`initialize`, `notifications/initialized`, `tools/list`, `tools/call`) and remote HTTP JSON-RPC 2.0 `POST` endpoints with bounded startup/call timeouts.
   - Connected MCP tools are listed (`mcp_list()`) and called (`await mcp_call(...)` / `mcp_call_sync(...)`) from `code`—and surfaced in `/mcp` and `mcpServerStatus/list`—without mutating top-level LLM `ToolDefinition` schemas when MCP servers connect or change.
+  - MCP calls issued from `code` authorize through the same session permission ladder as top-level tools: in `Build` mode an uncovered call prompts interactively via `ApprovalCallback` (async, non-blocking the sandbox service loop) and fails closed when no approval host is attached; `deny` rules still win in every mode.
 
 ## 2. Consent-Driven Execution & Safety Model (No Kernel Sandbox)
 

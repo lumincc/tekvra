@@ -12,7 +12,7 @@ use tekvra_protocol::{
     ApprovalPrompt, ApprovalResolution, ApprovalScope, GrantLifetime, InputDeliveryMode,
     PermissionMode, ScopeLadderOption, SessionCommand, SessionEvent, ToolOutput,
 };
-use tekvra_tui::{CodeHighlighter, TuiApp, TuiCommand};
+use tekvra_tui::{ActiveOverlay, CodeHighlighter, SearchOverlayState, TuiApp, TuiCommand};
 
 fn render_screen_text(app: &TuiApp, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
@@ -691,4 +691,78 @@ fn compaction_banner_and_status_bar_render_telemetry() {
         "status bar must show ctx%: {with_usage}"
     );
     assert!(with_usage.contains("cache 50%"));
+}
+
+#[test]
+fn question_modal_answers_prompts_and_search_enter_jumps_to_session() {
+    let mut app = TuiApp::new("thr_ui_11", "openai/gpt-5.4-codex", PermissionMode::Build);
+
+    // 1. `UserInputRequested` opens the Question modal listing both prompts.
+    let ask = |app: &mut TuiApp| {
+        app.apply_session_event(SessionEvent::UserInputRequested {
+            thread_id: "thr_ui_11".to_string(),
+            turn_id: "turn_q".to_string(),
+            item_id: "q_abc".to_string(),
+            questions: vec![
+                ("q0".to_string(), "Which database?".to_string()),
+                ("q1".to_string(), "Migrate now?".to_string()),
+            ],
+        });
+    };
+    ask(&mut app);
+    let screen = render_screen_text(&app, 90, 24);
+    assert!(screen.contains("Which database?"), "{screen}");
+    assert!(screen.contains("Migrate now?"));
+
+    // Type `sqlite` on q0, Tab to q1, type `yes`, Enter submits both drafts.
+    for ch in "sqlite".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    for ch in "yes".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    let submit = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        submit,
+        TuiCommand::Session(SessionCommand::ResolveUserInput {
+            item_id: "q_abc".to_string(),
+            answers: std::collections::BTreeMap::from([
+                ("q0".to_string(), vec!["sqlite".to_string()]),
+                ("q1".to_string(), vec!["yes".to_string()]),
+            ]),
+        })
+    );
+    assert!(matches!(app.overlay, ActiveOverlay::None));
+
+    // 2. Esc dismisses the modal but STILL resolves (empty drafts) so the turn cannot hang.
+    ask(&mut app);
+    let dismiss = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(
+        dismiss,
+        TuiCommand::Session(SessionCommand::ResolveUserInput {
+            item_id: "q_abc".to_string(),
+            answers: std::collections::BTreeMap::new(),
+        })
+    );
+
+    // 3. `/search` results jump: Enter on a selected hit switches to that session.
+    app.overlay = ActiveOverlay::Search(SearchOverlayState {
+        query: "needle".to_string(),
+        hits: vec![tekvra_storage::HistorySearchHit {
+            session_id: "thr_old_42".to_string(),
+            turn_id: "turn_7".to_string(),
+            role: "assistant".to_string(),
+            snippet: "needle in haystack".to_string(),
+        }],
+        selected: 0,
+    });
+    let jump = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        jump,
+        TuiCommand::SwitchSession {
+            session_id: "thr_old_42".to_string(),
+            fork: false,
+        }
+    );
 }

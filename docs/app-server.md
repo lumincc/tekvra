@@ -21,10 +21,10 @@ When `--auth-token` is set on `ws://`, HTTP upgrade requests lacking `Authorizat
 
 Clients MUST send `initialize` (followed by `initialized`) before invoking domain methods:
 
-- **Lifecycle**: `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/archive`, `thread/unarchive`, `thread/rollback`, `thread/compact/start`, `thread/name/set`
+- **Lifecycle**: `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/archive`, `thread/unarchive`, `thread/rollback`, `thread/compact/start` (queues `SessionCommand::Compact` on the loaded thread; forwarded compaction events report completion), `thread/name/set`
 - **Turns & Review**: `turn/start`, `turn/steer` (mapped onto non-destructive `Guide` delivery), `turn/interrupt`, `review/start`
 - **Interactive PTY**: `command/exec`, `command/exec/write`, `command/exec/resize`, `command/exec/terminate`
-- **Discovery & Config**: `model/list`, `modelProvider/list`, `skills/list`, `mcpServerStatus/list`, `config/read`, `config/value/write`, `config/batchWrite`, `account/read`, `account/login/start`, `account/logout`, `account/rateLimits/read`, `fuzzyFileSearch`
+- **Discovery & Config**: `model/list`, `modelProvider/list`, `skills/list`, `mcpServerStatus/list`, `config/read`, `config/value/write`, `config/batchWrite`, `account/read`, `account/login/start`, `account/logout`, `account/rateLimits/read` (live multi-account quota snapshot from the active driver: `rateLimits.primaryWindow.remainingRatio`/`usedPercent`, `spendControlReached`, and per-account `accounts[]` rows without tokens; deterministic test drivers report an empty pool), `fuzzyFileSearch`
 
 ## Policy Mapping & `configWarning` Disclosure
 

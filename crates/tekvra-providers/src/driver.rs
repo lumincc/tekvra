@@ -213,6 +213,13 @@ pub trait ProviderDriver: Send + Sync {
         }
         Ok(resp)
     }
+
+    /// Snapshot of the multi-account quota pool (remaining ratios + exhaustion flags)
+    /// for diagnostics surfaces such as the app-server `account/rateLimits/read` RPC.
+    /// Deterministic test drivers return an empty pool.
+    fn account_pool_snapshot(&self) -> AccountPool {
+        AccountPool::default()
+    }
 }
 
 /// Builds the stateless OpenAI `/responses` JSON body (`store: false`, `reasoning.encrypted_content`,
@@ -1735,6 +1742,10 @@ impl ProviderDriver for HttpProviderDriver {
     ) -> Result<CompletionResponse, ProviderError> {
         self.send_and_parse(provider, model, request, false, None)
             .await
+    }
+
+    fn account_pool_snapshot(&self) -> AccountPool {
+        HttpProviderDriver::account_pool_snapshot(self)
     }
 
     async fn complete_streaming(

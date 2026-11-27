@@ -322,6 +322,37 @@ where
                                     }
                                     None => {}
                                 },
+                                SessionEvent::UserInputRequested {
+                                    item_id, questions, ..
+                                } => {
+                                    // Surface the questions to the editor as an agent
+                                    // message update, then resolve non-blockingly with
+                                    // whatever the client supplied (none): ACP has no
+                                    // interactive question RPC yet, and the turn must
+                                    // never hang on an unanswered prompt.
+                                    let prompt_text = questions
+                                        .iter()
+                                        .map(|(_, q)| q.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    emit_acp_update(
+                                        &tx_clone,
+                                        &sid,
+                                        json!({
+                                            "sessionUpdate": "agent_message",
+                                            "content": {
+                                                "type": "text",
+                                                "text": format!("Question ({item_id}): {prompt_text}")
+                                            }
+                                        }),
+                                    );
+                                    let _ = h
+                                        .send(SessionCommand::ResolveUserInput {
+                                            item_id,
+                                            answers: BTreeMap::new(),
+                                        })
+                                        .await;
+                                }
                                 SessionEvent::ApprovalRequested { prompt, .. } => {
                                     // Bidirectional `session/request_permission` (ACP 3.1):
                                     // ask the editor, fail closed on EOF/cancel or an
@@ -454,6 +485,7 @@ fn emit_acp_update(out_tx: &mpsc::UnboundedSender<String>, session_id: &str, upd
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use std::sync::atomic::AtomicBool;
     use tekvra_config::{CliConfigOverrides, ConfigPaths, load_config};
     use tekvra_protocol::TokenUsage;
     use tekvra_providers::{
@@ -577,6 +609,156 @@ mod tests {
             }
         }
         assert!(saw_chunk);
+    }
+
+    /// First turn calls the `question` tool; second turn answers with final text.
+    struct QuestionAcpDriver {
+        asked: AtomicBool,
+    }
+
+    #[async_trait]
+    impl ProviderDriver for QuestionAcpDriver {
+        async fn complete(
+            &self,
+            _provider: &ProviderDefinition,
+            _model: &ModelCapabilities,
+            _request: &CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            if !self.asked.swap(true, AtomicOrdering::SeqCst) {
+                return Ok(CompletionResponse {
+                    assistant_message: ProviderMessage {
+                        role: MessageRole::Assistant,
+                        parts: vec![MessagePart::ToolCall {
+                            call_id: "q_acp_1".to_string(),
+                            name: "question".to_string(),
+                            arguments_json: "{\"questions\":[\"Deploy to staging?\"]}".to_string(),
+                        }],
+                    },
+                    stream_deltas: Vec::new(),
+                    usage: TokenUsage::default(),
+                    served_by_account: "mock".to_string(),
+                });
+            }
+            Ok(CompletionResponse {
+                assistant_message: ProviderMessage {
+                    role: MessageRole::Assistant,
+                    parts: vec![MessagePart::Text {
+                        text: "ACP_QUESTION_DONE".to_string(),
+                        cache_breakpoint: false,
+                    }],
+                },
+                stream_deltas: vec![StreamDelta::TextDelta("ACP_QUESTION_DONE".to_string())],
+                usage: TokenUsage::default(),
+                served_by_account: "mock".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acp_resolves_question_tool_prompts_non_blockingly() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        let cfg_dir = tmp.path().join("cfg");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir cfg");
+        std::fs::create_dir_all(&state_dir).expect("mkdir state");
+
+        let resolved = load_config(
+            ConfigPaths {
+                global_config_dir: cfg_dir,
+                state_dir: state_dir.clone(),
+                home_dir: Some(ws.clone()),
+            },
+            &ws,
+            &CliConfigOverrides::default(),
+        )
+        .expect("config");
+        let router = ModelRouter::from_config(&resolved, ProviderRegistry::new());
+        let state_index = Arc::new(Mutex::new(StateIndex::open(&state_dir).expect("state db")));
+
+        let deps = AcpServerDeps {
+            config: resolved,
+            router,
+            driver: Arc::new(QuestionAcpDriver {
+                asked: AtomicBool::new(false),
+            }),
+            state_index,
+            mcp_gateway: None,
+            plugin_executor: None,
+            extra_plugin_tools: Vec::new(),
+        };
+
+        let (cli, srv) = tokio::io::duplex(32 * 1024);
+        let (srv_r, srv_w) = tokio::io::split(srv);
+        tokio::spawn(async move {
+            let _ = serve_acp_stream(srv_r, srv_w, deps).await;
+        });
+
+        let (cli_r, mut cli_w) = tokio::io::split(cli);
+        let mut lines = BufReader::new(cli_r).lines();
+
+        cli_w
+            .write_all(b"{\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .expect("init");
+        let _: Value =
+            serde_json::from_str(&lines.next_line().await.expect("io").expect("l")).expect("j");
+        cli_w
+            .write_all(b"{\"id\":2,\"method\":\"session/new\",\"params\":{}}\n")
+            .await
+            .expect("new");
+        let new_v: Value =
+            serde_json::from_str(&lines.next_line().await.expect("io").expect("l")).expect("j");
+        let sid = new_v["result"]["sessionId"]
+            .as_str()
+            .expect("sid")
+            .to_string();
+
+        let prompt_req = json!({
+            "id": 3,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "Ask me something" }]
+            }
+        });
+        cli_w
+            .write_all(format!("{prompt_req}\n").as_bytes())
+            .await
+            .expect("prompt");
+
+        let mut saw_question_update = false;
+        let mut saw_done = false;
+        let read_frame = async {
+            loop {
+                let frame: Value =
+                    serde_json::from_str(&lines.next_line().await.expect("io").expect("l"))
+                        .expect("j");
+                let text = frame["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .unwrap_or("");
+                if text.starts_with("Question (") {
+                    saw_question_update = true;
+                }
+                if text == "ACP_QUESTION_DONE" {
+                    saw_done = true;
+                }
+                if frame.get("id") == Some(&json!(3)) {
+                    assert_eq!(frame["result"]["stopReason"], "end_turn");
+                    break;
+                }
+            }
+        };
+        // Whole exchange must finish promptly: no hang on the unanswered question.
+        tokio::time::timeout(std::time::Duration::from_secs(30), read_frame)
+            .await
+            .expect("ACP question turn must not hang");
+        assert!(
+            saw_question_update,
+            "editor must see the surfaced question update"
+        );
+        assert!(saw_done, "turn must continue after the question resolves");
     }
 
     #[test]

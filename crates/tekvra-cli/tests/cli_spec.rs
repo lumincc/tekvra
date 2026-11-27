@@ -61,11 +61,14 @@ async fn spawn_mock_openai_server(replies: Vec<&str>) -> String {
             })
         })
         .collect();
+    spawn_mock_openai_bodies(queue).await
+}
 
+async fn spawn_mock_openai_bodies(bodies: VecDeque<Value>) -> String {
     let app = Router::new()
         .route("/v1/responses", post(handle_responses))
         .with_state(MockResponsesState {
-            bodies: Arc::new(Mutex::new(queue)),
+            bodies: Arc::new(Mutex::new(bodies)),
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1368,4 +1371,76 @@ fn installer_ps1_verifies_sha256_and_installs_nested_bundle() {
         .output()
         .expect("run installed binary");
     assert!(String::from_utf8_lossy(&run.stdout).contains("FAKE_TEKVRA"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headless_exec_resolves_question_tool_prompts_without_hanging() {
+    // Turn 1 asks the `question` tool; headless exec must resolve the pending
+    // `UserInputRequested` event itself (empty answers) and continue to turn 2.
+    let bodies = VecDeque::from(vec![
+        json!({
+            "id": "resp_q1",
+            "output": [{
+                "type": "function_call",
+                "call_id": "qcall_1",
+                "name": "question",
+                "arguments": "{\"questions\":[\"Which database should we use?\"]}"
+            }],
+            "usage": { "input_tokens": 40, "output_tokens": 12 }
+        }),
+        json!({
+            "id": "resp_q2",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "QUESTION_RESOLVED_HEADLESS" }]
+            }],
+            "usage": { "input_tokens": 40, "output_tokens": 8 }
+        }),
+    ]);
+    let base_url = spawn_mock_openai_bodies(bodies).await;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("repo");
+    let cfg_dir = tmp.path().join("cfg");
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(&cfg_dir).expect("mkdir cfg");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+    std::fs::write(
+        cfg_dir.join("tekvra.toml"),
+        "version = 2\nmodel = \"openai/gpt-5.4-codex\"\n",
+    )
+    .expect("write tekvra.toml");
+    std::fs::write(
+        cfg_dir.join("providers.toml"),
+        format!("version = 2\n\n[providers.openai]\nbase_url = \"{base_url}\"\n"),
+    )
+    .expect("write providers.toml");
+
+    let bin = env!("CARGO_BIN_EXE_tekvra");
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        Command::new(bin)
+            .current_dir(&ws)
+            .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+            .env("TEKVRA_STATE_DIR", &state_dir)
+            .env("OPENAI_API_KEY", "sk-test-cli")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .args(["--no-plugins", "exec", "Ask me about databases"])
+            .output(),
+    )
+    .await
+    .expect("headless exec must not hang on a `question` turn")
+    .expect("run exec");
+    assert!(
+        out.status.success(),
+        "exit 0 expected, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("QUESTION_RESOLVED_HEADLESS"),
+        "turn must continue past the question: {stdout}"
+    );
 }

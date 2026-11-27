@@ -175,6 +175,17 @@ pub enum ToolOutput {
         /// Number of authorized MCP tool calls bridged during execution.
         mcp_calls: u32,
     },
+    /// Inspected workspace image delivered from `view_image` (multimodal-capable hosts).
+    Image {
+        /// Workspace-relative image path.
+        path: PathBuf,
+        /// Detected IANA media type (`image/png`, `image/jpeg`, `image/gif`, `image/webp`).
+        media_type: String,
+        /// Total image byte length.
+        bytes_len: usize,
+        /// Base64-encoded full image payload.
+        data_base64: String,
+    },
     /// Plain text or custom Lua plugin tool output.
     Text {
         /// Output body.
@@ -270,6 +281,17 @@ impl ToolOutput {
                 ..
             } => format!("[task {task_id} ({status})] {summary}"),
             Self::CodeExecution { output, .. } => output.clone(),
+            Self::Image {
+                path,
+                media_type,
+                bytes_len,
+                ..
+            } => {
+                format!(
+                    "Viewed image {} ({media_type}, {bytes_len} bytes)",
+                    path.display()
+                )
+            }
             Self::Text { text } => text.clone(),
         }
     }

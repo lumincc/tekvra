@@ -1197,3 +1197,261 @@ async fn mid_stream_interrupt_aborts_turn_without_appending_assistant_message() 
     );
     assert_eq!(deltas_seen, 0, "no deltas may surface from a parked stream");
 }
+
+#[tokio::test]
+async fn view_image_tool_result_attaches_multimodal_image_for_vision_models() {
+    let tmp = TempDir::new().expect("tempdir");
+
+    // Write a minimal PNG into the workspace before spawning the session.
+    let ws = tmp.path().join("repo");
+    std::fs::create_dir_all(&ws).expect("mkdir ws");
+    let png = {
+        let mut bytes = vec![0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        bytes.extend_from_slice(b"core-spec-image-payload");
+        bytes
+    };
+    std::fs::write(ws.join("shot.png"), &png).expect("write png");
+
+    let saw_image = Arc::new(Mutex::new(false));
+    let image_request = Arc::new(Mutex::new(None));
+    let saw_image_clone = Arc::clone(&saw_image);
+    let image_request_clone = Arc::clone(&image_request);
+    let driver = ScriptedDriver::from_fn(move |_prov, _model, req| {
+        let has_image = req.messages.iter().any(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::Image { .. }))
+        });
+        if has_image {
+            *saw_image_clone.lock().expect("lock") = true;
+            *image_request_clone.lock().expect("lock") = Some(req.clone());
+            return text_resp("Saw the screenshot!");
+        }
+        tool_call_resp("vi1", "view_image", json!({ "path": "shot.png" }))
+    });
+
+    let handle =
+        spawn_session(setup_bootstrap(&tmp, driver, PermissionMode::Auto)).expect("spawn session");
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "Inspect shot.png".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit");
+    assert_eq!(wait_for_turn_complete(&mut rx).await, "completed");
+
+    assert!(
+        *saw_image.lock().expect("lock"),
+        "vision-capable model must receive an Image part after view_image"
+    );
+
+    // The recorded follow-up request must carry exactly one dedicated user
+    // message holding the full base64 payload + media type.
+    let final_req = image_request
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("image-bearing request recorded");
+    let image_msgs: Vec<_> = final_req
+        .messages
+        .iter()
+        .filter(|m| m.role == MessageRole::User)
+        .filter(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::Image { .. }))
+        })
+        .collect();
+    assert_eq!(image_msgs.len(), 1, "exactly one image attachment message");
+    let image_part = image_msgs[0]
+        .parts
+        .iter()
+        .find_map(|p| match p {
+            MessagePart::Image {
+                media_type,
+                data_base64,
+                ..
+            } => Some((media_type.clone(), data_base64.clone())),
+            _ => None,
+        })
+        .expect("image part present");
+    assert_eq!(image_part.0, "image/png");
+    assert!(!image_part.1.is_empty());
+}
+
+#[tokio::test]
+async fn developer_instructions_list_available_skills_deterministically() {
+    let tmp = TempDir::new().expect("tempdir");
+    let developer_prefix = Arc::new(Mutex::new(String::new()));
+    let prefix_clone = Arc::clone(&developer_prefix);
+    let driver = ScriptedDriver::from_fn(move |_prov, _model, req| {
+        if let Some(ProviderMessage { parts, .. }) = req
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Developer)
+        {
+            for p in parts {
+                if let MessagePart::Text { text, .. } = p {
+                    *prefix_clone.lock().expect("lock") = text.clone();
+                }
+            }
+        }
+        text_resp("ok")
+    });
+
+    let mut bootstrap = setup_bootstrap(&tmp, driver, PermissionMode::Build);
+    bootstrap.config.skills = vec![
+        tekvra_config::SkillMetadata {
+            name: "zeta".to_string(),
+            description: "Z skill".to_string(),
+            path: PathBuf::from("z/SKILL.md"),
+            scope: "project".to_string(),
+        },
+        tekvra_config::SkillMetadata {
+            name: "alpha".to_string(),
+            description: "A skill".to_string(),
+            path: PathBuf::from("a/SKILL.md"),
+            scope: "global".to_string(),
+        },
+        tekvra_config::SkillMetadata {
+            name: "alpha".to_string(),
+            description: "duplicate shadowed entry".to_string(),
+            path: PathBuf::from("a2/SKILL.md"),
+            scope: "project".to_string(),
+        },
+    ];
+
+    let handle = spawn_session(bootstrap).expect("spawn session");
+    let mut rx = handle.subscribe();
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "hi".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit");
+    assert_eq!(wait_for_turn_complete(&mut rx).await, "completed");
+
+    let prefix = developer_prefix.lock().expect("lock").clone();
+    let expected = "<available_skills>\n- alpha: A skill\n- zeta: Z skill\n</available_skills>";
+    assert!(
+        prefix.contains(expected),
+        "skills must be sorted, deduped by name, name+description only; got: {prefix}"
+    );
+}
+
+#[tokio::test]
+async fn resume_restores_cumulative_usage_and_latest_plan_from_rollout() {
+    let tmp = TempDir::new().expect("tempdir");
+
+    // Session A: plan tool call + completion accumulate usage into the rollout.
+    let driver_a = ScriptedDriver::from_queue(vec![
+        tool_call_resp("p1", "plan", json!({ "markdown": "# PLAN_V1" })),
+        text_resp("planned"),
+    ]);
+    let mut bootstrap_a = setup_bootstrap(&tmp, driver_a, PermissionMode::Build);
+    bootstrap_a.session_id = Some("thr_resume_01".to_string());
+    let handle_a = spawn_session(bootstrap_a).expect("spawn session a");
+    let mut rx_a = handle_a.subscribe();
+    handle_a
+        .send(SessionCommand::SubmitInput {
+            prompt: "Draft the plan".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit");
+    assert_eq!(wait_for_turn_complete(&mut rx_a).await, "completed");
+    let usage_a = handle_a.state_snapshot().cumulative_usage;
+    assert!(
+        usage_a.input_tokens > 0,
+        "turn usage must accumulate: {usage_a:?}"
+    );
+    drop(rx_a);
+    drop(handle_a);
+    // The owning process exited in the real scenario: the lease file is stale.
+    let stale_lease = tmp
+        .path()
+        .join("state")
+        .join("leases")
+        .join("thr_resume_01.lock");
+    std::fs::remove_file(&stale_lease).expect("remove stale lease");
+
+    // Session B: resume the SAME session id -> plan + usage restored from rollouts.
+    let driver_b = ScriptedDriver::from_queue(vec![text_resp("resumed")]);
+    let mut bootstrap_b = setup_bootstrap(&tmp, driver_b, PermissionMode::Build);
+    bootstrap_b.session_id = Some("thr_resume_01".to_string());
+    let handle_b = spawn_session(bootstrap_b).expect("resume session");
+    let snap_b = handle_b.state_snapshot();
+    assert_eq!(snap_b.plan_markdown, "# PLAN_V1", "plan must be restored");
+    assert_eq!(
+        snap_b.cumulative_usage.input_tokens, usage_a.input_tokens,
+        "cumulative usage must equal the persisted rollout totals"
+    );
+
+    // A follow-up turn accumulates ON TOP of the restored totals.
+    let mut rx_b = handle_b.subscribe();
+    handle_b
+        .send(SessionCommand::SubmitInput {
+            prompt: "continue".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit");
+    assert_eq!(wait_for_turn_complete(&mut rx_b).await, "completed");
+    let usage_c = handle_b.state_snapshot().cumulative_usage;
+    assert!(
+        usage_c.input_tokens > usage_a.input_tokens,
+        "post-resume usage must grow beyond restored totals: {usage_c:?} vs {usage_a:?}"
+    );
+}
+
+#[tokio::test]
+async fn opt_in_auto_title_persists_session_title_via_job_role_title() {
+    let tmp = TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+
+    // 1st completion = the turn answer, 2nd = the background JobRole::Title call.
+    let driver = ScriptedDriver::from_queue(vec![
+        text_resp("First answer."),
+        text_resp("Clean Session Title"),
+    ]);
+    let mut bootstrap = setup_bootstrap(&tmp, driver, PermissionMode::Build);
+    bootstrap.config.settings.agent.auto_title = true;
+    bootstrap.session_id = Some("thr_title_01".to_string());
+    let handle = spawn_session(bootstrap).expect("spawn session");
+    let mut rx = handle.subscribe();
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "Help me refactor the parser module".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit");
+    assert_eq!(wait_for_turn_complete(&mut rx).await, "completed");
+
+    // The title lands asynchronously; poll the state index for a bounded window.
+    let mut title = None;
+    for _ in 0..100 {
+        let idx = tekvra_storage::StateIndex::open(&state_dir).expect("open index");
+        if let Some(summary) = idx.get_session("thr_title_01").expect("get session")
+            && let Some(t) = summary.title
+        {
+            title = Some(t);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        title.as_deref(),
+        Some("Clean Session Title"),
+        "auto_title must persist the JobRole::Title result"
+    );
+}

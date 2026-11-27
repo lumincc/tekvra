@@ -14,8 +14,8 @@ use tekvra_protocol::{
     PermissionMode, RevertScope, SessionCommand, SessionEvent, TokenUsage, ToolOutput,
 };
 use tekvra_providers::{
-    JobRole, MessagePart, MessageRole, ModelRouter, ProviderDriver, ProviderMessage, StreamDelta,
-    StreamDeltaSink, ToolDefinition,
+    CompletionRequest, JobRole, MessagePart, MessageRole, ModelRouter, ProviderDriver,
+    ProviderMessage, StreamDelta, StreamDeltaSink, ToolDefinition,
 };
 use tekvra_storage::{
     RolloutHeader, RolloutLog, RolloutRecord, SessionSummary, StateIndex, WorkspaceSnapshotStore,
@@ -352,6 +352,22 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
     base_tools.extend(bootstrap.extra_plugin_tools.clone());
 
     let developer_instructions = build_developer_instructions(&bootstrap.config, &canonical_ws);
+    // Resume fidelity: replay persisted turn usage and the latest `plan` tool
+    // output so `cumulative_usage` and `plan_markdown` survive a restart.
+    let mut restored_usage = TokenUsage::default();
+    let mut restored_plan = String::new();
+    for record in &rollout_records {
+        match record {
+            RolloutRecord::TurnCompleted { usage, .. } => {
+                accumulate_usage(&mut restored_usage, usage);
+            }
+            RolloutRecord::ToolCard {
+                output: ToolOutput::Plan { markdown },
+                ..
+            } => restored_plan = markdown.clone(),
+            _ => {}
+        }
+    }
     let restored_messages: Vec<ProviderMessage> = rollout_records
         .iter()
         .filter_map(|r| match r {
@@ -394,8 +410,8 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
         active_model: initial_caps.spec.clone(),
         mode,
         goal: None,
-        plan_markdown: String::new(),
-        cumulative_usage: TokenUsage::default(),
+        plan_markdown: restored_plan.clone(),
+        cumulative_usage: restored_usage,
         context_window: initial_caps.context_window,
         last_frame_snapshot: Some(frame.snapshot()),
     }));
@@ -535,8 +551,8 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
             frame,
             mode,
             active_goal: None,
-            plan_markdown: Arc::new(Mutex::new(String::new())),
-            cumulative_usage: TokenUsage::default(),
+            plan_markdown: Arc::new(Mutex::new(restored_plan)),
+            cumulative_usage: restored_usage,
             bridge: Arc::new(InteractiveBridge {
                 session_id: runner_session_id,
                 turn_id: Mutex::new(String::new()),
@@ -550,6 +566,7 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
             current_cancel,
             guide_inbox,
             replace_slot,
+            title_done: false,
         };
 
         loop {
@@ -631,6 +648,8 @@ struct SessionActor {
     current_cancel: Arc<Mutex<CancellationToken>>,
     guide_inbox: Arc<Mutex<VecDeque<PendingUserInput>>>,
     replace_slot: Arc<Mutex<Option<PendingUserInput>>>,
+    /// Set once the opt-in `JobRole::Title` background session title has run.
+    title_done: bool,
 }
 
 impl SessionActor {
@@ -1128,6 +1147,7 @@ impl SessionActor {
 
             if !tool_calls.is_empty() {
                 let mut tool_result_parts = Vec::with_capacity(tool_calls.len());
+                let mut attached_images: Vec<MessagePart> = Vec::new();
                 let mut interrupted_mid_tools = false;
 
                 for (call_id, tool_name, args_json) in tool_calls {
@@ -1221,6 +1241,21 @@ impl SessionActor {
                             }
 
                             let model_text = output.to_model_text();
+                            // Multimodal delivery: remember inspected images so a
+                            // vision-capable model receives real image blocks.
+                            if let ToolOutput::Image {
+                                path,
+                                media_type,
+                                data_base64,
+                                ..
+                            } = &output
+                            {
+                                attached_images.push(MessagePart::Image {
+                                    media_type: media_type.clone(),
+                                    data_base64: data_base64.clone(),
+                                    source_path: Some(path.display().to_string()),
+                                });
+                            }
                             let _ = self.append_rollout(RolloutRecord::ToolCard {
                                 turn_id: turn_id.clone(),
                                 call_id: call_id.clone(),
@@ -1271,6 +1306,22 @@ impl SessionActor {
                     turn_id: turn_id.clone(),
                     message: tool_msg,
                 });
+
+                // Vision-capable models receive inspected images as a trailing
+                // multimodal user attachment (append-only, after the tool result).
+                if model.supports_vision && !attached_images.is_empty() {
+                    let before_attach = self.frame.snapshot();
+                    let attach_msg = ProviderMessage {
+                        role: MessageRole::User,
+                        parts: attached_images,
+                    };
+                    self.frame.push_message(attach_msg.clone());
+                    let _ = self.frame.assert_append_only(&before_attach);
+                    let _ = self.append_rollout(RolloutRecord::Message {
+                        turn_id: turn_id.clone(),
+                        message: attach_msg,
+                    });
+                }
 
                 if interrupted_mid_tools {
                     final_status = "interrupted".to_string();
@@ -1389,11 +1440,82 @@ impl SessionActor {
         self.is_turn_running.store(false, Ordering::SeqCst);
         self.sync_shared_state();
 
+        if final_status == "completed" {
+            self.spawn_auto_title_once();
+        }
+
         let _ = self.event_tx.send(SessionEvent::TurnCompleted {
             thread_id: self.session_id.clone(),
             turn_id,
             status: final_status,
             error: final_error,
+        });
+    }
+
+    /// Opt-in `auto_title`: one background `JobRole::Title` call that names the
+    /// session from the first user prompt + first assistant reply and persists
+    /// the title via `StateIndex::set_session_title`. Failures are silent.
+    fn spawn_auto_title_once(&mut self) {
+        if self.title_done || !self.config.settings.agent.auto_title {
+            return;
+        }
+        self.title_done = true;
+
+        let first_user = self
+            .frame
+            .messages()
+            .iter()
+            .find_map(|m| (m.role == MessageRole::User).then(|| message_text(m)));
+        let Some(user_text) = first_user.filter(|text| !text.is_empty()) else {
+            return;
+        };
+        let assistant_text = self
+            .frame
+            .messages()
+            .iter()
+            .rev()
+            .find_map(|m| (m.role == MessageRole::Assistant).then(|| message_text(m)))
+            .unwrap_or_default();
+        let (provider, model) = match self.router.route(JobRole::Title) {
+            Ok(pair) => (pair.0.clone(), pair.1.clone()),
+            Err(_) => return,
+        };
+
+        let driver = Arc::clone(&self.driver);
+        let state_index = Arc::clone(&self.state_index);
+        let session_id = self.session_id.clone();
+        let summary = format!(
+            "User: {}\n\nAssistant: {}",
+            user_text.chars().take(600).collect::<String>(),
+            assistant_text.chars().take(400).collect::<String>(),
+        );
+        tokio::spawn(async move {
+            let request = CompletionRequest {
+                conversation_id: format!("{session_id}:title"),
+                messages: vec![ProviderMessage::user_text(format!(
+                    "Generate a concise 3-6 word title for this coding session. \
+                     Reply with ONLY the title text, no quotes:\n\n{summary}"
+                ))],
+                tools: Vec::new(),
+                reasoning_effort: None,
+                output_schema: None,
+            };
+            let Ok(resp) = driver.complete(&provider, &model, &request).await else {
+                return;
+            };
+            let title: String = message_text(&resp.assistant_message)
+                .trim()
+                .trim_matches('"')
+                .chars()
+                .take(80)
+                .collect();
+            if title.is_empty() {
+                return;
+            }
+            let _ = state_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_session_title(&session_id, &title);
         });
     }
 
@@ -1572,6 +1694,19 @@ impl SessionActor {
     }
 }
 
+/// Joins the plain `Text` parts of a provider message (used by auto-titling).
+fn message_text(message: &ProviderMessage) -> String {
+    message
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn build_developer_instructions(
     config: &ResolvedConfig,
     workspace_root: &std::path::Path,
@@ -1586,6 +1721,18 @@ fn build_developer_instructions(
             out.push_str(doc.content.trim());
             out.push('\n');
         }
+    }
+    // Deterministic skill metadata: dedupe by name, sort by name so the
+    // developer-instruction prefix stays byte-stable for prompt caching.
+    if !config.skills.is_empty() {
+        let mut skills = config.skills.clone();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        skills.dedup_by(|a, b| a.name == b.name);
+        out.push_str("\n\n<available_skills>\n");
+        for skill in &skills {
+            out.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+        }
+        out.push_str("</available_skills>");
     }
     out
 }

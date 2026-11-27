@@ -481,14 +481,12 @@ pub fn view_image(workspace_root: &Path, target: &Path) -> Result<ToolOutput, To
             rel.display()
         )));
     };
-    let encoded_prefix: String =
-        base64::engine::general_purpose::STANDARD.encode(&bytes[..bytes.len().min(64)]);
-    Ok(ToolOutput::Text {
-        text: format!(
-            "image={} mime={mime} bytes={} base64_head={encoded_prefix}",
-            rel.display(),
-            bytes.len()
-        ),
+    let encoded: String = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(ToolOutput::Image {
+        path: rel,
+        media_type: mime.to_string(),
+        bytes_len: bytes.len(),
+        data_base64: encoded,
     })
 }
 

@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -34,9 +35,9 @@ use crate::TuiError;
 use crate::cards::{ToolCardState, render_tool_card};
 use crate::markdown::render_markdown_lines;
 use crate::modals::{
-    ApprovalModalState, CompletionKind, CompletionPopupState, ModelPickerState, RevertOverlayState,
-    SearchOverlayState, SessionsOverlayState, TasksOverlayState, TrustUiCommand,
-    build_completion_popup, is_excluded_mention_path,
+    ApprovalModalState, CompletionKind, CompletionPopupState, ModelPickerState, QuestionModalState,
+    RevertOverlayState, SearchOverlayState, SessionsOverlayState, TasksOverlayState,
+    TrustUiCommand, build_completion_popup, is_excluded_mention_path,
 };
 
 /// Single entry in the TUI transcript view (main session or subagent).
@@ -79,6 +80,8 @@ pub enum ActiveOverlay {
     Sessions(SessionsOverlayState),
     /// `/revert` workspace file-restoration preview.
     Revert(RevertOverlayState),
+    /// `question` tool prompt awaiting user answers (`UserInputRequested`).
+    Question(QuestionModalState),
     /// `/model` interactive fuzzy model picker.
     ModelPicker(ModelPickerState),
 }
@@ -602,6 +605,15 @@ impl TuiApp {
             SessionEvent::ApprovalRequested { prompt, .. } => {
                 self.overlay = ActiveOverlay::Approval(ApprovalModalState::new(prompt));
             }
+            SessionEvent::UserInputRequested {
+                turn_id,
+                item_id,
+                questions,
+                ..
+            } if !is_subagent => {
+                self.overlay =
+                    ActiveOverlay::Question(QuestionModalState::new(item_id, turn_id, questions));
+            }
             SessionEvent::TokenUsageUpdated { usage, .. } if !is_subagent => {
                 self.usage = usage;
             }
@@ -816,8 +828,18 @@ impl TuiApp {
                     TuiCommand::Noop
                 }
                 KeyCode::Enter => {
+                    let target = search
+                        .hits
+                        .get(search.selected)
+                        .map(|hit| hit.session_id.clone());
                     self.overlay = ActiveOverlay::None;
-                    TuiCommand::Noop
+                    match target {
+                        Some(session_id) => TuiCommand::SwitchSession {
+                            session_id,
+                            fork: false,
+                        },
+                        None => TuiCommand::Noop,
+                    }
                 }
                 _ => TuiCommand::Noop,
             },
@@ -846,6 +868,39 @@ impl TuiApp {
                         Some(session_id) => TuiCommand::SwitchSession { session_id, fork },
                         None => TuiCommand::Noop,
                     }
+                }
+                _ => TuiCommand::Noop,
+            },
+            ActiveOverlay::Question(modal) => match key.code {
+                KeyCode::Esc => {
+                    // Dismissing still resolves the pending prompt (with whatever
+                    // drafts exist) so the turn never hangs on a closed modal.
+                    let item_id = modal.item_id.clone();
+                    let answers = modal.answers();
+                    self.overlay = ActiveOverlay::None;
+                    TuiCommand::Session(SessionCommand::ResolveUserInput { item_id, answers })
+                }
+                KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                    modal.next();
+                    TuiCommand::Noop
+                }
+                KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+                    modal.prev();
+                    TuiCommand::Noop
+                }
+                KeyCode::Backspace => {
+                    modal.backspace();
+                    TuiCommand::Noop
+                }
+                KeyCode::Enter => {
+                    let item_id = modal.item_id.clone();
+                    let answers = modal.answers();
+                    self.overlay = ActiveOverlay::None;
+                    TuiCommand::Session(SessionCommand::ResolveUserInput { item_id, answers })
+                }
+                KeyCode::Char(ch) => {
+                    modal.type_char(ch);
+                    TuiCommand::Noop
                 }
                 _ => TuiCommand::Noop,
             },
@@ -1309,6 +1364,7 @@ impl TuiApp {
             ActiveOverlay::Search(search) => self.render_search_modal(frame, search),
             ActiveOverlay::Sessions(sessions) => self.render_sessions_modal(frame, sessions),
             ActiveOverlay::Revert(rev) => self.render_revert_modal(frame, rev),
+            ActiveOverlay::Question(modal) => self.render_question_modal(frame, modal),
             ActiveOverlay::ModelPicker(picker) => self.render_model_picker(frame, picker),
         }
     }
@@ -1423,6 +1479,44 @@ impl TuiApp {
         let composer = Paragraph::new(format!("> {before}▏{after}"))
             .block(Block::default().borders(Borders::ALL).title(title));
         frame.render_widget(composer, area);
+    }
+
+    fn render_question_modal(&self, frame: &mut Frame<'_>, modal: &QuestionModalState) {
+        let area = centered_rect(70, 45, frame.area());
+        frame.render_widget(Clear, area);
+
+        let mut lines = vec![Line::from(Span::styled(
+            "The agent asks for your input (Enter: submit, Esc: dismiss, Tab: next):",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))];
+
+        for (idx, (qid, prompt)) in modal.questions.iter().enumerate() {
+            let focused = idx == modal.selected;
+            let marker = if focused { "●" } else { "○" };
+            lines.push(Line::from(Span::styled(
+                format!("{marker} [{qid}] {prompt}"),
+                if focused {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            )));
+            let draft = modal.drafts.get(idx).map(String::as_str).unwrap_or("");
+            lines.push(Line::from(Span::raw(format!(
+                "   > {draft}{}",
+                if focused { "_" } else { "" }
+            ))));
+        }
+
+        let widget = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Question ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+        frame.render_widget(widget, area);
     }
 
     fn render_approval_modal(&self, frame: &mut Frame<'_>, modal: &ApprovalModalState) {
@@ -1793,14 +1887,24 @@ struct AltScreenGuard;
 impl AltScreenGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
         Ok(Self)
     }
 }
 
 impl Drop for AltScreenGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }

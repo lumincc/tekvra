@@ -19,7 +19,7 @@ use crate::fs_tools::{
 use crate::patch::{PatchHunk, apply_patch_to_workspace, parse_patch};
 use crate::permissions::{PermissionDecision, PermissionEvaluator, ToolAction};
 use crate::pty::{PtyCommandRequest, PtySessionManager};
-use crate::web_and_code::{McpGateway, MontyCodeSandbox, SafeWebFetcher};
+use crate::web_and_code::{McpCallAuthorizer, McpGateway, MontyCodeSandbox, SafeWebFetcher};
 
 /// Host callback invoked when a tool call requires interactive user approval (`ApprovalPrompt`).
 #[async_trait]
@@ -285,10 +285,12 @@ pub fn build_tool_definitions_for_model(model: &ModelCapabilities) -> Vec<ToolDe
             json!({
                 "type": "object",
                 "properties": {
-                    "prompt": { "type": "string" },
-                    "role": { "type": "string" },
-                    "model": { "type": "string" },
-                    "background": { "type": "boolean" }
+                    "prompt": { "type": "string", "description": "New task prompt, or steering message when `task_id` is set." },
+                    "role": { "type": "string", "description": "Optional subagent role override." },
+                    "model": { "type": "string", "description": "Optional model spec override." },
+                    "background": { "type": "boolean", "description": "Run without blocking the parent turn." },
+                    "task_id": { "type": "string", "description": "Existing task id to steer instead of spawning." },
+                    "delivery": { "type": "string", "enum": ["guide", "replace"], "description": "How `prompt` reaches a steered task: queued guidance (default) or replacement." }
                 },
                 "required": ["prompt"]
             }),
@@ -448,6 +450,15 @@ impl NativeToolRegistry {
                     .get("max_matches")
                     .and_then(Value::as_u64)
                     .unwrap_or(200) as usize;
+                self.authorize(
+                    ctx,
+                    call_id,
+                    ToolAction::ReadWorkspace {
+                        tool_name: "file_glob".to_string(),
+                        path: ctx.workspace_root.clone(),
+                    },
+                )
+                .await?;
                 file_glob(&ctx.workspace_root, pattern, max)
             }
             "file_grep" => {
@@ -457,14 +468,41 @@ impl NativeToolRegistry {
                     .get("max_matches")
                     .and_then(Value::as_u64)
                     .unwrap_or(200) as usize;
+                self.authorize(
+                    ctx,
+                    call_id,
+                    ToolAction::ReadWorkspace {
+                        tool_name: "file_grep".to_string(),
+                        path: subpath.map_or_else(|| ctx.workspace_root.clone(), Path::to_path_buf),
+                    },
+                )
+                .await?;
                 file_grep(&ctx.workspace_root, pattern, subpath, max)
             }
             "file_index" => {
                 let path = req_str(args, "path")?;
+                self.authorize(
+                    ctx,
+                    call_id,
+                    ToolAction::ReadWorkspace {
+                        tool_name: "file_index".to_string(),
+                        path: PathBuf::from(path),
+                    },
+                )
+                .await?;
                 extract_file_outline(&ctx.workspace_root, Path::new(path))
             }
             "view_image" => {
                 let path = req_str(args, "path")?;
+                self.authorize(
+                    ctx,
+                    call_id,
+                    ToolAction::ReadWorkspace {
+                        tool_name: "view_image".to_string(),
+                        path: PathBuf::from(path),
+                    },
+                )
+                .await?;
                 view_image(&ctx.workspace_root, Path::new(path))
             }
             "plan" => {
@@ -598,33 +636,14 @@ impl NativeToolRegistry {
             }
             "code" => {
                 let snippet = req_str(args, "code")?;
-                let perms = Arc::clone(&ctx.permissions);
-                let item_id = call_id.to_string();
+                let authorizer = SessionMcpAuthorizer::new(
+                    Arc::clone(&ctx.permissions),
+                    ctx.approval_cb.clone(),
+                    ctx.state_index.clone(),
+                    format!("{call_id}_mcp"),
+                );
                 ctx.code_sandbox
-                    .execute(snippet, ctx.mcp_gateway.clone(), move |server, tool| {
-                        let decision = perms
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .evaluate(
-                                &item_id,
-                                &ToolAction::McpCall {
-                                    server: server.to_string(),
-                                    tool: tool.to_string(),
-                                },
-                            );
-                        match decision {
-                            PermissionDecision::Allow => Ok(()),
-                            PermissionDecision::Deny { reason } => {
-                                Err(ToolsError::PermissionDenied { message: reason })
-                            }
-                            PermissionDecision::Prompt(p) => Err(ToolsError::PermissionDenied {
-                                message: format!(
-                                    "MCP call `{}` requires explicit allow rule or Auto/YOLO approval",
-                                    p.summary
-                                ),
-                            }),
-                        }
-                    })
+                    .execute(snippet, ctx.mcp_gateway.clone(), Arc::new(authorizer))
                     .await
             }
             "batch" => {
@@ -632,21 +651,42 @@ impl NativeToolRegistry {
                     .get("calls")
                     .and_then(Value::as_array)
                     .ok_or_else(|| ToolsError::invalid("`batch` requires `calls` array"))?;
-                let mut outputs = Vec::with_capacity(arr.len());
+                const BATCH_ALLOWED_TOOLS: [&str; 5] = [
+                    "file_read",
+                    "file_glob",
+                    "file_grep",
+                    "file_index",
+                    "tool_output",
+                ];
+                let sub_ids: Vec<String> =
+                    (0..arr.len()).map(|i| format!("{call_id}_b{i}")).collect();
+                let mut futures = Vec::with_capacity(arr.len());
                 for (i, item) in arr.iter().enumerate() {
                     let sub_tool = item
                         .get("tool")
                         .and_then(Value::as_str)
                         .ok_or_else(|| ToolsError::invalid("batch item missing `tool`"))?;
-                    if sub_tool == "batch" {
-                        return Err(ToolsError::invalid("nested `batch` calls are disallowed"));
+                    if !BATCH_ALLOWED_TOOLS.contains(&sub_tool) {
+                        return Err(ToolsError::invalid(format!(
+                            "`batch` only accepts read/search/index tools ({}); `{sub_tool}` must run standalone",
+                            BATCH_ALLOWED_TOOLS.join(", ")
+                        )));
                     }
                     let sub_args = item.get("arguments").unwrap_or(&Value::Null);
-                    let sub_out =
-                        Box::pin(self.execute(ctx, &format!("{call_id}_b{i}"), sub_tool, sub_args))
-                            .await?;
-                    outputs.push(format!("=== {sub_tool} ===\n{}", sub_out.to_model_text()));
+                    futures.push(self.execute(ctx, &sub_ids[i], sub_tool, sub_args));
                 }
+                let results = futures::future::try_join_all(futures).await?;
+                let outputs: Vec<String> = results
+                    .iter()
+                    .zip(arr.iter())
+                    .map(|(out, item)| {
+                        let sub_tool = item
+                            .get("tool")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        format!("=== {sub_tool} ===\n{}", out.to_model_text())
+                    })
+                    .collect();
                 Ok(ToolOutput::Text {
                     text: outputs.join("\n\n"),
                 })
@@ -663,54 +703,116 @@ impl NativeToolRegistry {
         call_id: &str,
         action: ToolAction,
     ) -> Result<(), ToolsError> {
-        // Loop so compound shell commands with multiple uncovered subcommands can authorize each subcommand!
-        loop {
-            let decision = {
-                let eval = ctx
-                    .permissions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                eval.evaluate(call_id, &action)
-            };
-            match decision {
-                PermissionDecision::Allow => return Ok(()),
-                PermissionDecision::Deny { reason } => {
-                    return Err(ToolsError::PermissionDenied { message: reason });
+        run_permission_ladder(
+            &ctx.permissions,
+            ctx.approval_cb.as_ref(),
+            ctx.state_index.as_ref(),
+            call_id,
+            &action,
+        )
+        .await
+    }
+}
+
+/// Shared permission evaluation ladder: explicit `allow`/`deny` rules first,
+/// then interactive approval prompts (denying cleanly when no approval callback
+/// is available). Loops so compound shell commands authorize each subcommand.
+async fn run_permission_ladder(
+    permissions: &Arc<Mutex<PermissionEvaluator>>,
+    approval_cb: Option<&Arc<dyn ApprovalCallback>>,
+    state_index: Option<&Arc<Mutex<StateIndex>>>,
+    call_id: &str,
+    action: &ToolAction,
+) -> Result<(), ToolsError> {
+    loop {
+        let decision = {
+            let eval = permissions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            eval.evaluate(call_id, action)
+        };
+        match decision {
+            PermissionDecision::Allow => return Ok(()),
+            PermissionDecision::Deny { reason } => {
+                return Err(ToolsError::PermissionDenied { message: reason });
+            }
+            PermissionDecision::Prompt(prompt) => {
+                let Some(cb) = approval_cb else {
+                    return Err(ToolsError::PermissionDenied {
+                        message: format!(
+                            "approval required for `{}` ({})",
+                            prompt.tool_name, prompt.summary
+                        ),
+                    });
+                };
+                let resolution = cb.request_approval(prompt.clone()).await;
+                let is_once_approve = matches!(
+                    &resolution,
+                    ApprovalResolution::Approve {
+                        lifetime: tekvra_protocol::GrantLifetime::Once,
+                        ..
+                    }
+                );
+                {
+                    let mut eval = permissions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let idx_guard = state_index.map(|arc| {
+                        arc.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    });
+                    eval.apply_resolution(&prompt, resolution, idx_guard.as_deref())?;
                 }
-                PermissionDecision::Prompt(prompt) => {
-                    let Some(cb) = &ctx.approval_cb else {
-                        return Err(ToolsError::PermissionDenied {
-                            message: format!(
-                                "approval required for `{}` ({})",
-                                prompt.tool_name, prompt.summary
-                            ),
-                        });
-                    };
-                    let resolution = cb.request_approval(prompt.clone()).await;
-                    let is_once_approve = matches!(
-                        &resolution,
-                        ApprovalResolution::Approve {
-                            lifetime: tekvra_protocol::GrantLifetime::Once,
-                            ..
-                        }
-                    );
-                    {
-                        let mut eval = ctx
-                            .permissions
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let idx_guard = ctx.state_index.as_ref().map(|arc| {
-                            arc.lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        });
-                        eval.apply_resolution(&prompt, resolution, idx_guard.as_deref())?;
-                    }
-                    if is_once_approve {
-                        return Ok(());
-                    }
+                if is_once_approve {
+                    return Ok(());
                 }
             }
         }
+    }
+}
+
+/// Permission-ladder authorizer for MCP calls issued from inside Monty `code`:
+/// prompts interactively through [`ApprovalCallback`] in `Build` mode instead of
+/// failing closed.
+pub struct SessionMcpAuthorizer {
+    permissions: Arc<Mutex<PermissionEvaluator>>,
+    approval_cb: Option<Arc<dyn ApprovalCallback>>,
+    state_index: Option<Arc<Mutex<StateIndex>>>,
+    call_id: String,
+}
+
+impl SessionMcpAuthorizer {
+    /// Creates an authorizer bound to the session permission evaluator.
+    #[must_use]
+    pub fn new(
+        permissions: Arc<Mutex<PermissionEvaluator>>,
+        approval_cb: Option<Arc<dyn ApprovalCallback>>,
+        state_index: Option<Arc<Mutex<StateIndex>>>,
+        call_id: String,
+    ) -> Self {
+        Self {
+            permissions,
+            approval_cb,
+            state_index,
+            call_id,
+        }
+    }
+}
+
+#[async_trait]
+impl McpCallAuthorizer for SessionMcpAuthorizer {
+    async fn authorize_mcp(&self, server: &str, tool: &str) -> Result<(), ToolsError> {
+        run_permission_ladder(
+            &self.permissions,
+            self.approval_cb.as_ref(),
+            self.state_index.as_ref(),
+            &self.call_id,
+            &ToolAction::McpCall {
+                server: server.to_string(),
+                tool: tool.to_string(),
+            },
+        )
+        .await
     }
 }
 

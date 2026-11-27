@@ -1,6 +1,8 @@
 //! Modal overlays for scope-ladder approvals, `/tasks` (`Ctrl-X`) subagent navigation & live steering,
 //! `/search` FTS5 history picker, and workspace file-revert preview.
 
+use std::collections::BTreeMap;
+
 use tekvra_core::SubagentEntry;
 use tekvra_protocol::{
     ApprovalPrompt, ApprovalResolution, GrantLifetime, InputDeliveryMode, RevertScope,
@@ -726,5 +728,75 @@ fn fuzzy_score_token(candidate: &str, query: &str) -> Option<u32> {
         )
     } else {
         None
+    }
+}
+
+/// Interactive state for the `question` tool modal (`SessionEvent::UserInputRequested`).
+#[derive(Debug, Clone)]
+pub struct QuestionModalState {
+    /// Correlating item id for `SessionCommand::ResolveUserInput`.
+    pub item_id: String,
+    /// Turn the question belongs to.
+    pub turn_id: String,
+    /// `(id, prompt)` pairs in asked order.
+    pub questions: Vec<(String, String)>,
+    /// Focused question row.
+    pub selected: usize,
+    /// Per-question draft answers (parallel to `questions`).
+    pub drafts: Vec<String>,
+}
+
+impl QuestionModalState {
+    /// Creates a [`QuestionModalState`] with one empty draft per question.
+    #[must_use]
+    pub fn new(item_id: String, turn_id: String, questions: Vec<(String, String)>) -> Self {
+        let drafts = vec![String::new(); questions.len()];
+        Self {
+            item_id,
+            turn_id,
+            questions,
+            selected: 0,
+            drafts,
+        }
+    }
+
+    /// Appends `ch` to the focused question's draft answer.
+    pub fn type_char(&mut self, ch: char) {
+        if let Some(draft) = self.drafts.get_mut(self.selected) {
+            draft.push(ch);
+        }
+    }
+
+    /// Removes the last character from the focused question's draft answer.
+    pub fn backspace(&mut self) {
+        if let Some(draft) = self.drafts.get_mut(self.selected) {
+            draft.pop();
+        }
+    }
+
+    /// Moves focus down, clamped at the last question.
+    pub fn next(&mut self) {
+        if self.selected + 1 < self.questions.len() {
+            self.selected += 1;
+        }
+    }
+
+    /// Moves focus up, clamped at the first question.
+    pub fn prev(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Builds the `question id -> answer strings` map (empty drafts skipped so the
+    /// model sees unanswered questions rather than empty noise).
+    #[must_use]
+    pub fn answers(&self) -> BTreeMap<String, Vec<String>> {
+        let mut map = BTreeMap::new();
+        for ((id, _), draft) in self.questions.iter().zip(&self.drafts) {
+            let trimmed = draft.trim();
+            if !trimmed.is_empty() {
+                map.insert(id.clone(), vec![trimmed.to_string()]);
+            }
+        }
+        map
     }
 }

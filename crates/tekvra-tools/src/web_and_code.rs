@@ -282,6 +282,22 @@ struct PendingMcpBatch {
     reply_tx: oneshot::Sender<Vec<(u32, Result<Value, String>)>>,
 }
 
+/// Async authorizer for outbound MCP calls made from inside the Monty `code`
+/// sandbox (prompts interactively when no explicit allow rule covers the call).
+#[async_trait]
+pub trait McpCallAuthorizer: Send + Sync {
+    /// Authorizes one `server/tool` call, resolving prompts through the session
+    /// approval ladder (or denying cleanly when no approval callback exists).
+    async fn authorize_mcp(&self, server: &str, tool: &str) -> Result<(), ToolsError>;
+}
+
+#[async_trait]
+impl McpCallAuthorizer for Arc<dyn McpCallAuthorizer> {
+    async fn authorize_mcp(&self, server: &str, tool: &str) -> Result<(), ToolsError> {
+        (**self).authorize_mcp(server, tool).await
+    }
+}
+
 impl MontyCodeSandbox {
     /// Executes `python_code` inside an isolated Monty VM (`ResourceLimits` applied, all `OsCall`s denied).
     /// Supports both `mcp_list()` and concurrent `await mcp_call(server, tool, args)` (as well as `mcp_call_sync`).
@@ -290,15 +306,12 @@ impl MontyCodeSandbox {
     /// # Errors
     /// Returns [`ToolsError::CodeSandbox`] on Python syntax/runtime errors or sandbox OS-call violations,
     /// or [`ToolsError::PermissionDenied`] if an MCP call is rejected.
-    pub async fn execute<F>(
+    pub async fn execute(
         &self,
         python_code: &str,
         gateway: Option<Arc<dyn McpGateway>>,
-        mut authorize_mcp: F,
-    ) -> Result<ToolOutput, ToolsError>
-    where
-        F: FnMut(&str, &str) -> Result<(), ToolsError> + Send,
-    {
+        authorize_mcp: Arc<dyn McpCallAuthorizer>,
+    ) -> Result<ToolOutput, ToolsError> {
         let gateway_for_vm = gateway.as_ref().map(Arc::clone);
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<PendingMcpBatch>();
         let code_owned = python_code.to_string();
@@ -314,7 +327,7 @@ impl MontyCodeSandbox {
             let mut immediate_errors: HashMap<u32, String> = HashMap::new();
 
             for (call_id, server, tool, args) in batch.calls {
-                if let Err(err) = authorize_mcp(&server, &tool) {
+                if let Err(err) = authorize_mcp.authorize_mcp(&server, &tool).await {
                     immediate_errors.insert(call_id, err.to_string());
                     continue;
                 }

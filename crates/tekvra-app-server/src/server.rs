@@ -271,7 +271,7 @@ impl JsonRpcConnection {
             "thread/archive" => self.rpc_thread_archive(params, true),
             "thread/unarchive" => self.rpc_thread_archive(params, false),
             "thread/rollback" => self.rpc_thread_rollback(params).await,
-            "thread/compact/start" => Ok(json!({})),
+            "thread/compact/start" => self.rpc_thread_compact_start(params).await,
             "thread/name/set" => self.rpc_thread_set_name(params),
             "turn/start" => self.rpc_turn_start(params).await,
             "turn/steer" => self.rpc_turn_steer(params).await,
@@ -291,12 +291,7 @@ impl JsonRpcConnection {
             "account/read" => self.rpc_account_read(),
             "account/login/start" => self.rpc_account_login_start(params),
             "account/logout" => self.rpc_account_logout(params),
-            "account/rateLimits/read" => Ok(json!({
-                "rateLimits": {
-                    "planType": "plus",
-                    "spendControlReached": false
-                }
-            })),
+            "account/rateLimits/read" => self.rpc_account_rate_limits(),
             "fuzzyFileSearch" => self.rpc_fuzzy_file_search(params),
             other => Err((-32601, format!("Method not found: `{other}`"))),
         }
@@ -684,6 +679,51 @@ impl JsonRpcConnection {
                 .map_err(|e| (-32603, e.to_string()))?;
         }
         Ok(json!({ "thread": thread_val }))
+    }
+
+    /// `thread/compact/start`: queues `SessionCommand::Compact` on the loaded
+    /// thread; completion surfaces later via the forwarded compaction events.
+    async fn rpc_thread_compact_start(&self, params: Value) -> Result<Value, (i64, String)> {
+        let thread_id = req_str(&params, "threadId")?;
+        let handle = self.lookup_handle(&thread_id)?;
+        handle
+            .send(SessionCommand::Compact)
+            .await
+            .map_err(|e| (-32603, e.to_string()))?;
+        Ok(json!({}))
+    }
+
+    /// `account/rateLimits/read`: live multi-account quota snapshot from the
+    /// active provider driver (empty `accounts` list for deterministic drivers).
+    fn rpc_account_rate_limits(&self) -> Result<Value, (i64, String)> {
+        let rows = self.state.driver.account_pool_snapshot().summary_rows();
+        let accounts: Vec<Value> = rows
+            .iter()
+            .map(|(provider, name, ratio, exhausted)| {
+                json!({
+                    "provider": provider,
+                    "account": name,
+                    "remainingRatio": ratio,
+                    "exhausted": exhausted,
+                })
+            })
+            .collect();
+        let worst = rows
+            .iter()
+            .filter(|(_, _, _, exhausted)| !exhausted)
+            .map(|(_, _, ratio, _)| *ratio)
+            .fold(1.0_f64, f64::min);
+        Ok(json!({
+            "rateLimits": {
+                "primaryWindow": {
+                    "remainingRatio": worst,
+                    "usedPercent": ((1.0 - worst) * 100.0).round() as i64,
+                },
+                "spendControlReached": !rows.is_empty()
+                    && rows.iter().all(|(_, _, _, exhausted)| *exhausted),
+            },
+            "accounts": accounts,
+        }))
     }
 
     fn rpc_thread_set_name(&self, params: Value) -> Result<Value, (i64, String)> {

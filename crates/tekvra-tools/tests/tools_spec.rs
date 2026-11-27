@@ -1157,3 +1157,216 @@ async fn powershell_decomposition_and_permission_decisions_mirror_bash_contract(
         assert_eq!(facade, direct);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5: multimodal `view_image`, uniform read authorization, concurrent
+// read-only `batch`, and async Build-mode MCP approval inside `code`
+// ---------------------------------------------------------------------------
+
+struct ApprovingCallback {
+    prompts: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl tekvra_tools::ApprovalCallback for ApprovingCallback {
+    async fn request_approval(
+        &self,
+        prompt: tekvra_protocol::ApprovalPrompt,
+    ) -> ApprovalResolution {
+        self.prompts
+            .lock()
+            .expect("lock")
+            .push(format!("{}: {}", prompt.tool_name, prompt.summary));
+        ApprovalResolution::Approve {
+            scope: None,
+            lifetime: GrantLifetime::Project,
+            confirmed_broad: false,
+        }
+    }
+}
+
+/// Minimal valid PNG (signature + stub payload) for MIME sniffing.
+fn tiny_png() -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+    bytes.extend_from_slice(b"fake-ihdr-data");
+    bytes
+}
+
+#[tokio::test]
+async fn view_image_returns_multimodal_image_payload_and_authorizes_reads() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("repo");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&ws).expect("mkdir");
+    let png = tiny_png();
+    std::fs::write(ws.join("shot.png"), &png).expect("write png");
+
+    let reg = NativeToolRegistry::new();
+
+    // Build mode with an explicit `view_image` deny rule -> rejected before disk read.
+    let deny_rules = vec![PermissionRule {
+        tool: "view_image".to_string(),
+        pattern: "*".to_string(),
+        action: RuleAction::Deny,
+    }];
+    let denied_ctx = make_ctx(ws.clone(), state.clone(), PermissionMode::Build, deny_rules);
+    let err = reg
+        .execute(
+            &denied_ctx,
+            "v0",
+            "view_image",
+            &json!({ "path": "shot.png" }),
+        )
+        .await
+        .expect_err("deny rule must block view_image");
+    assert!(err.to_string().contains("blocked by explicit `deny` rule"));
+
+    // Without the deny rule, the full base64 payload is delivered.
+    let ctx = make_ctx(ws, state, PermissionMode::Build, Vec::new());
+    let out = reg
+        .execute(&ctx, "v1", "view_image", &json!({ "path": "shot.png" }))
+        .await
+        .expect("view_image");
+    let ToolOutput::Image {
+        path,
+        media_type,
+        bytes_len,
+        data_base64,
+    } = out
+    else {
+        panic!("expected Image output, got {out:?}");
+    };
+    assert_eq!(path, PathBuf::from("shot.png"));
+    assert_eq!(media_type, "image/png");
+    assert_eq!(bytes_len, png.len());
+    // Full payload, not the old 64-byte head: standard base64 length formula.
+    assert_eq!(
+        data_base64.len(),
+        bytes_len.div_ceil(3) * 4,
+        "expected full base64 payload"
+    );
+    // Model-facing text stays concise (no multi-megabyte base64 inline).
+    let model_text = ToolOutput::Image {
+        path: path.clone(),
+        media_type: media_type.clone(),
+        bytes_len,
+        data_base64: data_base64.clone(),
+    }
+    .to_model_text();
+    assert!(model_text.starts_with("Viewed image "));
+    assert!(!model_text.contains(data_base64.as_str()));
+}
+
+#[tokio::test]
+async fn deny_rule_blocks_file_grep_and_batch_rejects_mutating_tools_concurrently() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("repo");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&ws).expect("mkdir");
+    std::fs::write(ws.join("a.txt"), "NEEDLE_A\n").expect("write a");
+    std::fs::write(ws.join("b.txt"), "NEEDLE_B\n").expect("write b");
+
+    let rules = vec![PermissionRule {
+        tool: "file_grep".to_string(),
+        pattern: "*".to_string(),
+        action: RuleAction::Deny,
+    }];
+    let ctx = make_ctx(ws, state, PermissionMode::Build, rules);
+    let reg = NativeToolRegistry::new();
+
+    // Direct denied call.
+    let err = reg
+        .execute(&ctx, "g0", "file_grep", &json!({ "pattern": "NEEDLE" }))
+        .await
+        .expect_err("deny rule must block file_grep");
+    assert!(err.to_string().contains("blocked by explicit `deny` rule"));
+
+    // Denied call inside `batch` (before scanning disk).
+    let err = reg
+        .execute(
+            &ctx,
+            "b0",
+            "batch",
+            &json!({ "calls": [{ "tool": "file_grep", "arguments": { "pattern": "NEEDLE" } }] }),
+        )
+        .await
+        .expect_err("deny rule must hold inside batch");
+    assert!(err.to_string().contains("blocked by explicit `deny` rule"));
+
+    // Mutating tools are rejected from `batch` with a validation error.
+    let err = reg
+        .execute(
+            &ctx,
+            "b1",
+            "batch",
+            &json!({ "calls": [{ "tool": "file_write", "arguments": { "path": "x.txt", "content": "nope" } }] }),
+        )
+        .await
+        .expect_err("mutating tool must be rejected in batch");
+    assert!(err.to_string().contains("only accepts read/search/index"));
+
+    // Read-only calls run concurrently and return ordered results.
+    let out = reg
+        .execute(
+            &ctx,
+            "b2",
+            "batch",
+            &json!({
+                "calls": [
+                    { "tool": "file_read", "arguments": { "path": "a.txt" } },
+                    { "tool": "file_read", "arguments": { "path": "b.txt" } }
+                ]
+            }),
+        )
+        .await
+        .expect("batch read");
+    let text = out.to_model_text();
+    let a_pos = text.find("NEEDLE_A").expect("NEEDLE_A in output");
+    let b_pos = text.find("NEEDLE_B").expect("NEEDLE_B in output");
+    assert!(a_pos < b_pos, "batch results must stay ordered: {text}");
+}
+
+#[tokio::test]
+async fn build_mode_mcp_call_inside_code_prompts_interactively() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("repo");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&ws).expect("mkdir");
+
+    let reg = NativeToolRegistry::new();
+    let snippet = json!({
+        "code": "r = mcp_call_sync('docs', 'lookup', {'q': 'tekvra'})\nprint(r['echo']['q'])"
+    });
+
+    // 1. Build mode with NO approval callback -> fails closed (no hang).
+    let ctx_no_cb = make_ctx(ws.clone(), state.clone(), PermissionMode::Build, Vec::new());
+    let err = reg
+        .execute(&ctx_no_cb, "c0", "code", &snippet)
+        .await
+        .expect_err("prompt without approval callback must deny");
+    assert!(err.to_string().contains("approval required"));
+
+    // 2. Build mode WITH an interactive approval callback -> executes the call.
+    let mut ctx = make_ctx(ws, state, PermissionMode::Build, Vec::new());
+    let mock_mcp = Arc::new(MockMcp::default());
+    ctx.mcp_gateway = Some(mock_mcp.clone());
+    let approving = Arc::new(ApprovingCallback {
+        prompts: Mutex::new(Vec::new()),
+    });
+    ctx.approval_cb = Some(approving.clone());
+
+    let out = reg
+        .execute(&ctx, "c1", "code", &snippet)
+        .await
+        .expect("approved mcp call inside code");
+    let ToolOutput::CodeExecution { output, mcp_calls } = out else {
+        panic!("expected CodeExecution");
+    };
+    assert_eq!(mcp_calls, 1);
+    assert_eq!(output.trim(), "tekvra");
+    assert!(
+        !approving.prompts.lock().expect("lock").is_empty(),
+        "an interactive approval prompt must have been issued"
+    );
+    assert_eq!(mock_mcp.calls.load(Ordering::SeqCst), 1);
+}

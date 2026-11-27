@@ -1,6 +1,7 @@
 //! Headless non-interactive `tekvra exec` / `--print` runner supporting plain text, JSONL events,
 //! `stream-json` bidirectional framing, and `--output-schema <PATH>` JSON Schema validation.
 
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -108,6 +109,16 @@ pub async fn run_headless_exec(handle: SessionHandle, opts: ExecRunOptions) -> R
                     if !text.is_empty() {
                         turn_text = text;
                     }
+                }
+                SessionEvent::UserInputRequested { item_id, .. } => {
+                    // Headless exec has no interactive host: resolve immediately with
+                    // no answers so the `question` turn completes instead of hanging.
+                    let _ = handle
+                        .send(SessionCommand::ResolveUserInput {
+                            item_id,
+                            answers: BTreeMap::new(),
+                        })
+                        .await;
                 }
                 SessionEvent::ApprovalRequested { prompt, .. } => {
                     let resolution = if matches!(

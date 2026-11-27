@@ -581,3 +581,102 @@ async fn websocket_bearer_auth_and_bidirectional_command_approval_and_denial() {
     assert!(saw_approval_req_2);
     assert!(!saw_must_not_run, "declined command must never execute");
 }
+
+#[tokio::test]
+async fn thread_compact_start_queues_compaction_and_rate_limits_read_reports_pool() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (state, _ws) = build_app_state(&tmp, Vec::new());
+
+    let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+    let (srv_r, srv_w) = tokio::io::split(server_stream);
+    tokio::spawn(async move {
+        let _ = serve_read_write(srv_r, srv_w, state).await;
+    });
+
+    let (cli_r, mut cli_w) = tokio::io::split(client_stream);
+    let mut lines = BufReader::new(cli_r).lines();
+
+    cli_w
+        .write_all(
+            b"{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"codex-test\",\"version\":\"0.1.0\"}}}\n",
+        )
+        .await
+        .expect("write init");
+    let _: Value =
+        serde_json::from_str(&lines.next_line().await.expect("io").expect("line")).expect("j");
+    cli_w
+        .write_all(b"{\"method\":\"initialized\"}\n")
+        .await
+        .expect("write initialized");
+
+    cli_w
+        .write_all(b"{\"id\":2,\"method\":\"thread/start\",\"params\":{}}\n")
+        .await
+        .expect("write thread/start");
+    let mut thread_id: Option<String> = None;
+    while thread_id.is_none() {
+        let msg: Value =
+            serde_json::from_str(&lines.next_line().await.expect("io").expect("frame"))
+                .expect("json");
+        if msg.get("id") == Some(&json!(2)) {
+            thread_id = Some(
+                msg["result"]["thread"]["id"]
+                    .as_str()
+                    .expect("id")
+                    .to_string(),
+            );
+        }
+    }
+    let thread_id = thread_id.expect("thread id from thread/start");
+
+    // Live `account/rateLimits/read`: deterministic driver -> empty pool summary.
+    cli_w
+        .write_all(b"{\"id\":3,\"method\":\"account/rateLimits/read\",\"params\":{}}\n")
+        .await
+        .expect("write rate limits");
+    let limits: Value =
+        serde_json::from_str(&lines.next_line().await.expect("io").expect("line")).expect("j");
+    assert_eq!(
+        limits["result"]["rateLimits"]["primaryWindow"]["remainingRatio"],
+        1.0
+    );
+    assert_eq!(limits["result"]["rateLimits"]["spendControlReached"], false);
+    assert_eq!(limits["result"]["accounts"], json!([]));
+
+    // `thread/compact/start` queues `SessionCommand::Compact` and answers `{}`.
+    let req = serde_json::to_string(&json!({
+        "id": 4,
+        "method": "thread/compact/start",
+        "params": { "threadId": thread_id }
+    }))
+    .expect("ser");
+    cli_w
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("send compact");
+    let compact: Value =
+        serde_json::from_str(&lines.next_line().await.expect("io").expect("line")).expect("j");
+    assert!(
+        compact.get("error").is_none(),
+        "compact must succeed: {compact}"
+    );
+    assert_eq!(compact["result"], json!({}));
+
+    // Unknown thread id -> clean JSON-RPC error, not a panic.
+    let req = serde_json::to_string(&json!({
+        "id": 5,
+        "method": "thread/compact/start",
+        "params": { "threadId": "thr_missing" }
+    }))
+    .expect("ser");
+    cli_w
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .expect("send missing");
+    let missing: Value =
+        serde_json::from_str(&lines.next_line().await.expect("io").expect("line")).expect("j");
+    assert!(
+        missing.get("error").is_some(),
+        "unknown thread must error: {missing}"
+    );
+}

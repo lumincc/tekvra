@@ -797,6 +797,25 @@ impl AccountPool {
         }
     }
 
+    /// Public `(provider, account, remaining_ratio, exhausted)` rows for diagnostics
+    /// surfaces such as the app-server `account/rateLimits/read` RPC (no tokens).
+    #[must_use]
+    pub fn summary_rows(&self) -> Vec<(String, String, f64, bool)> {
+        self.by_provider
+            .iter()
+            .flat_map(|(provider, accounts)| {
+                accounts.iter().map(|candidate| {
+                    (
+                        provider.clone(),
+                        candidate.name.clone(),
+                        candidate.remaining_quota_ratio,
+                        candidate.exhausted,
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Pins selection for a provider (`--account PROVIDER:NAME`), disabling failover onto other accounts.
     pub fn set_pin(&mut self, pin: Option<AccountPin>) {
         self.pin = pin;

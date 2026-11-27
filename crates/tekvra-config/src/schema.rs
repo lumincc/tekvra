@@ -60,6 +60,8 @@ pub struct AgentSettings {
     pub shell_env_set: BTreeMap<String, String>,
     /// Optional allowlisted CIDR/host entries permitted by `webfetch` even on private networks.
     pub webfetch_allow_private_hosts: Vec<String>,
+    /// Opt-in background session titling (`JobRole::Title`) after the first completed turn.
+    pub auto_title: bool,
 }
 
 impl Default for AgentSettings {
@@ -73,6 +75,7 @@ impl Default for AgentSettings {
             shell_env_passthrough: Vec::new(),
             shell_env_set: BTreeMap::new(),
             webfetch_allow_private_hosts: Vec::new(),
+            auto_title: false,
         }
     }
 }

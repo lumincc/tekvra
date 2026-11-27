@@ -36,10 +36,12 @@ pub use pty::{
     PtyCommandRequest, PtyCompletionNotice, PtySessionManager, build_sanitized_shell_env,
 };
 pub use registry::{
-    ApprovalCallback, NativeToolRegistry, QuestionCallback, ToolExecutionContext,
-    build_tool_definitions_for_model,
+    ApprovalCallback, NativeToolRegistry, QuestionCallback, SessionMcpAuthorizer,
+    ToolExecutionContext, build_tool_definitions_for_model,
 };
-pub use web_and_code::{McpGateway, McpToolDescriptor, MontyCodeSandbox, SafeWebFetcher};
+pub use web_and_code::{
+    McpCallAuthorizer, McpGateway, McpToolDescriptor, MontyCodeSandbox, SafeWebFetcher,
+};
 
 /// Errors emitted by `tekvra-tools`.
 #[derive(Debug, Error)]

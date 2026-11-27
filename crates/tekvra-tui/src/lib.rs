@@ -21,9 +21,9 @@ pub use highlight::{CodeHighlighter, highlight_unified_diff};
 pub use markdown::render_markdown_lines;
 pub use modals::{
     ApprovalModalState, CompletionCandidate, CompletionKind, CompletionPopupState,
-    ModelPickerState, RevertOverlayState, RevertPreviewItem, SearchOverlayState,
-    SessionsOverlayState, TasksOverlayState, TrustUiCommand, build_completion_popup,
-    is_excluded_mention_path,
+    ModelPickerState, QuestionModalState, RevertOverlayState, RevertPreviewItem,
+    SearchOverlayState, SessionsOverlayState, TasksOverlayState, TrustUiCommand,
+    build_completion_popup, is_excluded_mention_path,
 };
 
 /// Errors produced by `tekvra-tui`.
