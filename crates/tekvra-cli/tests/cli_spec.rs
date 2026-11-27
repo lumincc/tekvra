@@ -1318,7 +1318,7 @@ fn installer_ps1_verifies_sha256_and_installs_nested_bundle() {
         .map(|out| out.status.success())
         .unwrap_or(false);
     let shell = if has_pwsh { "pwsh" } else { "powershell" };
-    let mut installer_cmd = |sums: &str| {
+    let installer_cmd = |sums: &str| {
         std::fs::write(dist_versioned.join("SHA256SUMS.txt"), sums).expect("write SHA256SUMS.txt");
         StdCommand::new(shell)
             .args([
