@@ -533,11 +533,10 @@ async fn auto_merge_conflict_reports_without_touching_parent_tree() {
     loop {
         match rx.recv().await.expect("events") {
             SessionEvent::ItemCompleted {
-                tool_output: Some(tekvra_protocol::ToolOutput::SubagentCard {
-                    status,
-                    summary,
-                    ..
-                }),
+                tool_output:
+                    Some(tekvra_protocol::ToolOutput::SubagentCard {
+                        status, summary, ..
+                    }),
                 ..
             } => {
                 if status == "merge_conflicted" {
