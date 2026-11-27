@@ -225,6 +225,11 @@ pub async fn serve_endpoint(
         ListenEndpoint::Stdio => serve_stdio(state).await,
         #[cfg(unix)]
         ListenEndpoint::Unix(path) => serve_unix(&path, state).await,
+        #[cfg(not(unix))]
+        ListenEndpoint::Unix(path) => Err(AppServerError::InvalidListenUri {
+            uri: format!("unix://{}", path.display()),
+            reason: "Unix domain sockets are not supported on this platform".to_string(),
+        }),
         ListenEndpoint::WebSocket(addr) => {
             let listener = tokio::net::TcpListener::bind(addr).await?;
             serve_websocket(listener, auth_token, state).await

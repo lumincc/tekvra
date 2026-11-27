@@ -8,9 +8,11 @@ use thiserror::Error;
 
 pub use fuzzy::{FuzzyFileMatch, FuzzySearchOutput, fuzzy_file_search};
 pub use server::{AppServerState, AppServerStateInit, JsonRpcConnection};
+#[cfg(unix)]
+pub use transport::serve_unix;
 pub use transport::{
     ListenEndpoint, parse_listen_endpoint, serve_endpoint, serve_read_write, serve_stdio,
-    serve_unix, serve_websocket,
+    serve_websocket,
 };
 
 /// Errors produced by `tekvra-app-server`.
