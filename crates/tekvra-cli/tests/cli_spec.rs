@@ -1105,6 +1105,12 @@ async fn cli_worktree_flag_routes_writes_into_managed_checkout() {
 }
 
 #[test]
+// install.sh is a POSIX shell script (bash + tar + sha256sum + file:// curl);
+// Windows distribution is served by install.ps1, so this smoke test cannot run there.
+#[cfg_attr(
+    windows,
+    ignore = "install.sh is a POSIX shell script; Windows ships install.ps1"
+)]
 fn installer_sh_verifies_sha256_and_rejects_mismatch() {
     use std::process::Command as StdCommand;
 
