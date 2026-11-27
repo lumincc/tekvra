@@ -1,4 +1,6 @@
 /target
 /.tmp
+/.agents
+/openspec
 *.swp
 .DS_Store
