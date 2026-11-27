@@ -197,6 +197,9 @@ async fn single_editor_model_routing_and_multi_file_apply_patch_with_move_and_sn
 }
 
 #[tokio::test]
+// exec_command runs payloads through a POSIX shell (`/bin/bash -c`); Windows
+// runners have no such shell, so the interactive-PTY scenarios cannot run there.
+#[cfg_attr(windows, ignore = "exec_command requires a POSIX shell (/bin/bash -c)")]
 async fn interactive_pty_prompt_write_stdin_and_failing_test_filter_with_tool_output_paging() {
     let tmp = TempDir::new().expect("tempdir");
     let ws = tmp.path().join("repo");
