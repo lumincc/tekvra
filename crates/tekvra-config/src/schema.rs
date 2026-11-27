@@ -77,6 +77,10 @@ pub struct AgentSettings {
     pub spend_limit_usd: Option<f64>,
     /// Aggregation window for the spend cap (`session` default, `day`).
     pub spend_limit_window: SpendWindow,
+    /// Opt-in gate for `task { merge: "auto" }` worktree steering (default disabled:
+    /// merge-back stays explicit). When enabled, `"auto"` resolves to a clean merge or a
+    /// conflict report — never to `"discard"`.
+    pub allow_task_auto_merge: bool,
 }
 
 /// Window over which the spend cap accumulates.
@@ -106,6 +110,7 @@ impl Default for AgentSettings {
             websearch_base_url: None,
             spend_limit_usd: None,
             spend_limit_window: SpendWindow::Session,
+            allow_task_auto_merge: false,
         }
     }
 }
@@ -138,6 +143,10 @@ pub struct McpServerConfig {
     pub startup_timeout_sec: Option<u64>,
     /// Optional per-tool call timeout override in seconds.
     pub tool_timeout_sec: Option<u64>,
+    /// Optional streaming HTTP header-phase budget override in seconds (default 60).
+    pub http_header_timeout_sec: Option<u64>,
+    /// Optional streaming HTTP per-chunk idle budget override in seconds (default 10).
+    pub http_idle_timeout_sec: Option<u64>,
     /// Extra environment variables passed to stdio MCP server.
     pub env: BTreeMap<String, String>,
     /// Whether this server is enabled.

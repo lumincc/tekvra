@@ -203,6 +203,10 @@ enum McpClientTransport {
         catalog_dirty: Arc<AtomicBool>,
         next_id: AtomicU64,
         call_timeout: Duration,
+        /// Per-server overrides of [`HTTP_HEADER_TIMEOUT`].
+        header_timeout: Duration,
+        /// Per-server overrides of [`HTTP_IDLE_CHUNK_TIMEOUT`].
+        idle_timeout: Duration,
         session: Arc<HttpSessionState>,
     },
 }
@@ -341,6 +345,19 @@ impl McpClientTransport {
         }
     }
 
+    /// Streaming budget for HTTP servers: the per-server `http_header_timeout_sec` /
+    /// `http_idle_timeout_sec` overrides when set, else the built-in defaults.
+    const fn http_stream_timeouts(&self) -> (Duration, Duration) {
+        match self {
+            Self::Stdio { .. } => (HTTP_HEADER_TIMEOUT, HTTP_IDLE_CHUNK_TIMEOUT),
+            Self::Http {
+                header_timeout,
+                idle_timeout,
+                ..
+            } => (*header_timeout, *idle_timeout),
+        }
+    }
+
     fn take_catalog_dirty(&self) -> bool {
         match self {
             Self::Stdio { catalog_dirty, .. } | Self::Http { catalog_dirty, .. } => {
@@ -476,6 +493,8 @@ impl McpClientTransport {
         hooks: SharedMcpHooks,
         handshake_timeout: Duration,
         call_timeout: Duration,
+        header_timeout: Duration,
+        idle_timeout: Duration,
     ) -> Result<(Self, Vec<McpToolDescriptor>), ToolsError> {
         let parsed = url::Url::parse(raw_url).map_err(|e| ToolsError::CodeSandbox {
             message: format!("invalid HTTP MCP URL `{raw_url}` for `{server_name}`: {e}"),
@@ -547,6 +566,8 @@ impl McpClientTransport {
             catalog_dirty,
             next_id: AtomicU64::new(1),
             call_timeout,
+            header_timeout,
+            idle_timeout,
             session: transport_session,
         };
 
@@ -726,7 +747,7 @@ impl McpClientTransport {
                 }
 
                 // Header phase: bounded independently of body streaming.
-                let header_deadline = HTTP_HEADER_TIMEOUT.min(*call_timeout);
+                let header_deadline = self.http_stream_timeouts().0.min(*call_timeout);
                 let resp = tokio::time::timeout(header_deadline, req.send())
                     .await
                     .map_err(|_| ToolsError::CodeSandbox {
@@ -760,7 +781,8 @@ impl McpClientTransport {
                     .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
 
                 if is_sse {
-                    Self::drain_sse_response(resp, server_name, method, req_id, router).await
+                    self.drain_sse_response(resp, server_name, method, req_id, router)
+                        .await
                 } else {
                     let msg: Value = resp.json().await.map_err(|e| ToolsError::CodeSandbox {
                         message: format!(
@@ -776,18 +798,20 @@ impl McpClientTransport {
     /// Drains an SSE body incrementally, routing inter-leaved notifications and server→client
     /// requests while resolving the frame matching `req_id`.
     async fn drain_sse_response(
+        &self,
         resp: reqwest::Response,
         server_name: &str,
         method: &str,
         req_id: u64,
         router: &InboundRouter,
     ) -> Result<Value, ToolsError> {
+        let idle_timeout = self.http_stream_timeouts().1;
         let mut parser = SseFrameParser::default();
         let mut stream = resp.bytes_stream();
         let mut matched: Option<Value> = None;
 
         loop {
-            let received = tokio::time::timeout(HTTP_IDLE_CHUNK_TIMEOUT, stream.next()).await;
+            let received = tokio::time::timeout(idle_timeout, stream.next()).await;
             let mut events: Vec<(Option<String>, String)> = Vec::new();
             let mut stream_ended = false;
             let chunk = match received {
@@ -1058,6 +1082,12 @@ impl ConfiguredMcpGateway {
                     Arc::clone(&hooks),
                     handshake_timeout,
                     call_timeout,
+                    cfg.http_header_timeout_sec
+                        .filter(|&s| s > 0)
+                        .map_or(HTTP_HEADER_TIMEOUT, Duration::from_secs),
+                    cfg.http_idle_timeout_sec
+                        .filter(|&s| s > 0)
+                        .map_or(HTTP_IDLE_CHUNK_TIMEOUT, Duration::from_secs),
                 )
                 .await
             } else {

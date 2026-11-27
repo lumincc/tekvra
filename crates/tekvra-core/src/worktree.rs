@@ -21,6 +21,71 @@ pub struct TaskWorktree {
     pub base_commit: String,
 }
 
+/// In-memory-equivalent merge probe for `task { merge: "auto" }`: runs the real
+/// `git merge --no-ff --no-commit <branch>`, then immediately `git merge --abort` so the
+/// index and working tree are restored before authorization. `Ok(())` = clean merge;
+/// `Err(message)` = conflicts (paths named), parent-dirty refusal, or unsupported git.
+pub async fn probe_task_merge(workspace_root: &Path, branch: &str) -> Result<(), String> {
+    let mut merge = Command::new("git");
+    merge
+        .current_dir(workspace_root)
+        .args(["merge", "--no-ff", "--no-commit", branch]);
+    let out = merge
+        .output()
+        .await
+        .map_err(|e| format!("git unavailable: {e}"))?;
+    if out.status.success() {
+        let abort = Command::new("git")
+            .current_dir(workspace_root)
+            .args(["merge", "--abort"])
+            .output()
+            .await;
+        if let Ok(a) = &abort
+            && !a.status.success()
+        {
+            return Err(format!(
+                "auto-merge probe succeeded but restoring the tree failed: {}",
+                String::from_utf8_lossy(&a.stderr).trim()
+            ));
+        }
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Cleanly abandon any partially applied merge state before reporting.
+    let _ = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["merge", "--abort"])
+        .output()
+        .await;
+    if stderr.contains("local changes") || stdout.contains("local changes") {
+        return Err(format!(
+            "parent tree has uncommitted edits overlapping `{branch}` — commit or stash first (worktree and branch kept)"
+        ));
+    }
+    let unmerged = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["ls-files", "--unmerged"])
+        .output()
+        .await
+        .map_err(|e| format!("git unavailable: {e}"))?;
+    let mut conflicted: Vec<String> = String::from_utf8_lossy(&unmerged.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(3).map(str::to_string))
+        .collect();
+    if !conflicted.is_empty() {
+        conflicted.sort();
+        conflicted.dedup();
+        return Err(format!(
+            "merge with `{branch}` conflicts on {} — worktree and branch kept for manual resolution",
+            conflicted.join(", ")
+        ));
+    }
+    Err(format!(
+        "merge with `{branch}` conflicts (worktree and branch kept for manual resolution)"
+    ))
+}
+
 /// Result of a successful merge-back into the parent working tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeOutcome {

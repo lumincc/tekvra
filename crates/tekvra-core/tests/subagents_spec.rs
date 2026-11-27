@@ -72,6 +72,18 @@ impl ProviderDriver for OneShotDriver {
 }
 
 fn setup_bootstrap(tmp: &TempDir, git_init: bool) -> SessionBootstrap {
+    let driver = Arc::new(OneShotDriver {
+        script: Mutex::new(vec![text_resp("subagent finished the work")].into()),
+    });
+    setup_bootstrap_with(tmp, git_init, driver, false)
+}
+
+fn setup_bootstrap_with(
+    tmp: &TempDir,
+    git_init: bool,
+    driver: Arc<dyn ProviderDriver>,
+    allow_task_auto_merge: bool,
+) -> SessionBootstrap {
     let ws = tmp.path().join("repo");
     let cfg_dir = tmp.path().join("cfg");
     let state_dir = tmp.path().join("state");
@@ -105,6 +117,7 @@ fn setup_bootstrap(tmp: &TempDir, git_init: bool) -> SessionBootstrap {
     )
     .expect("load config");
     resolved.settings.agent.default_mode = PermissionMode::Build;
+    resolved.settings.agent.allow_task_auto_merge = allow_task_auto_merge;
 
     let reg = ProviderRegistry::new();
     let router = ModelRouter::from_config(&resolved, reg);
@@ -116,9 +129,7 @@ fn setup_bootstrap(tmp: &TempDir, git_init: bool) -> SessionBootstrap {
         state_dir,
         config: resolved,
         router,
-        driver: Arc::new(OneShotDriver {
-            script: Mutex::new(vec![text_resp("subagent finished the work")].into()),
-        }),
+        driver,
         state_index: None,
         compaction: tekvra_core::CompactionConfig::default(),
         mcp_gateway: None,
@@ -286,4 +297,278 @@ async fn depth_budget_gates_nested_subagent_manager() {
         .expect("entry");
     assert_eq!(entry.depth, 1);
     assert_eq!(entry.status, "completed");
+}
+
+fn tool_call_resp(name: &str, args: serde_json::Value) -> CompletionResponse {
+    CompletionResponse {
+        assistant_message: tekvra_providers::ProviderMessage {
+            role: MessageRole::Assistant,
+            parts: vec![tekvra_providers::MessagePart::ToolCall {
+                call_id: format!("call_{name}"),
+                name: name.to_string(),
+                arguments_json: args.to_string(),
+            }],
+        },
+        stream_deltas: Vec::new(),
+        usage: TokenUsage {
+            input_tokens: 120,
+            cached_input_tokens: 0,
+            output_tokens: 25,
+            reasoning_tokens: 0,
+            cost_usd: 0.0009,
+        },
+        served_by_account: "mock".to_string(),
+    }
+}
+
+/// Serves the child task turn with plain text, then exactly one `task {task_id, merge}`
+/// steering tool_call built from the task id the test stores after spawning; subsequent
+/// parent-loop requests get plain text so the tool loop terminates.
+struct MergeSteerDriver {
+    task_id: Mutex<Option<String>>,
+    merge_verb: &'static str,
+    steered: Mutex<bool>,
+}
+
+impl MergeSteerDriver {
+    fn new(merge_verb: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            task_id: Mutex::new(None),
+            merge_verb,
+            steered: Mutex::new(false),
+        })
+    }
+}
+
+#[async_trait]
+impl ProviderDriver for MergeSteerDriver {
+    async fn complete(
+        &self,
+        _provider: &ProviderDefinition,
+        _model: &ModelCapabilities,
+        _request: &CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let mut spent = self.steered.lock().expect("lock");
+        if *spent {
+            return Ok(text_resp("steering applied"));
+        }
+        let guard = self.task_id.lock().expect("lock");
+        let Some(id) = guard.as_ref() else {
+            return Ok(text_resp("child ok"));
+        };
+        *spent = true;
+        Ok(tool_call_resp(
+            "task",
+            serde_json::json!({ "task_id": id, "merge": self.merge_verb }),
+        ))
+    }
+}
+
+/// Spawns a foreground worktree task whose "work" edits `lib.rs`, commits the worktree,
+/// and stores the task id in the steering driver.
+async fn spawn_committed_worktree_task(
+    mgr: &tekvra_core::SubagentManager,
+    driver: &MergeSteerDriver,
+) -> (String, std::path::PathBuf, String) {
+    let card = mgr
+        .spawn(SubagentSpawnRequest {
+            prompt: "do isolated work".to_string(),
+            role: None,
+            model_override: None,
+            background: false,
+            worktree: true,
+        })
+        .await
+        .expect("spawn worktree task");
+    let tekvra_protocol::ToolOutput::SubagentCard { task_id, .. } = card else {
+        panic!("expected SubagentCard");
+    };
+    let entry = mgr
+        .list()
+        .into_iter()
+        .find(|e| e.task_id == task_id)
+        .expect("task entry");
+    let wt_path = entry.worktree_path.clone().expect("worktree path");
+    let branch = entry.worktree_branch.clone().expect("worktree branch");
+    std::fs::write(wt_path.join("lib.rs"), "fn edited() {}\n").expect("task edit");
+    // Commit the task branch so the probe sees a real branch delta (uncommitted
+    // worktree files are picked up by merge_task, not by `merge-tree`).
+    git(&wt_path, &["add", "-A"]);
+    git(&wt_path, &["commit", "-q", "-m", "task work"]);
+    *driver.task_id.lock().expect("lock") = Some(task_id.clone());
+    (task_id, wt_path, branch)
+}
+
+#[tokio::test]
+async fn auto_merge_requires_opt_in_flag() {
+    let tmp = TempDir::new().expect("tempdir");
+    let driver = MergeSteerDriver::new("auto");
+    let bootstrap = setup_bootstrap_with(&tmp, true, Arc::clone(&driver) as Arc<_>, false);
+    let handle = spawn_session(bootstrap).expect("spawn parent session");
+    let mgr = handle.subagents().expect("subagent manager").clone();
+    let parent_root = parent_workspace(&tmp);
+
+    let (task_id, wt_path, _branch) = spawn_committed_worktree_task(&mgr, &driver).await;
+
+    let mut rx = handle.subscribe();
+    handle
+        .send(tekvra_protocol::SessionCommand::SubmitInput {
+            prompt: "merge the task automatically".to_string(),
+            delivery: tekvra_protocol::InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit");
+    // Tool-level validation errors are fed back to the model as the tool result text
+    // (the turn itself completes); the observable contract is that text.
+    let mut tool_error = None;
+    loop {
+        match rx.recv().await.expect("events") {
+            SessionEvent::ItemCompleted { item_id, text, .. } if item_id.starts_with("call_") => {
+                tool_error = Some(text.clone());
+            }
+            SessionEvent::TurnCompleted { .. } => break,
+            _ => {}
+        }
+    }
+    let err = tool_error.expect("auto-merge without the flag must surface the flag name");
+    assert!(
+        err.contains("allow_task_auto_merge"),
+        "error must name the flag: {err}"
+    );
+    // Nothing merged, nothing destroyed.
+    let entry = mgr
+        .list()
+        .into_iter()
+        .find(|e| e.task_id == task_id)
+        .expect("task entry still present");
+    assert_eq!(entry.status, "completed", "task not merged");
+    assert!(wt_path.exists(), "worktree intact");
+    assert!(!parent_root.join("feature.rs").exists());
+    assert_eq!(
+        std::fs::read_to_string(parent_root.join("lib.rs")).expect("parent lib"),
+        "fn a() {}\n"
+    );
+}
+
+#[tokio::test]
+async fn auto_merge_clean_path_matches_explicit_merge() {
+    let tmp = TempDir::new().expect("tempdir");
+    let driver = MergeSteerDriver::new("auto");
+    let bootstrap = setup_bootstrap_with(&tmp, true, Arc::clone(&driver) as Arc<_>, true);
+    let handle = spawn_session(bootstrap).expect("spawn parent session");
+    let mgr = handle.subagents().expect("subagent manager").clone();
+    let parent_root = parent_workspace(&tmp);
+
+    let (_task_id, wt_path, _branch) = spawn_committed_worktree_task(&mgr, &driver).await;
+
+    let mut rx = handle.subscribe();
+    handle
+        .send(tekvra_protocol::SessionCommand::SubmitInput {
+            prompt: "merge the task automatically".to_string(),
+            delivery: tekvra_protocol::InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit");
+    let mut merge_result = None;
+    loop {
+        match rx.recv().await.expect("events") {
+            SessionEvent::ItemCompleted { item_id, text, .. } if item_id.starts_with("call_") => {
+                merge_result = Some(text.clone());
+            }
+            SessionEvent::TurnCompleted { status, error, .. } => {
+                assert_eq!(status, "completed", "clean auto-merge failed: {error:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    let result = merge_result.expect("clean auto-merge must produce a merged card");
+    assert!(
+        result.contains("(merged)"),
+        "expected merged card: {result}"
+    );
+    // Identical to explicit `merge`: parent tree updated, worktree and branch removed.
+    let lib = std::fs::read_to_string(parent_root.join("lib.rs")).expect("merged lib");
+    assert_eq!(lib, "fn edited() {}\n");
+    assert!(!wt_path.exists(), "worktree removed after clean auto-merge");
+    let merged = mgr
+        .list()
+        .into_iter()
+        .into_iter()
+        .find(|e| e.status == "merged");
+    assert!(merged.is_some(), "one task recorded as merged");
+}
+
+#[tokio::test]
+async fn auto_merge_conflict_reports_without_touching_parent_tree() {
+    let tmp = TempDir::new().expect("tempdir");
+    let driver = MergeSteerDriver::new("auto");
+    let bootstrap = setup_bootstrap_with(&tmp, true, Arc::clone(&driver) as Arc<_>, true);
+    let handle = spawn_session(bootstrap).expect("spawn parent session");
+    let mgr = handle.subagents().expect("subagent manager").clone();
+    let parent_root = parent_workspace(&tmp);
+
+    let (task_id, wt_path, _branch) = spawn_committed_worktree_task(&mgr, &driver).await;
+
+    // Conflicting parent-side commit on the same lines the task edited.
+    std::fs::write(parent_root.join("lib.rs"), "fn parent_wins() {}\n").expect("parent edit");
+    git(&parent_root, &["add", "-A"]);
+    git(
+        &parent_root,
+        &["commit", "-q", "-m", "parent conflicting edit"],
+    );
+
+    let mut rx = handle.subscribe();
+    handle
+        .send(tekvra_protocol::SessionCommand::SubmitInput {
+            prompt: "merge the task automatically".to_string(),
+            delivery: tekvra_protocol::InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit");
+    let mut conflict_card = None;
+    loop {
+        match rx.recv().await.expect("events") {
+            SessionEvent::ItemCompleted {
+                tool_output: Some(tekvra_protocol::ToolOutput::SubagentCard {
+                    status,
+                    summary,
+                    ..
+                }),
+                ..
+            } => {
+                if status == "merge_conflicted" {
+                    conflict_card = Some(summary.clone());
+                }
+            }
+            SessionEvent::TurnCompleted { status, .. } => {
+                assert_eq!(
+                    status, "completed",
+                    "conflict report must not fail the turn"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    let summary = conflict_card.expect("merge_conflicted card reported");
+    assert!(
+        summary.contains("conflicts") && summary.contains("use explicit `merge` or `discard`"),
+        "{summary}"
+    );
+    // Parent tree untouched; worktree and branch preserved for explicit resolution.
+    assert_eq!(
+        std::fs::read_to_string(parent_root.join("lib.rs")).expect("parent lib"),
+        "fn parent_wins() {}\n"
+    );
+    assert!(wt_path.exists(), "worktree intact after conflict report");
+    let entry = mgr
+        .list()
+        .into_iter()
+        .find(|e| e.task_id == task_id)
+        .expect("task entry");
+    assert_ne!(entry.status, "merged", "conflict must not record a merge");
 }

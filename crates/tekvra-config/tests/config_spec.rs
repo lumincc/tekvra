@@ -363,3 +363,57 @@ fn model_fallback_chain_parses_and_defaults_empty() {
             .is_empty()
     );
 }
+
+#[test]
+fn task_auto_merge_and_mcp_http_timeout_keys_parse_with_defaults() {
+    let tmp = TempDir::new().expect("tempdir");
+    let paths = make_test_paths(&tmp);
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join(".git")).expect("create .git");
+
+    // Absent keys: defaults, zero notices.
+    let resolved =
+        load_config(paths.clone(), &repo, &CliConfigOverrides::default()).expect("defaults");
+    assert!(!resolved.settings.agent.allow_task_auto_merge);
+    let server = resolved.settings.mcp_servers.get("slow");
+    assert!(server.is_none());
+
+    fs::write(
+        paths.global_config_dir.join("tekvra.toml"),
+        "version = 2\n[agent]\nallow_task_auto_merge = true\n\n[mcp_servers.slow]\nurl = \"https://mcp.example.com/rpc\"\nhttp_header_timeout_sec = 120\nhttp_idle_timeout_sec = 45\n",
+    )
+    .expect("write toml");
+    let resolved = load_config(paths.clone(), &repo, &CliConfigOverrides::default())
+        .expect("flag + timeouts config");
+    assert!(resolved.settings.agent.allow_task_auto_merge);
+    let server = resolved
+        .settings
+        .mcp_servers
+        .get("slow")
+        .expect("slow server");
+    assert_eq!(server.http_header_timeout_sec, Some(120));
+    assert_eq!(server.http_idle_timeout_sec, Some(45));
+    assert!(
+        resolved.notices.is_empty(),
+        "no notices for valid overrides"
+    );
+
+    // `0` override: loader notice names server+key, no hard failure.
+    fs::write(
+        paths.global_config_dir.join("tekvra.toml"),
+        "version = 2\n\n[mcp_servers.slow]\nurl = \"https://mcp.example.com/rpc\"\nhttp_header_timeout_sec = 0\n",
+    )
+    .expect("write zero toml");
+    let resolved = load_config(paths, &repo, &CliConfigOverrides::default())
+        .expect("zero timeout still loads");
+    let zero_notices: Vec<_> = resolved
+        .notices
+        .iter()
+        .filter(|n| n.code == "invalid_mcp_http_timeout")
+        .collect();
+    assert_eq!(zero_notices.len(), 1, "one notice: {:?}", resolved.notices);
+    assert!(
+        zero_notices[0].message.contains("slow")
+            && zero_notices[0].message.contains("http_header_timeout_sec")
+    );
+}

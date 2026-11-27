@@ -2110,6 +2110,64 @@ impl SessionActor {
                             .map_err(|e| e.to_string())?;
                             return mgr.merge_task(existing_id).await.map_err(|e| e.to_string());
                         }
+                        "auto" => {
+                            // Opt-in resolution: probe in-memory first (never touches the
+                            // index/worktree), then authorize + merge only on the clean
+                            // path. Conflicts report without prompting or mutating —
+                            // "auto" can never resolve to "discard".
+                            if !self.config.settings.agent.allow_task_auto_merge {
+                                return Err(
+                                    "task `merge: \"auto\"` requires `agent.allow_task_auto_merge = true` in global config; use explicit `merge` or `discard`"
+                                        .to_string(),
+                                );
+                            }
+                            let entry =
+                                mgr.list()
+                                    .into_iter()
+                                    .find(|e| e.task_id == existing_id)
+                                    .ok_or_else(|| format!("unknown subagent `{existing_id}`"))?;
+                            let branch = entry.worktree_branch.clone().unwrap_or_default();
+                            let role = entry.role.clone();
+                            match crate::worktree::probe_task_merge(&self.workspace_root, &branch)
+                                .await
+                            {
+                                Ok(()) => {
+                                    let action = tekvra_tools::ToolAction::WriteWorkspace {
+                                        tool_name: "task".to_string(),
+                                        paths,
+                                    };
+                                    tekvra_tools::run_permission_ladder(
+                                        &self.permissions,
+                                        Some(
+                                            &(Arc::clone(&self.bridge)
+                                                as Arc<dyn ApprovalCallback>),
+                                        ),
+                                        Some(&self.state_index),
+                                        call_id,
+                                        &action,
+                                    )
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                    return mgr
+                                        .merge_task(existing_id)
+                                        .await
+                                        .map_err(|e| e.to_string());
+                                }
+                                Err(conflict_note) => {
+                                    let summary = format!(
+                                        "auto: {conflict_note}; use explicit `merge` or `discard`"
+                                    );
+                                    return Ok(tekvra_protocol::ToolOutput::SubagentCard {
+                                        task_id: existing_id.to_string(),
+                                        role,
+                                        status: "merge_conflicted".to_string(),
+                                        summary,
+                                        worktree_branch: Some(branch),
+                                        diff_summary: None,
+                                    });
+                                }
+                            }
+                        }
                         "discard" => {
                             return mgr
                                 .discard_task(existing_id)

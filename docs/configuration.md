@@ -61,6 +61,8 @@ bearer_token_env_var = "DOCS_MCP_TOKEN"
 startup_timeout_sec = 10
 tool_timeout_sec = 30
 session = true        # Streamable-HTTP `Mcp-Session-Id` affinity (default true)
+http_header_timeout_sec = 120   # response-header budget (default 60 s)
+http_idle_timeout_sec = 300     # SSE inter-chunk budget (default 10 s)
 
 [mcp_servers.local_sampler]
 command = "python3"
@@ -72,6 +74,15 @@ mcp_sampling = true   # global gate; sampling without it answers -32603
 ```
 
 Server→client requests are routed: `sampling/createMessage` uses the session's `fast`-role model binding after an interactive approval prompt (usage lands in the ledger under `<rpc_id>_mcp_sampling`); `elicitation/create` becomes interactive questions; unknown methods answer `-32601`.
+
+### HTTP Streaming Timeouts (`http_header_timeout_sec` / `http_idle_timeout_sec`)
+
+Per-server (HTTP `url` servers only) overrides of the streaming budget: `http_header_timeout_sec`
+bounds waiting for the response headers (default 60 s), `http_idle_timeout_sec` bounds the gap
+between SSE body chunks (default 10 s). Slow backends that stream long-running tool results raise
+the idle budget instead of tripping the built-in one; the effective timeout is still clamped by
+`tool_timeout_sec`/`reqwest`'s overall call budget. `0` is rejected at load time with an
+`invalid_mcp_http_timeout` notice and the built-in default applies.
 
 ### Language Servers (`[lsp.<id>]`)
 
@@ -132,6 +143,21 @@ spend_limit_window = "session"        # "session" (default) or "day"
   turn start, no restart needed). Surfaces: the TUI/app-server `thread/tokenUsage/updated`
   payload carries `remainingBudget { limitUsd, spentUsd, remainingUsd }`, and
   `account/rateLimits` reports `spendControlReached`.
+
+## Task Auto-Merge Gate (`agent.allow_task_auto_merge`)
+
+```toml
+[agent]
+allow_task_auto_merge = true   # default: false (merge-back stays explicit)
+```
+
+Opt-in gate for `task { task_id, merge: "auto" }`: when enabled, `"auto"` runs a real merge
+probe (immediately aborted, tree restored), then merges for real if clean — identical to
+`merge: "merge"` — and otherwise reports the conflict (worktree and branch preserved,
+conflicting paths named) without prompting or mutating the parent tree. `"auto"` never
+resolves to `"discard"`; explicit `"merge"` / `"discard"` keep their exact semantics with
+the flag on or off. Permission authorization runs for the resolved verb only (the conflict
+path authorizes nothing), and explicit `deny` rules still win.
 
 ## Model Fallback Chains (`models.fallback`)
 

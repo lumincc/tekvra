@@ -2041,3 +2041,294 @@ async fn memory_store_caps_and_memory_save_ladder() {
         .await;
     assert!(out.is_err(), "deny rule must refuse memory_save");
 }
+
+/// `batch` admits `web_search` (network-bound, read-only) alongside local reads; results
+/// stay ordered; per-sub-call endpoint authorization and deny rules hold; process-spawning
+/// tools stay excluded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_admits_web_search_orders_mixed_results_and_keeps_lsp_out() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(&state).expect("mkdir state");
+    std::fs::write(ws.join("notes.txt"), "NEEDLE_LOCAL\n").expect("write notes");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let page = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    SEARCH_PAGE.len(),
+                    SEARCH_PAGE
+                );
+                let _ = stream.write_all(page.as_bytes()).await;
+            });
+        }
+    });
+    let endpoint = format!("http://{addr}/search");
+
+    let mut ctx = make_ctx(ws.clone(), state, PermissionMode::Build, Vec::new());
+    ctx.settings.websearch_base_url = Some(endpoint.clone());
+    ctx.web_fetcher = tekvra_tools::SafeWebFetcher::new(&["127.0.0.1".to_string()]);
+    ctx.approval_cb = Some(Arc::new(ApprovingCallback {
+        prompts: Mutex::new(Vec::new()),
+    }));
+    let reg = NativeToolRegistry::new();
+
+    // Mixed local + network sub-calls: ordered results.
+    let out = reg
+        .execute(
+            &ctx,
+            "bws1",
+            "batch",
+            &json!({
+                "calls": [
+                    { "tool": "file_grep", "arguments": { "pattern": "NEEDLE_LOCAL" } },
+                    { "tool": "web_search", "arguments": { "query": "tekvra rust agent" } },
+                    { "tool": "file_read", "arguments": { "path": "notes.txt" } }
+                ]
+            }),
+        )
+        .await
+        .expect("mixed batch runs");
+    let text = out.to_model_text();
+    let local_pos = text
+        .find("NEEDLE_LOCAL")
+        .expect("local grep result present");
+    let search_pos = text.find("Example").expect("search result present");
+    let read_pos = text.find("NEEDLE_LOCAL").expect("dup marker");
+    let _ = read_pos;
+    assert!(
+        local_pos < search_pos,
+        "results must stay in submission order: {text}"
+    );
+
+    // Process-spawning tools stay excluded from `batch`.
+    let err = reg
+        .execute(
+            &ctx,
+            "bws2",
+            "batch",
+            &json!({ "calls": [{ "tool": "lsp_diagnostics", "arguments": { "path": "notes.txt" } }] }),
+        )
+        .await
+        .expect_err("lsp_diagnostics must stay out of batch");
+    assert!(err.to_string().contains("only accepts"), "got: {err}");
+
+    // Endpoint deny rules hold inside batch sub-calls.
+    let deny_rules = vec![PermissionRule {
+        tool: "webfetch".to_string(),
+        pattern: endpoint.clone(),
+        action: RuleAction::Deny,
+    }];
+    let mut deny_ctx = make_ctx(
+        ws,
+        tmp.path().join("state2"),
+        PermissionMode::Build,
+        deny_rules,
+    );
+    deny_ctx.settings.websearch_base_url = Some(endpoint);
+    deny_ctx.web_fetcher = tekvra_tools::SafeWebFetcher::new(&["127.0.0.1".to_string()]);
+    deny_ctx.approval_cb = Some(Arc::new(ApprovingCallback {
+        prompts: Mutex::new(Vec::new()),
+    }));
+    let err = reg
+        .execute(
+            &deny_ctx,
+            "bws3",
+            "batch",
+            &json!({ "calls": [{ "tool": "web_search", "arguments": { "query": "q" } }] }),
+        )
+        .await
+        .expect_err("endpoint deny rule must hold inside batch");
+    assert!(
+        err.to_string().contains("denied") || err.to_string().contains("Denied"),
+        "got: {err}"
+    );
+}
+
+fn sse_response(rpc: Value) -> String {
+    let body = format!("data: {rpc}\r\n\r\n");
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// Per-server MCP HTTP streaming timeouts (`http_idle_timeout_sec`) override the built-in
+/// budget: a slower-than-default stream passes with a larger override and still trips the
+/// (overridden) idle timeout when the override is smaller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_http_idle_timeout_is_configurable_per_server() {
+    use indexmap::IndexMap;
+    use tekvra_config::McpServerConfig;
+    use tekvra_tools::ConfiguredMcpGateway;
+
+    const CHUNK_DELAY_MS: u64 = 1200;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).expect("mkdir ws");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                // Read headers, then the Content-Length body.
+                let mut buf = vec![0_u8; 8192];
+                let mut read = 0_usize;
+                let body_start = loop {
+                    let n = stream.read(&mut buf[read..]).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    read += n;
+                    let head = String::from_utf8_lossy(&buf[..read]);
+                    if let Some(pos) = head.find("\r\n\r\n") {
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if read >= pos + 4 + len {
+                            break pos;
+                        }
+                    }
+                };
+                let body = String::from_utf8_lossy(&buf[body_start + 4..read]).to_string();
+                let req: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+                let mid = req.get("id").cloned().unwrap_or(json!(0));
+                let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+                let result = match method {
+                    "initialize" => sse_response(json!({ "jsonrpc": "2.0", "id": mid, "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": { "name": "mock-slow", "version": "1" }
+                    }})),
+                    "tools/list" => {
+                        sse_response(json!({ "jsonrpc": "2.0", "id": mid, "result": { "tools": [
+                            { "name": "slow", "description": "d", "inputSchema": { "type": "object" } }
+                        ]}}))
+                    }
+                    // tools/call: an immediate chunk, then the result after the delay.
+                    // Headers declare the FULL body up front (first event + delayed
+                    // result) so hyper streams bytes as they arrive without framing.
+                    "tools/call" => {
+                        let first = format!(
+                            "data: {}\r\n\r\n",
+                            json!({ "jsonrpc": "2.0", "method": "notifications/progress", "params": {} })
+                        );
+                        let rpc = json!({ "jsonrpc": "2.0", "id": mid, "result": {
+                            "content": [{ "type": "text", "text": "slow-done" }]
+                        }})
+                        .to_string();
+                        let rest = format!("data: {rpc}\r\n\r\n");
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    first.len() + rest.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let _ = stream.write_all(first.as_bytes()).await;
+                        let _ = stream.flush().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(CHUNK_DELAY_MS)).await;
+                        rest
+                    }
+                    _ => sse_response(json!({ "jsonrpc": "2.0", "id": mid, "result": {} })),
+                };
+                let _ = stream.write_all(result.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut servers = IndexMap::new();
+    servers.insert(
+        "slow_srv".to_string(),
+        McpServerConfig {
+            url: Some(format!("http://{addr}/mcp")),
+            enabled: true,
+            http_idle_timeout_sec: Some(1),
+            ..McpServerConfig::default()
+        },
+    );
+
+    // Override smaller than the stream's inter-chunk gap → idle timeout fires.
+    let (gw, report) =
+        ConfiguredMcpGateway::connect_all(&servers, &ws, &AgentSettings::default(), false).await;
+    eprintln!("WARNINGS {:?}", report.warnings);
+    assert_eq!(report.connected_servers, vec!["slow_srv"]);
+    let mut ctx = make_ctx(
+        ws.clone(),
+        tmp.path().join("state"),
+        PermissionMode::Auto,
+        Vec::new(),
+    );
+    ctx.mcp_gateway = Some(gw);
+    let reg = NativeToolRegistry::new();
+    let err = reg
+        .execute(
+            &ctx,
+            "mcp_idle_1",
+            "code",
+            &json!({ "code": "r = mcp_call_sync('slow_srv', 'slow', {})\nprint(r)" }),
+        )
+        .await
+        .expect_err("1s override must trip before the 1.2s chunk");
+    assert!(
+        err.to_string().contains("SSE stream idle timeout"),
+        "got: {err}"
+    );
+
+    // Override larger than the gap → the delayed chunk resolves the call.
+    let mut servers_fast = IndexMap::new();
+    servers_fast.insert(
+        "slow_srv".to_string(),
+        McpServerConfig {
+            url: Some(format!("http://{addr}/mcp")),
+            enabled: true,
+            http_idle_timeout_sec: Some(5),
+            ..McpServerConfig::default()
+        },
+    );
+    let (gw2, _report) =
+        ConfiguredMcpGateway::connect_all(&servers_fast, &ws, &AgentSettings::default(), false)
+            .await;
+    let mut ctx2 = make_ctx(
+        ws,
+        tmp.path().join("state2"),
+        PermissionMode::Auto,
+        Vec::new(),
+    );
+    ctx2.mcp_gateway = Some(gw2);
+    let out = reg
+        .execute(
+            &ctx2,
+            "mcp_idle_2",
+            "code",
+            &json!({ "code": "r = mcp_call_sync('slow_srv', 'slow', {})\nprint(r['content'][0]['text'])" }),
+        )
+        .await
+        .expect("5s override must survive the 1.2s gap");
+    let ToolOutput::CodeExecution { output, .. } = out else {
+        panic!("expected CodeExecution");
+    };
+    assert_eq!(output.trim(), "slow-done");
+}

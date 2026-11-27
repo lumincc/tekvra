@@ -334,7 +334,7 @@ pub fn build_tool_definitions_for_model(model: &ModelCapabilities) -> Vec<ToolDe
                     "worktree": { "type": "boolean", "description": "Run in a dedicated git worktree (branch `tekvra/<task_id>`); merge back later with `merge`." },
                     "task_id": { "type": "string", "description": "Existing task id to steer instead of spawning." },
                     "delivery": { "type": "string", "enum": ["guide", "replace"], "description": "How `prompt` reaches a steered task: queued guidance (default) or replacement." },
-                    "merge": { "type": "string", "enum": ["merge", "discard"], "description": "With `task_id`: merge the worktree branch into the parent tree, or discard the worktree and branch." }
+                    "merge": { "type": "string", "enum": ["merge", "discard", "auto"], "description": "With `task_id`: merge the worktree branch into the parent tree, discard the worktree and branch, or (auto, requires `agent.allow_task_auto_merge`) merge when clean and report conflicts without touching the parent tree." }
                 },
                 "required": ["prompt"]
             }),
@@ -776,12 +776,13 @@ impl NativeToolRegistry {
                     .get("calls")
                     .and_then(Value::as_array)
                     .ok_or_else(|| ToolsError::invalid("`batch` requires `calls` array"))?;
-                const BATCH_ALLOWED_TOOLS: [&str; 5] = [
+                const BATCH_ALLOWED_TOOLS: [&str; 6] = [
                     "file_read",
                     "file_glob",
                     "file_grep",
                     "file_index",
                     "tool_output",
+                    "web_search",
                 ];
                 let sub_ids: Vec<String> =
                     (0..arr.len()).map(|i| format!("{call_id}_b{i}")).collect();

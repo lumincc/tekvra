@@ -433,6 +433,25 @@ pub fn load_config(
         &project_root,
     );
 
+    // 8. Per-server MCP timeout sanity: `0` would make the streaming budget fire
+    //    instantly, so keep the built-in default and tell the user.
+    for (name, server) in &settings.mcp_servers {
+        for (key, value) in [
+            ("http_header_timeout_sec", server.http_header_timeout_sec),
+            ("http_idle_timeout_sec", server.http_idle_timeout_sec),
+        ] {
+            if value == Some(0) {
+                notices.push(ConfigNotice {
+                    code: "invalid_mcp_http_timeout".to_string(),
+                    message: format!(
+                        "`mcp_servers.{name}.{key} = 0` would disable the streaming budget; keeping the built-in default."
+                    ),
+                    path: None,
+                });
+            }
+        }
+    }
+
     Ok(ResolvedConfig {
         paths,
         cwd: canonical_cwd,
