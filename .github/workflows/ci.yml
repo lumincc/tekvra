@@ -103,8 +103,6 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test workspace on Windows
         run: cargo test --locked --workspace --no-fail-fast
-        env:
-          RUST_TEST_NOCAPTURE: 1 # keep diagnostics probes' stdout in the log
       - name: Build tekvra binary on Windows
         run: cargo build --locked --bin tekvra
 

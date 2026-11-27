@@ -51,5 +51,3 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-portable-pty = { workspace = true }
-base64 = { workspace = true }
