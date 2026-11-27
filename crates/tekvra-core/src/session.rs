@@ -15,7 +15,7 @@ use tekvra_protocol::{
 };
 use tekvra_providers::{
     JobRole, MessagePart, MessageRole, ModelRouter, ProviderDriver, ProviderMessage, StreamDelta,
-    ToolDefinition,
+    StreamDeltaSink, ToolDefinition,
 };
 use tekvra_storage::{
     RolloutHeader, RolloutLog, RolloutRecord, SessionSummary, StateIndex, WorkspaceSnapshotStore,
@@ -1024,13 +1024,40 @@ impl SessionActor {
                 None,
             );
 
+            // Emit the assistant item start BEFORE dispatching so hosts can render
+            // live deltas against a stable item id while the stream decodes.
+            let msg_item_id = format!("msg_{}", Uuid::now_v7().simple());
+            let _ = self.event_tx.send(SessionEvent::ItemStarted {
+                thread_id: self.session_id.clone(),
+                turn_id: turn_id.clone(),
+                item_id: msg_item_id.clone(),
+                kind: "agent_message".to_string(),
+            });
+            let delta_event_tx = self.event_tx.clone();
+            let delta_thread_id = self.session_id.clone();
+            let delta_turn_id = turn_id.clone();
+            let delta_item_id = msg_item_id.clone();
+            let on_delta: StreamDeltaSink = Arc::new(move |delta: StreamDelta| {
+                let (channel, text) = match delta {
+                    StreamDelta::TextDelta(text) => ("text", text),
+                    StreamDelta::ReasoningSummaryDelta(text) => ("reasoning_summary", text),
+                };
+                let _ = delta_event_tx.send(SessionEvent::ItemDelta {
+                    thread_id: delta_thread_id.clone(),
+                    turn_id: delta_turn_id.clone(),
+                    item_id: delta_item_id.clone(),
+                    channel: channel.to_string(),
+                    delta: text,
+                });
+            });
+
             let complete_res = tokio::select! {
                 biased;
                 () = cancel_token.cancelled() => {
                     final_status = "interrupted".to_string();
                     break;
                 }
-                res = self.driver.complete(&provider, &model, &req) => res,
+                res = self.driver.complete_streaming(&provider, &model, &req, Some(on_delta)) => res,
             };
 
             let resp = match complete_res {
@@ -1050,37 +1077,8 @@ impl SessionActor {
                 usage: self.cumulative_usage,
             });
 
-            // Stream deltas + assistant item events
-            let msg_item_id = format!("msg_{}", Uuid::now_v7().simple());
-            let _ = self.event_tx.send(SessionEvent::ItemStarted {
-                thread_id: self.session_id.clone(),
-                turn_id: turn_id.clone(),
-                item_id: msg_item_id.clone(),
-                kind: "agent_message".to_string(),
-            });
-            for delta in &resp.stream_deltas {
-                match delta {
-                    StreamDelta::TextDelta(d) => {
-                        let _ = self.event_tx.send(SessionEvent::ItemDelta {
-                            thread_id: self.session_id.clone(),
-                            turn_id: turn_id.clone(),
-                            item_id: msg_item_id.clone(),
-                            channel: "text".to_string(),
-                            delta: d.clone(),
-                        });
-                    }
-                    StreamDelta::ReasoningSummaryDelta(d) => {
-                        let _ = self.event_tx.send(SessionEvent::ItemDelta {
-                            thread_id: self.session_id.clone(),
-                            turn_id: turn_id.clone(),
-                            item_id: msg_item_id.clone(),
-                            channel: "reasoning_summary".to_string(),
-                            delta: d.clone(),
-                        });
-                    }
-                }
-            }
-
+            // Live deltas were already forwarded from `complete_streaming`; only the
+            // completed item is announced here (no duplicate replay after the fact).
             let assistant_text = extract_assistant_text(&resp.assistant_message);
             let _ = self.event_tx.send(SessionEvent::ItemCompleted {
                 thread_id: self.session_id.clone(),

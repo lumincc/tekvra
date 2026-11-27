@@ -115,6 +115,7 @@ fn tool_call_resp(call_id: &str, name: &str, args: serde_json::Value) -> Complet
                     id: format!("rs_{call_id}"),
                     summary: vec!["planning tool call".to_string()],
                     encrypted_content: Some(format!("ENC_BLOB_{call_id}")),
+                    signature: None,
                 },
                 MessagePart::ToolCall {
                     call_id: call_id.to_string(),
@@ -1011,4 +1012,188 @@ async fn skill_invocation_injects_instructions_without_mutating_developer_prefix
         t3.contains("does-not-exist fallback prompt") && !t3.contains("skill_instructions"),
         "unknown skill must leave the prompt unexpanded"
     );
+}
+
+/// Streams two live deltas through the sink, then blocks on a gate that only the
+/// test (after observing those deltas) can open. Proves deltas decode before the
+/// driver future completes.
+struct GatedStreamDriver {
+    gate: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl ProviderDriver for GatedStreamDriver {
+    async fn complete(
+        &self,
+        _provider: &ProviderDefinition,
+        _model: &ModelCapabilities,
+        _request: &CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
+        Ok(text_resp("non-streaming path"))
+    }
+
+    async fn complete_streaming(
+        &self,
+        _provider: &ProviderDefinition,
+        _model: &ModelCapabilities,
+        _request: &CompletionRequest,
+        on_delta: Option<tekvra_providers::StreamDeltaSink>,
+    ) -> Result<CompletionResponse, ProviderError> {
+        if let Some(sink) = &on_delta {
+            sink(StreamDelta::TextDelta("live-1".to_string()));
+            sink(StreamDelta::TextDelta("live-2".to_string()));
+        }
+        // Simulate an in-flight stream: nothing completes until the test proves
+        // it already received both deltas.
+        self.gate.notified().await;
+        let mut resp = text_resp("stream completed");
+        resp.stream_deltas.clear();
+        Ok(resp)
+    }
+}
+
+#[tokio::test]
+async fn complete_streaming_forwards_item_deltas_live_before_turn_completion() {
+    let tmp = TempDir::new().expect("tempdir");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let driver = Arc::new(GatedStreamDriver {
+        gate: Arc::clone(&gate),
+    });
+    let bootstrap = setup_bootstrap(&tmp, driver, PermissionMode::Plan);
+    let handle = spawn_session(bootstrap).expect("spawn session");
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "stream a reply".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit turn");
+
+    let mut saw_item_started = false;
+    let mut live_deltas: Vec<String> = Vec::new();
+    let status = 'completion: {
+        loop {
+            match rx.recv().await.expect("event stream") {
+                SessionEvent::ItemStarted { kind, .. } if kind == "agent_message" => {
+                    saw_item_started = true;
+                }
+                SessionEvent::ItemDelta { delta, .. } => {
+                    assert!(saw_item_started, "ItemStarted must precede live deltas");
+                    live_deltas.push(delta);
+                    if live_deltas.len() == 2 {
+                        // Both deltas decoded while the driver is still blocked inside
+                        // the in-flight stream: open the gate so the turn can finish.
+                        gate.notify_one();
+                    }
+                }
+                SessionEvent::TurnCompleted {
+                    status: turn_status,
+                    ..
+                } => break 'completion turn_status,
+                _ => {}
+            }
+        }
+    };
+
+    assert_eq!(status, "completed");
+    assert_eq!(
+        live_deltas,
+        vec!["live-1".to_string(), "live-2".to_string()]
+    );
+    // No duplicate delta replay after stream completion.
+    let mut post_completion_deltas = 0;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, SessionEvent::ItemDelta { .. }) {
+            post_completion_deltas += 1;
+        }
+    }
+    assert_eq!(
+        post_completion_deltas, 0,
+        "deltas must not be replayed twice"
+    );
+}
+
+/// Blocks forever inside `complete_streaming` to simulate an unbounded SSE body.
+struct HangingStreamDriver;
+
+#[async_trait]
+impl ProviderDriver for HangingStreamDriver {
+    async fn complete(
+        &self,
+        _provider: &ProviderDefinition,
+        _model: &ModelCapabilities,
+        _request: &CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
+        Ok(text_resp("non-streaming path"))
+    }
+
+    async fn complete_streaming(
+        &self,
+        _provider: &ProviderDefinition,
+        _model: &ModelCapabilities,
+        _request: &CompletionRequest,
+        _on_delta: Option<tekvra_providers::StreamDeltaSink>,
+    ) -> Result<CompletionResponse, ProviderError> {
+        // Park forever: the only way the turn can finish is by cancelling the
+        // future (dropping the in-flight HTTP stream).
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let _ = rx.await;
+        unreachable!("driver future must be dropped by cancellation");
+    }
+}
+
+#[tokio::test]
+async fn mid_stream_interrupt_aborts_turn_without_appending_assistant_message() {
+    let tmp = TempDir::new().expect("tempdir");
+    let driver = Arc::new(HangingStreamDriver);
+    let bootstrap = setup_bootstrap(&tmp, driver, PermissionMode::Plan);
+    let handle = spawn_session(bootstrap).expect("spawn session");
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "never finishes".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit turn");
+
+    // Wait for the streaming dispatch to engage (item opened before the call).
+    loop {
+        match rx.recv().await.expect("event stream") {
+            SessionEvent::ItemStarted { kind, .. } if kind == "agent_message" => break,
+            SessionEvent::TurnCompleted { .. } => {
+                panic!("turn must not complete while the stream is parked");
+            }
+            _ => {}
+        }
+    }
+
+    handle
+        .send(SessionCommand::InterruptTurn)
+        .await
+        .expect("interrupt");
+
+    let mut deltas_seen = 0;
+    let status = 'completion: {
+        loop {
+            match rx.recv().await.expect("event stream") {
+                SessionEvent::ItemDelta { .. } => deltas_seen += 1,
+                SessionEvent::TurnCompleted {
+                    status: turn_status,
+                    ..
+                } => break 'completion turn_status,
+                _ => {}
+            }
+        }
+    };
+    assert_eq!(
+        status, "interrupted",
+        "cancelled stream must end interrupted"
+    );
+    assert_eq!(deltas_seen, 0, "no deltas may surface from a parked stream");
 }

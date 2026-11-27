@@ -18,9 +18,10 @@ pub use catalog::{
 };
 pub use driver::{
     CompletionRequest, CompletionResponse, HttpProviderDriver, MessagePart, MessageRole,
-    ProviderDriver, ProviderMessage, StreamDelta, ToolDefinition, build_anthropic_messages_payload,
-    build_chat_completions_payload, build_gemini_payload, build_openai_responses_payload,
-    parse_gemini_body, parse_openai_responses_body, request_has_image,
+    ProviderDriver, ProviderMessage, StreamDelta, StreamDeltaSink, ToolDefinition,
+    build_anthropic_messages_payload, build_chat_completions_payload, build_gemini_payload,
+    build_openai_responses_payload, compute_cost_usd, parse_gemini_body,
+    parse_openai_responses_body, request_has_image,
 };
 
 /// Errors emitted by `tekvra-providers`.

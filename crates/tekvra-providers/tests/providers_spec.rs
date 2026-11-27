@@ -875,3 +875,693 @@ fn providers_toml_vision_override_applies_to_resolved_models() {
         .expect("def");
     assert_eq!(def.supports_vision_override, Some(true));
 }
+
+// ---------------------------------------------------------------------------
+// Incremental SSE streaming, usage/cost extraction, and transient retry backoff
+// ---------------------------------------------------------------------------
+
+fn chat_account(provider: &str, name: &str, token: &str) -> AccountCandidate {
+    AccountCandidate {
+        provider: provider.to_string(),
+        name: name.to_string(),
+        token: SecretToken::new(token),
+        account_id: None,
+        remaining_quota_ratio: 1.0,
+        exhausted: false,
+    }
+}
+
+fn chat_tools() -> Vec<ToolDefinition> {
+    vec![ToolDefinition {
+        name: "file_edit".to_string(),
+        description: "Edit a file".to_string(),
+        parameters: json!({"type": "object"}),
+    }]
+}
+
+#[tokio::test]
+async fn streaming_chat_completions_emits_live_deltas_and_assembles_tool_calls() {
+    use tekvra_providers::StreamDelta;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let captured: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_srv = Arc::clone(&captured);
+    let write2_at: Arc<Mutex<Option<tokio::time::Instant>>> = Arc::new(Mutex::new(None));
+    let write2_srv = Arc::clone(&write2_at);
+
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        let (hdr, body) = read_http_request(&mut sock).await;
+        captured_srv.lock().expect("lock").push((hdr, body));
+        // First delta flushes immediately; the rest arrives only after a visible gap
+        // so the test can prove deltas decode live instead of after EOF.
+        let head = "data: {\"choices\":[{\"delta\":{\"content\":\"Planning \"}}]}\n\n";
+        sock.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{head}"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write head");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let rest = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"edit.\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_z\",\"function\":{\"name\":\"file_edit\",\"arguments\":\"{\\\"pa\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":100},\"completion_tokens\":40,\"completion_tokens_details\":{\"reasoning_tokens\":7}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        sock.write_all(rest.as_bytes()).await.expect("write rest");
+        *write2_srv.lock().expect("lock") = Some(tokio::time::Instant::now());
+    });
+
+    let mut pool = AccountPool::new(0.02);
+    pool.add_account(chat_account("xai", "main", "sk-xai"));
+    let driver = HttpProviderDriver::new(pool);
+    let provider = ProviderDefinition {
+        id: "xai".to_string(),
+        display_name: "xAI".to_string(),
+        base_url: format!("http://{addr}/v1"),
+        default_protocol: WireProtocol::OpenAiChatCompletions,
+        default_api_key_env: None,
+        supports_vision_override: None,
+        headers: BTreeMap::new(),
+        featured_models: Vec::new(),
+    };
+    let caps = tekvra_providers::ModelCapabilities::resolve("xai", "grok-4", None);
+
+    let arrivals: Arc<Mutex<Vec<(tokio::time::Instant, StreamDelta)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let arrivals_sink = Arc::clone(&arrivals);
+    let sink: tekvra_providers::StreamDeltaSink =
+        Arc::new(move |delta: tekvra_providers::StreamDelta| {
+            arrivals_sink
+                .lock()
+                .expect("lock")
+                .push((tokio::time::Instant::now(), delta));
+        });
+
+    let resp = driver
+        .complete_streaming(
+            &provider,
+            &caps,
+            &CompletionRequest {
+                conversation_id: "conv_stream_chat".to_string(),
+                messages: vec![ProviderMessage::user_text("edit the file")],
+                tools: chat_tools(),
+                reasoning_effort: None,
+                output_schema: None,
+            },
+            Some(sink),
+        )
+        .await
+        .expect("streaming chat turn");
+
+    server.await.expect("server");
+    let wrote_rest = write2_at
+        .lock()
+        .expect("lock")
+        .expect("rest write recorded");
+    let arrived = arrivals.lock().expect("lock");
+    assert!(
+        arrived.first().expect("live delta").0 < wrote_rest,
+        "first delta must decode before the server finished its second write"
+    );
+    assert_eq!(arrived.len(), 2, "two content deltas expected: {arrived:?}");
+    drop(arrived);
+
+    // Assembled message: merged prose + fully concatenated tool-call arguments.
+    let parts = &resp.assistant_message.parts;
+    assert_eq!(
+        parts[0],
+        tekvra_providers::MessagePart::Text {
+            text: "Planning edit.".to_string(),
+            cache_breakpoint: false,
+        }
+    );
+    assert_eq!(
+        parts[1],
+        tekvra_providers::MessagePart::ToolCall {
+            call_id: "call_z".to_string(),
+            name: "file_edit".to_string(),
+            arguments_json: r#"{"path":"a.rs"}"#.to_string(),
+        }
+    );
+    // `stream_options.include_usage` must surface the final usage chunk.
+    assert_eq!(resp.usage.input_tokens, 120);
+    assert_eq!(resp.usage.cached_input_tokens, 100);
+    assert_eq!(resp.usage.output_tokens, 40);
+    assert_eq!(resp.usage.reasoning_tokens, 7);
+    assert!(resp.usage.cost_usd > 0.0);
+    // The outbound request must have asked for streaming + usage.
+    let (hdr, body) = &captured.lock().expect("lock")[0];
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(body["stream_options"]["include_usage"], json!(true));
+    assert!(hdr.contains("POST /v1/chat/completions"));
+}
+
+#[tokio::test]
+async fn streaming_anthropic_assembles_thinking_signature_tool_use_and_cache_usage() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let captured: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_srv = Arc::clone(&captured);
+
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        let (hdr, body) = read_http_request(&mut sock).await;
+        captured_srv.lock().expect("lock").push((hdr, body));
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1000,\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":800}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"id\":\"thg_1\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Reasoning step.\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"SIG==\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Here is the plan.\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"file_read\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pa\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"th\\\":\\\"x\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":42}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        sock.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sse}",
+                sse.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write sse");
+    });
+
+    let mut pool = AccountPool::new(0.02);
+    pool.add_account(chat_account("anthropic", "claude-main", "sk-ant-test"));
+    let driver = HttpProviderDriver::new(pool);
+    let provider = ProviderDefinition {
+        id: "anthropic".to_string(),
+        display_name: "Anthropic".to_string(),
+        base_url: format!("http://{addr}/v1"),
+        default_protocol: WireProtocol::AnthropicMessages,
+        default_api_key_env: None,
+        supports_vision_override: None,
+        headers: BTreeMap::new(),
+        featured_models: Vec::new(),
+    };
+    let caps = tekvra_providers::ModelCapabilities::resolve("anthropic", "claude-sonnet-4-5", None);
+
+    let deltas: Arc<Mutex<Vec<tekvra_providers::StreamDelta>>> = Arc::new(Mutex::new(Vec::new()));
+    let deltas_sink = Arc::clone(&deltas);
+    let sink: tekvra_providers::StreamDeltaSink = Arc::new(move |d| {
+        deltas_sink.lock().expect("lock").push(d);
+    });
+
+    let resp = driver
+        .complete_streaming(
+            &provider,
+            &caps,
+            &CompletionRequest {
+                conversation_id: "conv_stream_anthropic".to_string(),
+                messages: vec![
+                    ProviderMessage::developer_cached("Be careful."),
+                    ProviderMessage::user_text("plan it"),
+                ],
+                tools: chat_tools(),
+                reasoning_effort: None,
+                output_schema: None,
+            },
+            Some(sink),
+        )
+        .await
+        .expect("streaming anthropic turn");
+    server.await.expect("server");
+
+    // Signed thinking block + text + tool call, in wire order.
+    let parts = &resp.assistant_message.parts;
+    assert_eq!(
+        parts[0],
+        tekvra_providers::MessagePart::Reasoning {
+            id: "thg_1".to_string(),
+            summary: vec!["Reasoning step.".to_string()],
+            encrypted_content: None,
+            signature: Some("SIG==".to_string()),
+        }
+    );
+    assert_eq!(
+        parts[1],
+        tekvra_providers::MessagePart::Text {
+            text: "Here is the plan.".to_string(),
+            cache_breakpoint: false,
+        }
+    );
+    assert_eq!(
+        parts[2],
+        tekvra_providers::MessagePart::ToolCall {
+            call_id: "toolu_9".to_string(),
+            name: "file_read".to_string(),
+            arguments_json: r#"{"path":"x"}"#.to_string(),
+        }
+    );
+    // Usage: input tokens include cache-creation; cached counts cache reads.
+    assert_eq!(resp.usage.input_tokens, 1850);
+    assert_eq!(resp.usage.cached_input_tokens, 800);
+    assert_eq!(resp.usage.output_tokens, 42);
+    assert!(resp.usage.cost_usd > 0.0);
+    // Live delta ordering: thinking first, then text.
+    let deltas = deltas.lock().expect("lock");
+    assert!(matches!(
+        deltas.first(),
+        Some(tekvra_providers::StreamDelta::ReasoningSummaryDelta(_))
+    ));
+    assert!(matches!(
+        deltas.get(1),
+        Some(tekvra_providers::StreamDelta::TextDelta(t)) if t == "Here is the plan."
+    ));
+    drop(deltas);
+
+    // Request carried `stream: true` with Anthropic auth headers.
+    let (hdr, body) = &captured.lock().expect("lock")[0];
+    assert_eq!(body["stream"], json!(true));
+    assert!(hdr.contains("x-api-key: sk-ant-test"));
+    // Rolling ephemeral cache breakpoint lands on the trailing user turn block.
+    let messages = body["messages"].as_array().expect("messages");
+    let last_msg = messages.last().expect("trailing message");
+    assert_eq!(
+        last_msg["content"]
+            .as_array()
+            .expect("content")
+            .last()
+            .expect("last block")["cache_control"],
+        json!({"type": "ephemeral"})
+    );
+    // Developer system block keeps its own breakpoint.
+    assert_eq!(
+        body["system"][0]["cache_control"],
+        json!({"type": "ephemeral"})
+    );
+}
+
+#[tokio::test]
+async fn streaming_gemini_alt_sse_streams_chunks_and_usage() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let captured: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_srv = Arc::clone(&captured);
+
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        let (hdr, body) = read_http_request(&mut sock).await;
+        captured_srv.lock().expect("lock").push((hdr, body));
+        let sse = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo!\"}]}}],\"usageMetadata\":{\"promptTokenCount\":300,\"cachedContentTokenCount\":100,\"candidatesTokenCount\":12,\"thoughtsTokenCount\":5}}\n\n",
+        );
+        sock.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sse}",
+                sse.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write sse");
+    });
+
+    let mut pool = AccountPool::new(0.02);
+    pool.add_account(chat_account("gemini", "g-main", "sk-g"));
+    let driver = HttpProviderDriver::new(pool);
+    let provider = ProviderDefinition {
+        id: "gemini".to_string(),
+        display_name: "Gemini".to_string(),
+        base_url: format!("http://{addr}/v1beta"),
+        default_protocol: WireProtocol::GeminiGenerateContent,
+        default_api_key_env: None,
+        supports_vision_override: None,
+        headers: BTreeMap::new(),
+        featured_models: Vec::new(),
+    };
+    let caps = tekvra_providers::ModelCapabilities::resolve("gemini", "gemini-2.5-pro", None);
+
+    let resp = driver
+        .complete_streaming(
+            &provider,
+            &caps,
+            &CompletionRequest {
+                conversation_id: "conv_stream_gemini".to_string(),
+                messages: vec![ProviderMessage::user_text("hi")],
+                tools: Vec::new(),
+                reasoning_effort: None,
+                output_schema: None,
+            },
+            None,
+        )
+        .await
+        .expect("streaming gemini turn");
+    server.await.expect("server");
+
+    // One part per chunk (matches the buffered JSON-array parser behavior).
+    assert_eq!(
+        resp.assistant_message.parts,
+        vec![
+            tekvra_providers::MessagePart::Text {
+                text: "Hel".to_string(),
+                cache_breakpoint: false,
+            },
+            tekvra_providers::MessagePart::Text {
+                text: "lo!".to_string(),
+                cache_breakpoint: false,
+            },
+        ]
+    );
+    assert_eq!(resp.stream_deltas.len(), 2);
+    assert_eq!(resp.usage.input_tokens, 300);
+    assert_eq!(resp.usage.cached_input_tokens, 100);
+    assert_eq!(resp.usage.output_tokens, 12);
+    assert_eq!(resp.usage.reasoning_tokens, 5);
+    assert!(resp.usage.cost_usd > 0.0);
+
+    let (hdr, _) = &captured.lock().expect("lock")[0];
+    assert!(
+        hdr.contains(":streamGenerateContent?alt=sse"),
+        "gemini streaming must append alt=sse: {hdr}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_openai_responses_delivers_live_deltas_and_encrypted_reasoning() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let captured: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_srv = Arc::clone(&captured);
+
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        let (hdr, body) = read_http_request(&mut sock).await;
+        captured_srv.lock().expect("lock").push((hdr, body));
+        let sse = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Checking\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello \"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"world\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{",
+            "\"output\":[",
+            "{\"type\":\"reasoning\",\"id\":\"rs_s1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Checking\"}],\"encrypted_content\":\"ENC_S1\"},",
+            "{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello world\"}]}",
+            "],",
+            "\"usage\":{\"input_tokens\":100,\"input_tokens_details\":{\"cached_tokens\":60},\"output_tokens\":20,\"output_tokens_details\":{\"reasoning_tokens\":8}}",
+            "}}\n\n"
+        );
+        sock.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sse}",
+                sse.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write sse");
+    });
+
+    let mut pool = AccountPool::new(0.01);
+    pool.add_account(chat_account("openai", "primary", "sk-test-123"));
+    let driver = HttpProviderDriver::new(pool);
+    let provider = ProviderDefinition {
+        id: "openai".to_string(),
+        display_name: "OpenAI".to_string(),
+        base_url: format!("http://{addr}/v1"),
+        default_protocol: WireProtocol::OpenAiResponses,
+        default_api_key_env: None,
+        supports_vision_override: None,
+        headers: BTreeMap::new(),
+        featured_models: Vec::new(),
+    };
+    let caps = tekvra_providers::ModelCapabilities::resolve("openai", "gpt-5.4-codex", None);
+
+    let deltas: Arc<Mutex<Vec<tekvra_providers::StreamDelta>>> = Arc::new(Mutex::new(Vec::new()));
+    let deltas_sink = Arc::clone(&deltas);
+    let sink: tekvra_providers::StreamDeltaSink = Arc::new(move |d| {
+        deltas_sink.lock().expect("lock").push(d);
+    });
+
+    let resp = driver
+        .complete_streaming(
+            &provider,
+            &caps,
+            &CompletionRequest {
+                conversation_id: "conv_stream_resp".to_string(),
+                messages: vec![ProviderMessage::user_text("hi")],
+                tools: Vec::new(),
+                reasoning_effort: Some("high".to_string()),
+                output_schema: None,
+            },
+            Some(sink),
+        )
+        .await
+        .expect("streaming responses turn");
+    server.await.expect("server");
+
+    // Live deltas arrive in wire order (reasoning first, then text fragments).
+    let deltas = deltas.lock().expect("lock");
+    assert_eq!(
+        &*deltas,
+        &vec![
+            tekvra_providers::StreamDelta::ReasoningSummaryDelta("Checking".to_string()),
+            tekvra_providers::StreamDelta::TextDelta("Hello ".to_string()),
+            tekvra_providers::StreamDelta::TextDelta("world".to_string()),
+        ]
+    );
+    drop(deltas);
+    // Final assembly keeps encrypted reasoning verbatim for stateless replay.
+    let parts = &resp.assistant_message.parts;
+    assert_eq!(
+        parts[0],
+        tekvra_providers::MessagePart::Reasoning {
+            id: "rs_s1".to_string(),
+            summary: vec!["Checking".to_string()],
+            encrypted_content: Some("ENC_S1".to_string()),
+            signature: None,
+        }
+    );
+    assert_eq!(resp.usage.input_tokens, 100);
+    assert_eq!(resp.usage.cached_input_tokens, 60);
+    assert_eq!(resp.usage.reasoning_tokens, 8);
+    assert_eq!(
+        resp.stream_deltas.len(),
+        3,
+        "no duplicate deltas after completion"
+    );
+
+    let (_, body) = &captured.lock().expect("lock")[0];
+    assert_eq!(body["stream"], json!(true));
+}
+
+#[tokio::test]
+async fn streaming_falls_back_to_json_when_server_ignores_stream_hint() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_srv = Arc::clone(&captured);
+
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        let (_, body) = read_http_request(&mut sock).await;
+        captured_srv.lock().expect("lock").push(body);
+        let json_body = serde_json::to_string(&json!({
+            "choices": [{
+                "message": { "content": "Buffered answer." },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 55,
+                "prompt_tokens_details": { "cached_tokens": 40 },
+                "completion_tokens": 9,
+                "completion_tokens_details": { "reasoning_tokens": 2 }
+            }
+        }))
+        .expect("json");
+        sock.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{json_body}",
+                json_body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write json");
+    });
+
+    let mut pool = AccountPool::new(0.02);
+    pool.add_account(chat_account("deepseek", "ds", "sk-ds"));
+    let driver = HttpProviderDriver::new(pool);
+    let provider = ProviderDefinition {
+        id: "deepseek".to_string(),
+        display_name: "DeepSeek".to_string(),
+        base_url: format!("http://{addr}/v1"),
+        default_protocol: WireProtocol::OpenAiChatCompletions,
+        default_api_key_env: None,
+        supports_vision_override: None,
+        headers: BTreeMap::new(),
+        featured_models: Vec::new(),
+    };
+    let caps = tekvra_providers::ModelCapabilities::resolve("deepseek", "deepseek-chat", None);
+
+    let resp = driver
+        .complete_streaming(
+            &provider,
+            &caps,
+            &CompletionRequest {
+                conversation_id: "conv_fallback".to_string(),
+                messages: vec![ProviderMessage::user_text("hi")],
+                tools: Vec::new(),
+                reasoning_effort: None,
+                output_schema: None,
+            },
+            None,
+        )
+        .await
+        .expect("json fallback turn");
+    server.await.expect("server");
+
+    assert_eq!(
+        resp.assistant_message.parts[0],
+        tekvra_providers::MessagePart::Text {
+            text: "Buffered answer.".to_string(),
+            cache_breakpoint: false,
+        }
+    );
+    // Real usage must surface even through the JSON fallback (no more zero-token rows).
+    assert_eq!(resp.usage.input_tokens, 55);
+    assert_eq!(resp.usage.cached_input_tokens, 40);
+    assert_eq!(resp.usage.output_tokens, 9);
+    assert_eq!(resp.usage.reasoning_tokens, 2);
+    assert!(resp.usage.cost_usd > 0.0);
+    assert_eq!(captured.lock().expect("lock")[0]["stream"], json!(true));
+}
+
+#[tokio::test]
+async fn transient_503_and_temporary_429_retries_succeed_within_budget() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let request_count = Arc::new(Mutex::new(0u32));
+    let count_srv = Arc::clone(&request_count);
+
+    let server = tokio::spawn(async move {
+        // 1. Transient upstream 503 with an immediate Retry-After hint.
+        let (mut s1, _) = listener.accept().await.expect("accept 503");
+        let _ = read_http_request(&mut s1).await;
+        let body503 = "{\"error\":{\"message\":\"upstream overloaded\"}}";
+        s1.write_all(
+            format!(
+                "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body503}",
+                body503.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write 503");
+        drop(s1);
+
+        // 2. Temporary single-account 429 without permanent billing markers.
+        let (mut s2, _) = listener.accept().await.expect("accept 429");
+        let _ = read_http_request(&mut s2).await;
+        let body429 = "{\"error\":{\"message\":\"slow down\"}}";
+        s2.write_all(
+            format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body429}",
+                body429.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write 429");
+        drop(s2);
+
+        // 3. Success.
+        let (mut s3, _) = listener.accept().await.expect("accept 200");
+        let (_, req_body) = read_http_request(&mut s3).await;
+        *count_srv.lock().expect("lock") += 3;
+        let _ = req_body;
+        let ok_body = serde_json::to_string(&json!({
+            "choices": [{ "message": { "content": "Recovered." }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 3 }
+        }))
+        .expect("json");
+        s3.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{ok_body}",
+                ok_body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write 200");
+    });
+
+    let mut pool = AccountPool::new(0.02);
+    pool.add_account(chat_account("xai", "only", "sk-x"));
+    let driver = HttpProviderDriver::new(pool);
+    let provider = ProviderDefinition {
+        id: "xai".to_string(),
+        display_name: "xAI".to_string(),
+        base_url: format!("http://{addr}/v1"),
+        default_protocol: WireProtocol::OpenAiChatCompletions,
+        default_api_key_env: None,
+        supports_vision_override: None,
+        headers: BTreeMap::new(),
+        featured_models: Vec::new(),
+    };
+    let caps = tekvra_providers::ModelCapabilities::resolve("xai", "grok-4", None);
+
+    let started = tokio::time::Instant::now();
+    let resp = driver
+        .complete(
+            &provider,
+            &caps,
+            &CompletionRequest {
+                conversation_id: "conv_retry".to_string(),
+                messages: vec![ProviderMessage::user_text("hi")],
+                tools: Vec::new(),
+                reasoning_effort: None,
+                output_schema: None,
+            },
+        )
+        .await
+        .expect("retry recovers");
+    let elapsed = started.elapsed();
+
+    server.await.expect("server");
+    assert_eq!(*request_count.lock().expect("lock"), 3);
+    assert_eq!(
+        resp.assistant_message.parts[0],
+        tekvra_providers::MessagePart::Text {
+            text: "Recovered.".to_string(),
+            cache_breakpoint: false,
+        }
+    );
+    assert_eq!(resp.usage.input_tokens, 10);
+    assert_eq!(resp.usage.output_tokens, 3);
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "Retry-After: 0 must be honored over exponential backoff; took {elapsed:?}"
+    );
+    // The single account must NOT have been marked exhausted by a soft 429.
+    assert!(driver.account_pool_snapshot().select("xai").is_ok());
+}

@@ -1145,7 +1145,10 @@ fn installer_sh_verifies_sha256_and_rejects_mismatch() {
         }
     );
     let archive_name = format!("tekvra-v0.1.0-{target}.tar.gz");
-    let packager = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/ci_verify_packaging.py");
+    let packager = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/ci_verify_packaging.py"
+    );
     let python = find_python_interpreter()
         .expect("python3 or python must be available to package the installer fixture");
     let packaged = StdCommand::new(&python)
@@ -1258,8 +1261,7 @@ fn installer_ps1_verifies_sha256_and_installs_nested_bundle() {
     let payload_dir = tmp.path().join("payload");
     std::fs::create_dir_all(&payload_dir).expect("mkdir payload");
     let payload_path = payload_dir.join("tekvra.exe");
-    let system_root =
-        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     let cmd_exe = std::path::Path::new(&system_root)
         .join("System32")
         .join("cmd.exe");
@@ -1270,7 +1272,10 @@ fn installer_ps1_verifies_sha256_and_installs_nested_bundle() {
     // missing) to x86_64-pc-windows-msvc.
     let target = "x86_64-pc-windows-msvc";
     let archive_name = format!("tekvra-v0.1.0-{target}.zip");
-    let packager = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/ci_verify_packaging.py");
+    let packager = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/ci_verify_packaging.py"
+    );
     let python = find_python_interpreter()
         .expect("python3 or python must be available to package the installer fixture");
     let packaged = StdCommand::new(&python)
@@ -1313,7 +1318,13 @@ fn installer_ps1_verifies_sha256_and_installs_nested_bundle() {
     let mut installer_cmd = |sums: &str| {
         std::fs::write(dist_versioned.join("SHA256SUMS.txt"), sums).expect("write SHA256SUMS.txt");
         StdCommand::new(shell)
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", installer])
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                installer,
+            ])
             .env("TEKVRA_VERSION", "v0.1.0")
             .env("TEKVRA_INSTALL_PREFIX", &prefix)
             .env("TEKVRA_DOWNLOAD_PREFIX", &download_prefix)
@@ -1348,7 +1359,10 @@ fn installer_ps1_verifies_sha256_and_installs_nested_bundle() {
     let installed = prefix.join("bin").join("tekvra.exe");
     let installed_bytes = std::fs::read(&installed).expect("read installed binary");
     let payload_bytes = std::fs::read(&payload_path).expect("read payload binary");
-    assert_eq!(installed_bytes, payload_bytes, "installed binary must match the packaged payload");
+    assert_eq!(
+        installed_bytes, payload_bytes,
+        "installed binary must match the packaged payload"
+    );
     let run = StdCommand::new(&installed)
         .args(["/d", "/c", "echo", "FAKE_TEKVRA"])
         .output()
