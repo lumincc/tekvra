@@ -436,14 +436,17 @@ async fn bash_ast_decomposition_modes_scope_ladders_ssrf_redirects_and_cache_sta
         },
     ];
 
-    // 2. Plan mode blocks `apply_patch` / `file_write` with guidance to use `plan`
+    // 2. Plan mode blocks `apply_patch` / `file_write` with guidance to use `plan`.
+    //    This test asserts bash decomposition semantics (`eval "$FOO"` → once_only),
+    //    so pin the syntax explicitly instead of following the platform shell.
     let mut eval = PermissionEvaluator::new(
         PermissionMode::Plan,
         canon_ws.clone(),
         Some(canon_ws.clone()),
         rules.clone(),
         Vec::new(),
-    );
+    )
+    .with_shell_syntax(ShellSyntax::Bash);
     match eval.evaluate(
         "i1",
         &ToolAction::WriteWorkspace {
