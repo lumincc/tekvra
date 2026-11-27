@@ -472,6 +472,8 @@ async fn websocket_bearer_auth_and_bidirectional_command_approval_and_denial() {
 
     let mut saw_approval_req_1 = false;
     let mut saw_ws_approved_output = false;
+    // Keep every completed item so a failure shows what actually ran.
+    let mut completed_items = Vec::new();
     loop {
         let txt = ws_stream
             .next()
@@ -481,6 +483,9 @@ async fn websocket_bearer_auth_and_bidirectional_command_approval_and_denial() {
             .into_text()
             .expect("text");
         let v: Value = serde_json::from_str(&txt).expect("json");
+        if v.get("method").and_then(Value::as_str) == Some("item/completed") {
+            completed_items.push(v["params"]["item"].clone());
+        }
         if v.get("method").and_then(Value::as_str) == Some("item/commandExecution/requestApproval")
         {
             saw_approval_req_1 = true;
@@ -515,7 +520,7 @@ async fn websocket_bearer_auth_and_bidirectional_command_approval_and_denial() {
     );
     assert!(
         saw_ws_approved_output,
-        "expected approved command to execute"
+        "expected approved command to execute; completed items: {completed_items:?}"
     );
 
     // 4. Turn 2: `turn/start` -> receive `item/commandExecution/requestApproval` -> reply `"decline"`!

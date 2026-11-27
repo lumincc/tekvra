@@ -335,7 +335,15 @@ impl PtySessionManager {
             tokio::time::sleep(Duration::from_millis(20)).await;
         } else {
             let fg_cap_ms = settings.shell_foreground_limit_secs.saturating_mul(1_000);
-            let wait_ms = req.yield_time_ms.min(fg_cap_ms.max(50));
+            // Windows: PowerShell cold start alone can exceed the default 1.5s yield
+            // window, backgrounding even instant commands before the interpreter has
+            // launched. Grant an extra startup allowance (still capped by the
+            // foreground limit).
+            let grace_ms = if cfg!(windows) { 8_000 } else { 0 };
+            let wait_ms = req
+                .yield_time_ms
+                .saturating_add(grace_ms)
+                .min(fg_cap_ms.max(50));
             wait_for_exit_or_timeout(&shared, &notify, Duration::from_millis(wait_ms)).await;
             let mut guard = shared
                 .lock()
