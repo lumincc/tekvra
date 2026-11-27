@@ -1605,16 +1605,21 @@ impl TuiApp {
 
         for (i, entry) in tasks.entries.iter().enumerate() {
             let sel = tasks.selected_index == i + 1;
+            let mut line = format!(
+                "{} {} [role={} model={} status={} depth={}] {}",
+                if sel { "▸" } else { " " },
+                entry.task_id,
+                entry.role,
+                entry.model,
+                entry.status,
+                entry.depth,
+                entry.summary
+            );
+            if let Some(branch) = &entry.worktree_branch {
+                line.push_str(&format!(" [worktree {branch}]"));
+            }
             lines.push(Line::from(Span::styled(
-                format!(
-                    "{} {} [role={} model={} status={}] {}",
-                    if sel { "▸" } else { " " },
-                    entry.task_id,
-                    entry.role,
-                    entry.model,
-                    entry.status,
-                    entry.summary
-                ),
+                line,
                 if sel {
                     Style::default()
                         .fg(Color::Cyan)

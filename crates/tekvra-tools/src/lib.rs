@@ -37,7 +37,7 @@ pub use pty::{
 };
 pub use registry::{
     ApprovalCallback, NativeToolRegistry, QuestionCallback, SessionMcpAuthorizer,
-    ToolExecutionContext, build_tool_definitions_for_model,
+    ToolExecutionContext, build_tool_definitions_for_model, run_permission_ladder,
 };
 pub use web_and_code::{
     McpCallAuthorizer, McpGateway, McpToolDescriptor, MontyCodeSandbox, SafeWebFetcher,

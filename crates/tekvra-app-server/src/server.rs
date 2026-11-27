@@ -1378,6 +1378,7 @@ impl JsonRpcConnection {
             plugin_executor: self.state.plugin_executor.clone(),
             extra_plugin_tools: self.state.extra_plugin_tools.clone(),
             allow_subagents: true,
+            subagent_depth: 0,
         })
         .map_err(|e| (-32603, e.to_string()))
     }

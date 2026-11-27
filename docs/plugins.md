@@ -50,7 +50,37 @@ env = ["CI"]
 
 - `tekvra.api.register_tool({ name, description, parameters, handler })`
 - `tekvra.api.register_command({ name, description, handler })`
+- `tekvra.api.register_hook(event, handler)` — lifecycle hooks; unknown event names are rejected at registration.
 - `tekvra.keymap.set(mode, lhs, description)`
+
+## Lifecycle Hooks
+
+`register_hook` accepts the events `session_start`, `turn_started`, `turn_completed`, `pre_tool_use`, and `post_tool_use` (registration order preserved per event). Handlers receive a payload table (`turn_id`, `status`, `model`; or `tool`, `arguments`, `call_id` for the tool events) and may return:
+
+- `nil` (no-op), a **string** (surfaced in the transcript as a `plugin` steering note), or
+- for `pre_tool_use` only, a table `{ decision = "deny", reason = "..." }` — the tool call is then blocked before any permission prompt or side effect, and the model receives `denied by plugin: <reason>` as its tool result.
+
+Semantics:
+
+- **Failure isolation**: a handler that errors, panics, or exceeds its per-dispatch instruction budget (5M VM instructions) is detached for that invocation; the turn continues and the transcript shows a single `plugin_error` warning naming the failure.
+- **Frame safety**: hook output only ever lands in rollout steering notes and `SteeringInjected` transcript events — never inside the append-only prompt-cache frame.
+- Example — deny destructive shells and annotate writes:
+
+```lua
+tekvra.api.register_hook("pre_tool_use", function(payload)
+    if payload.tool == "exec_command" and payload.arguments:find("rm %-rf") then
+        return { decision = "deny", reason = "rm -rf is not allowed by plugin policy" }
+    end
+    return nil
+end)
+
+tekvra.api.register_hook("post_tool_use", function(payload)
+    if payload.tool == "file_write" then
+        return "wrote " .. payload.arguments
+    end
+    return nil
+end)
+```
 
 ## CLI Flags & Live Reload
 

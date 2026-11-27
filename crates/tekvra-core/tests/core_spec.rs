@@ -181,6 +181,7 @@ fn setup_bootstrap(
         plugin_executor: None,
         extra_plugin_tools: Vec::new(),
         allow_subagents: true,
+        subagent_depth: 0,
     }
 }
 

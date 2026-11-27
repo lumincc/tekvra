@@ -167,6 +167,10 @@ pub enum ToolOutput {
         status: String,
         /// Latest summary text.
         summary: String,
+        /// Worktree branch when the task ran isolated (`worktree: true`).
+        worktree_branch: Option<String>,
+        /// Changed-file summary against the worktree base commit.
+        diff_summary: Option<String>,
     },
     /// Isolated Python `code` execution output.
     CodeExecution {

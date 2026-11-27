@@ -26,7 +26,7 @@ Built on a unified `tokio` + `reqwest` (`rustls` + `aws-lc-rs`) async foundation
 - **Session Durability, Context Compaction, Subagents & Code Review (`tekvra-core`, `tekvra-storage`)**:
   - Append-only JSONL rollouts (`~/.local/share/tekvra/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`) + SQLite WAL metadata index (`state.db`), supporting `resume`, `fork`, and reversible `/undo` across file mutations.
   - Reverse token-budget compaction preserving recent turns and active `plan` state while summarizing older history, plus pruned large tool outputs recoverable via `tool_output`.
-  - Depth-bounded (`max_depth = 1`), concurrency-capped subagent orchestration (`spawn_agent`, `send_input`, `wait_agent`, `close_agent`) and dedicated read-only `/review` (`tekvra review`).
+  - Depth-bounded (`agent.subagent_max_depth`, default `1`) subagent orchestration via the `task` tool and `SubagentManager` (`spawn`/`steer`/`list`, foreground or background, optional worktree isolation with explicit merge-back) and dedicated read-only `/review` (`tekvra review`).
 - **Fullscreen Alt-Screen TUI, Headless `exec`, Codex v2 `app-server` & `acp`**:
   - `ratatui` + `crossterm` Alt-Screen TUI (`tekvra-tui`) with live streaming Markdown, `syntect` syntax highlighting, inline diff hunks, Raw/Filtered tool output toggle (`Ctrl-O`), interactive permission approval modal, UTF-8/CJK cursor-aware composer, `/queue` vs `/steer` mid-turn submission, slash commands (`/help`, `/model`, `/mode`, `/mcp`, `/review`, `/undo`, `/compact`), and opt-in Luau (`mlua` 0.12) custom commands (`experimental.lua_plugins = true`).
   - Non-interactive `tekvra exec` (`text`, `--json` JSONL events, `--output-schema`, `-o`).

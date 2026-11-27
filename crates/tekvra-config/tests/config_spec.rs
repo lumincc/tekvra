@@ -40,6 +40,27 @@ fn fresh_startup_initializes_without_lua_or_custom_files() {
 }
 
 #[test]
+fn subagent_max_depth_defaults_to_one_and_overrides_explicitly() {
+    let tmp = TempDir::new().expect("tempdir");
+    let paths = make_test_paths(&tmp);
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join(".git")).expect("create .git");
+
+    let resolved =
+        load_config(paths.clone(), &repo, &CliConfigOverrides::default()).expect("load defaults");
+    assert_eq!(resolved.settings.agent.subagent_max_depth, 1);
+
+    fs::write(
+        paths.global_config_dir.join("tekvra.toml"),
+        "version = 2\n[agent]\nsubagent_max_depth = 2\n",
+    )
+    .expect("write config");
+    let resolved =
+        load_config(paths, &repo, &CliConfigOverrides::default()).expect("load explicit");
+    assert_eq!(resolved.settings.agent.subagent_max_depth, 2);
+}
+
+#[test]
 fn dotted_cli_overrides_and_profile_precedence() {
     let tmp = TempDir::new().expect("tempdir");
     let paths = make_test_paths(&tmp);

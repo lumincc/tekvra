@@ -1135,6 +1135,7 @@ fn spawn_cli_session(
         plugin_executor,
         extra_plugin_tools,
         allow_subagents: true,
+        subagent_depth: 0,
     })?)
 }
 

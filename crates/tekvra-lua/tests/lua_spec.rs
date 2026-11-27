@@ -197,3 +197,206 @@ tekvra.keymap.set("n", "<C-p>", "ping")
     // Explicitly drop `host` to verify safe RegistryKey cleanup before `mlua::Lua` drop (zero GC panic)
     drop(host);
 }
+
+/// Boots a plugin-enabled host with the given `init.lua` under `<cfg>/lua/hooks/`.
+fn init_hooks_host(tmp: &TempDir, init_lua: &str) -> PluginHost {
+    let ws = tmp.path().join("repo");
+    let cfg_dir = tmp.path().join("cfg");
+    let state_dir = tmp.path().join("state");
+    let plugin_dir = cfg_dir.join("lua").join("hooks");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir ws/.git");
+    std::fs::create_dir_all(&plugin_dir).expect("mkdir plugin");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+
+    std::fs::write(
+        cfg_dir.join("tekvra.toml"),
+        "version = 2\n[experimental]\nlua_plugins = true\n",
+    )
+    .expect("write tekvra.toml");
+    std::fs::write(plugin_dir.join("init.lua"), init_lua).expect("write init.lua");
+
+    let mut trust = TrustStore::load(&state_dir).expect("trust");
+    trust.grant_trust(&ws).expect("grant trust");
+
+    let resolved = load_config(
+        ConfigPaths {
+            global_config_dir: cfg_dir,
+            state_dir,
+            home_dir: Some(ws.clone()),
+        },
+        &ws,
+        &CliConfigOverrides::default(),
+    )
+    .expect("load config");
+
+    let (host, _report) =
+        PluginHost::initialize(resolved, LuaHostOptions::default()).expect("initialize hooks host");
+    host
+}
+
+#[tokio::test]
+async fn hooks_registration_notes_deny_and_failure_isolation() {
+    let tmp = TempDir::new().expect("tempdir");
+    let init_lua = r#"
+tekvra.api.register_hook("post_tool_use", function(payload)
+    return "post:" .. payload.tool
+end)
+
+tekvra.api.register_hook("pre_tool_use", function(payload)
+    if payload.tool == "exec_command" then
+        return { decision = "deny", reason = "shell is forbidden" }
+    end
+    return nil
+end)
+
+tekvra.api.register_hook("turn_started", function(_payload)
+    error("hook handler exploded")
+end)
+
+tekvra.api.register_hook("turn_completed", function(_payload)
+    return nil
+end)
+"#;
+    let host = init_hooks_host(&tmp, init_lua);
+    use tekvra_core::{HookEvent, HookEventPayload};
+
+    // post_tool_use handler returns a note carrying the tool name.
+    let outcome = host.dispatch_hook(
+        HookEvent::PostToolUse,
+        HookEventPayload {
+            tool: Some("file_write".to_string()),
+            arguments: Some("{\"path\":\"a.rs\"}".to_string()),
+            call_id: Some("call_1".to_string()),
+            ..HookEventPayload::default()
+        },
+    );
+    assert!(outcome.denied.is_none());
+    assert_eq!(outcome.notes, vec!["post:file_write".to_string()]);
+    assert!(outcome.failures.is_empty());
+
+    // pre_tool_use denies `exec_command` with the plugin-provided reason.
+    let denied = host.dispatch_hook(
+        HookEvent::PreToolUse,
+        HookEventPayload {
+            tool: Some("exec_command".to_string()),
+            arguments: Some("{\"command\":\"rm -rf build\"}".to_string()),
+            call_id: Some("call_2".to_string()),
+            ..HookEventPayload::default()
+        },
+    );
+    assert_eq!(denied.denied.as_deref(), Some("shell is forbidden"));
+
+    // pre_tool_use passes through for other tools (deny table only for exec_command).
+    let allowed = host.dispatch_hook(
+        HookEvent::PreToolUse,
+        HookEventPayload {
+            tool: Some("file_read".to_string()),
+            arguments: Some("{}".to_string()),
+            call_id: Some("call_3".to_string()),
+            ..HookEventPayload::default()
+        },
+    );
+    assert!(allowed.denied.is_none());
+
+    // turn_completed has only a nil-returning handler: empty outcome.
+    let empty = host.dispatch_hook(
+        HookEvent::TurnCompleted,
+        HookEventPayload {
+            turn_id: Some("turn_x".to_string()),
+            status: Some("completed".to_string()),
+            ..HookEventPayload::default()
+        },
+    );
+    assert!(empty.notes.is_empty() && empty.failures.is_empty() && empty.denied.is_none());
+
+    // turn_started handler raises a Lua error: failure-isolated, never a panic.
+    let failing = host.dispatch_hook(
+        HookEvent::TurnStarted,
+        HookEventPayload {
+            turn_id: Some("turn_y".to_string()),
+            ..HookEventPayload::default()
+        },
+    );
+    assert!(failing.notes.is_empty());
+    assert!(failing.denied.is_none());
+    assert!(
+        failing
+            .failures
+            .iter()
+            .any(|f| f.contains("hook handler exploded")),
+        "{:?}",
+        failing.failures
+    );
+}
+
+#[tokio::test]
+async fn hook_instruction_budget_aborts_runaway_handler() {
+    let tmp = TempDir::new().expect("tempdir");
+    let init_lua = r#"
+tekvra.api.register_hook("turn_started", function(_payload)
+    while true do end
+end)
+"#;
+    let host = init_hooks_host(&tmp, init_lua);
+    use tekvra_core::{HookEvent, HookEventPayload};
+
+    let outcome = host.dispatch_hook(
+        HookEvent::TurnStarted,
+        HookEventPayload {
+            turn_id: Some("turn_z".to_string()),
+            ..HookEventPayload::default()
+        },
+    );
+    assert!(outcome.notes.is_empty() && outcome.denied.is_none());
+    assert!(
+        outcome
+            .failures
+            .iter()
+            .any(|f| f.contains("instruction budget exceeded")),
+        "expected budget abort, got {:?}",
+        outcome.failures
+    );
+    // Failure isolation: the VM stays alive for later dispatches.
+    let after = host.dispatch_hook(HookEvent::SessionStart, HookEventPayload::default());
+    assert!(after.failures.is_empty() && after.notes.is_empty());
+}
+
+#[tokio::test]
+async fn unknown_hook_event_rejected_at_registration_time() {
+    let tmp = TempDir::new().expect("tempdir");
+    let init_lua = r#"
+tekvra.api.register_hook("session_end", function(_payload)
+    return "never"
+end)
+"#;
+    let ws = tmp.path().join("repo");
+    let cfg_dir = tmp.path().join("cfg");
+    let state_dir = tmp.path().join("state");
+    let plugin_dir = cfg_dir.join("lua").join("hooks");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir ws/.git");
+    std::fs::create_dir_all(&plugin_dir).expect("mkdir plugin");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+    std::fs::write(
+        cfg_dir.join("tekvra.toml"),
+        "version = 2\n[experimental]\nlua_plugins = true\n",
+    )
+    .expect("write tekvra.toml");
+    std::fs::write(plugin_dir.join("init.lua"), init_lua).expect("write init.lua");
+    let mut trust = TrustStore::load(&state_dir).expect("trust");
+    trust.grant_trust(&ws).expect("grant trust");
+    let resolved = load_config(
+        ConfigPaths {
+            global_config_dir: cfg_dir,
+            state_dir,
+            home_dir: Some(ws.clone()),
+        },
+        &ws,
+        &CliConfigOverrides::default(),
+    )
+    .expect("load config");
+
+    let err = PluginHost::initialize(resolved, LuaHostOptions::default())
+        .map(|_| ())
+        .expect_err("unknown event must fail plugin load");
+    assert!(err.to_string().contains("unknown hook event"), "got: {err}");
+}

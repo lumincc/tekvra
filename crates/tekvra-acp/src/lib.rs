@@ -171,6 +171,7 @@ where
                     plugin_executor: deps.plugin_executor.clone(),
                     extra_plugin_tools: deps.extra_plugin_tools.clone(),
                     allow_subagents: true,
+                    subagent_depth: 0,
                 })?;
                 let sid = handle.session_id().to_string();
                 sessions

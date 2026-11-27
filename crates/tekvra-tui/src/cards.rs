@@ -178,15 +178,36 @@ pub fn render_tool_card(card: &ToolCardState, selected: bool) -> Vec<Line<'stati
             role,
             status,
             summary,
+            worktree_branch,
+            diff_summary,
         } => {
+            let mut head = format!("{fold_glyph} [task {task_id}] role={role} status={status}");
+            if let Some(branch) = worktree_branch {
+                head.push_str(&format!(" branch={branch}"));
+            }
             lines.push(Line::from(Span::styled(
-                format!("{fold_glyph} [task {task_id}] role={role} status={status}"),
+                head,
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
             )));
             if !card.collapsed && !summary.is_empty() {
                 for l in summary.lines() {
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ".to_string(), Style::default().fg(border_color)),
+                        Span::raw(l.to_string()),
+                    ]));
+                }
+            }
+            if !card.collapsed
+                && let Some(diff) = diff_summary
+                && !diff.is_empty()
+            {
+                lines.push(Line::from(Span::styled(
+                    "  │ worktree changes:".to_string(),
+                    Style::default().fg(border_color),
+                )));
+                for l in diff.lines() {
                     lines.push(Line::from(vec![
                         Span::styled("  │ ".to_string(), Style::default().fg(border_color)),
                         Span::raw(l.to_string()),

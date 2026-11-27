@@ -62,6 +62,8 @@ pub struct AgentSettings {
     pub webfetch_allow_private_hosts: Vec<String>,
     /// Opt-in background session titling (`JobRole::Title`) after the first completed turn.
     pub auto_title: bool,
+    /// Maximum nesting depth for `task` subagents (`1` = children cannot spawn subagents).
+    pub subagent_max_depth: u32,
 }
 
 impl Default for AgentSettings {
@@ -76,6 +78,7 @@ impl Default for AgentSettings {
             shell_env_set: BTreeMap::new(),
             webfetch_allow_private_hosts: Vec::new(),
             auto_title: false,
+            subagent_max_depth: 1,
         }
     }
 }

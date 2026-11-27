@@ -33,6 +33,7 @@ use crate::CoreError;
 use crate::context::{SkillInvocation, expand_prompt_attachments, expand_skill_invocation};
 use crate::frame::{CompactionConfig, Frame, extract_assistant_text};
 use crate::goal_and_review::{accumulate_usage, evaluate_goal};
+use crate::hooks::{HookEvent, HookEventPayload, HookOutcome};
 use crate::steering::{SteeringDetector, ToolFailureTracker};
 use crate::subagents::{
     BackgroundSubagentNotice, SubagentManager, SubagentManagerDeps, SubagentSpawnRequest,
@@ -53,6 +54,14 @@ pub trait PluginToolExecutor: Send + Sync {
         tool_name: &str,
         arguments: &Value,
     ) -> Result<ToolOutput, String>;
+
+    /// Dispatches a lifecycle hook to all handlers registered for `event`
+    /// (`tekvra.api.register_hook`), in registration order. The default outcome
+    /// is empty so hosts without hook support stay no-ops.
+    fn dispatch_hook(&self, event: HookEvent, payload: HookEventPayload) -> HookOutcome {
+        let _ = (event, payload);
+        HookOutcome::default()
+    }
 }
 
 /// Snapshot of live session metadata inspectable synchronously by TUI and `app-server`.
@@ -106,6 +115,8 @@ pub struct SessionBootstrap {
     pub extra_plugin_tools: Vec<ToolDefinition>,
     /// Whether this session exposes the `task` subagent tool.
     pub allow_subagents: bool,
+    /// Nesting depth of this session (`0` = top-level); children spawn at `depth + 1`.
+    pub subagent_depth: u32,
 }
 
 /// Cloneable client handle to a running session actor (`tekvra-tui`, `tekvra-app-server`, `tekvra-acp`, `tekvra exec`).
@@ -288,7 +299,7 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
     let (_, initial_caps) = bootstrap.router.route_for_mode(mode)?;
 
     let existing_rollout = tekvra_storage::rollout_path(&bootstrap.state_dir, &session_id);
-    let (rollout_log, rollout_records) = if existing_rollout.is_file() {
+    let (mut rollout_log, mut rollout_records) = if existing_rollout.is_file() {
         RolloutLog::open_and_recover(&bootstrap.state_dir, &session_id)?
     } else {
         let hdr = RolloutHeader {
@@ -352,6 +363,35 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
     base_tools.extend(bootstrap.extra_plugin_tools.clone());
 
     let developer_instructions = build_developer_instructions(&bootstrap.config, &canonical_ws);
+    // Plugin `session_start` hook: rollout notes only — no live subscribers exist
+    // before the actor loop starts, so transcript events would be lost.
+    if let Some(exec) = &bootstrap.plugin_executor {
+        let outcome = exec.dispatch_hook(HookEvent::SessionStart, HookEventPayload::default());
+        let push_note = |kind: &str,
+                         text: &str,
+                         rollout_log: &mut tekvra_storage::RolloutLog,
+                         rollout_records: &mut Vec<RolloutRecord>| {
+            let record = RolloutRecord::SteeringNote {
+                turn_id: "session_start".to_string(),
+                kind: kind.to_string(),
+                text: text.to_string(),
+            };
+            if rollout_log.append(&record).is_ok() {
+                rollout_records.push(record);
+            }
+        };
+        for note in &outcome.notes {
+            push_note("plugin", note, &mut rollout_log, &mut rollout_records);
+        }
+        for failure in &outcome.failures {
+            push_note(
+                "plugin_error",
+                failure,
+                &mut rollout_log,
+                &mut rollout_records,
+            );
+        }
+    }
     // Resume fidelity: replay persisted turn usage and the latest `plan` tool
     // output so `cumulative_usage` and `plan_markdown` survive a restart.
     let mut restored_usage = TokenUsage::default();
@@ -401,6 +441,7 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
             driver: Arc::clone(&bootstrap.driver),
             state_index: Some(Arc::clone(&state_index)),
             parent_wakeup_tx: subagent_done_tx,
+            depth: bootstrap.subagent_depth,
         })
     });
 
@@ -589,10 +630,19 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
                 }
                 Some(bg_notice) = subagent_done_rx.recv() => {
                     // Idle parent session immediately wakes up on background subagent completion!
-                    let reminder = format!(
+                    let mut reminder = format!(
                         "Background subagent `{}` (role `{}`) finished with status `{}`:\n{}",
                         bg_notice.task_id, bg_notice.role, bg_notice.status, bg_notice.summary
                     );
+                    if let Some(branch) = &bg_notice.worktree_branch {
+                        reminder.push_str(&format!(
+                            "\n\nThe task ran isolated in worktree branch `{branch}`; merge its work into the parent tree with `task {{ task_id: \"{}\", merge: \"merge\" }}` or drop it with `merge: \"discard\"`.",
+                            bg_notice.task_id
+                        ));
+                        if let Some(diff) = &bg_notice.diff_summary {
+                            reminder.push_str(&format!("\n\nchanged files:\n{diff}"));
+                        }
+                    }
                     actor.run_wakeup_turn("background_subagent", reminder).await;
                 }
                 Some(pty_notice) = pty_done_rx.recv() => {
@@ -872,6 +922,7 @@ impl SessionActor {
             turn_id: turn_id.clone(),
             started_at: now,
         });
+        self.dispatch_turn_started_hook(&turn_id);
         let _ = self.append_rollout(RolloutRecord::SteeringNote {
             turn_id: turn_id.clone(),
             kind: reason.to_string(),
@@ -947,6 +998,7 @@ impl SessionActor {
             turn_id: turn_id.clone(),
             started_at: now,
         });
+        self.dispatch_turn_started_hook(&turn_id);
         let _ = self.append_rollout(RolloutRecord::Message {
             turn_id: turn_id.clone(),
             message: user_msg,
@@ -1198,6 +1250,42 @@ impl SessionActor {
                         continue;
                     }
 
+                    // Plugin lifecycle hook: `pre_tool_use` may deny the call before
+                    // any permission prompt or side effect (never burns a prompt).
+                    let plugin_deny_reason = self
+                        .dispatch_hook_with_notes(
+                            &turn_id,
+                            HookEvent::PreToolUse,
+                            HookEventPayload {
+                                tool: Some(tool_name.clone()),
+                                arguments: Some(args_json.clone()),
+                                call_id: Some(call_id.clone()),
+                                ..HookEventPayload::default()
+                            },
+                        )
+                        .denied;
+                    if let Some(reason) = plugin_deny_reason {
+                        let deny_text = format!("denied by plugin: {reason}");
+                        self.record_hook_note(
+                            &turn_id,
+                            "plugin_deny",
+                            &format!("{tool_name}: {reason}"),
+                        );
+                        let _ = self.event_tx.send(SessionEvent::ItemCompleted {
+                            thread_id: self.session_id.clone(),
+                            turn_id: turn_id.clone(),
+                            item_id: call_id.clone(),
+                            text: deny_text.clone(),
+                            tool_output: None,
+                        });
+                        tool_result_parts.push(MessagePart::ToolResult {
+                            call_id,
+                            output: deny_text,
+                            is_error: true,
+                        });
+                        continue;
+                    }
+
                     let exec_res = tokio::select! {
                         biased;
                         () = cancel_token.cancelled() => {
@@ -1262,6 +1350,18 @@ impl SessionActor {
                                 tool_name: tool_name.clone(),
                                 output: output.clone(),
                             });
+                            // Plugin lifecycle hook: `post_tool_use` observes the
+                            // completed call (result already recorded; notes only).
+                            self.dispatch_hook_with_notes(
+                                &turn_id,
+                                HookEvent::PostToolUse,
+                                HookEventPayload {
+                                    tool: Some(tool_name.clone()),
+                                    arguments: Some(args_json.clone()),
+                                    call_id: Some(call_id.clone()),
+                                    ..HookEventPayload::default()
+                                },
+                            );
                             let _ = self.event_tx.send(SessionEvent::ItemCompleted {
                                 thread_id: self.session_id.clone(),
                                 turn_id: turn_id.clone(),
@@ -1436,6 +1536,21 @@ impl SessionActor {
             status: final_status.clone(),
             usage: turn_usage,
         });
+        let active_model_for_hook = self
+            .router
+            .route_for_mode(self.mode)
+            .map(|(_, c)| c.spec)
+            .unwrap_or_else(|_| self.config.settings.model.clone());
+        self.dispatch_hook_with_notes(
+            &turn_id,
+            HookEvent::TurnCompleted,
+            HookEventPayload {
+                turn_id: Some(turn_id.clone()),
+                status: Some(final_status.clone()),
+                model: Some(active_model_for_hook),
+                ..HookEventPayload::default()
+            },
+        );
 
         self.is_turn_running.store(false, Ordering::SeqCst);
         self.sync_shared_state();
@@ -1581,6 +1696,43 @@ impl SessionActor {
                 return Err("subagent `task` tool is disabled in this session".to_string());
             };
             if let Some(existing_id) = args.get("task_id").and_then(Value::as_str) {
+                // Worktree merge-back verbs: `merge` mutates the parent tree, so the
+                // changed paths go through the WriteWorkspace permission ladder first.
+                if let Some(merge_mode) = args.get("merge").and_then(Value::as_str) {
+                    let paths = self
+                        .task_merge_paths(mgr, existing_id)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    match merge_mode {
+                        "merge" => {
+                            let action = tekvra_tools::ToolAction::WriteWorkspace {
+                                tool_name: "task".to_string(),
+                                paths,
+                            };
+                            tekvra_tools::run_permission_ladder(
+                                &self.permissions,
+                                Some(&(Arc::clone(&self.bridge) as Arc<dyn ApprovalCallback>)),
+                                Some(&self.state_index),
+                                call_id,
+                                &action,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                            return mgr.merge_task(existing_id).await.map_err(|e| e.to_string());
+                        }
+                        "discard" => {
+                            return mgr
+                                .discard_task(existing_id)
+                                .await
+                                .map_err(|e| e.to_string());
+                        }
+                        other => {
+                            return Err(format!(
+                                "invalid `merge` value `{other}`; expected `merge` or `discard`"
+                            ));
+                        }
+                    }
+                }
                 let prompt = args
                     .get("prompt")
                     .and_then(Value::as_str)
@@ -1598,6 +1750,8 @@ impl SessionActor {
                     role: "subagent".to_string(),
                     status: "steered".to_string(),
                     summary: format!("Delivered steering update to `{existing_id}`."),
+                    worktree_branch: None,
+                    diff_summary: None,
                 });
             }
             let prompt = args
@@ -1614,12 +1768,17 @@ impl SessionActor {
                 .get("background")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let worktree = args
+                .get("worktree")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             return mgr
                 .spawn(SubagentSpawnRequest {
                     prompt,
                     role,
                     model_override,
                     background,
+                    worktree,
                 })
                 .await
                 .map_err(|e| e.to_string());
@@ -1656,6 +1815,87 @@ impl SessionActor {
             }
             Err(err) => Err(err.to_string()),
         }
+    }
+
+    /// Dispatches the `turn_started` hook with the turn id and routed model spec.
+    fn dispatch_turn_started_hook(&mut self, turn_id: &str) {
+        let model = self
+            .router
+            .route_for_mode(self.mode)
+            .map(|(_, c)| c.spec)
+            .unwrap_or_else(|_| self.config.settings.model.clone());
+        self.dispatch_hook_with_notes(
+            turn_id,
+            HookEvent::TurnStarted,
+            HookEventPayload {
+                turn_id: Some(turn_id.to_string()),
+                model: Some(model),
+                ..HookEventPayload::default()
+            },
+        );
+    }
+
+    /// Dispatches a hook event and records notes/failures as steering notes
+    /// plus `SteeringInjected` transcript events (never model-frame messages).
+    fn dispatch_hook_with_notes(
+        &mut self,
+        turn_id: &str,
+        event: HookEvent,
+        payload: HookEventPayload,
+    ) -> HookOutcome {
+        let Some(exec) = self.plugin_executor.clone() else {
+            return HookOutcome::default();
+        };
+        let outcome = exec.dispatch_hook(event, payload);
+        for note in &outcome.notes {
+            self.record_hook_note(turn_id, "plugin", note);
+        }
+        for failure in &outcome.failures {
+            self.record_hook_note(turn_id, "plugin_error", failure);
+        }
+        outcome
+    }
+
+    /// Records one hook-derived note in the rollout and the live transcript.
+    fn record_hook_note(&mut self, turn_id: &str, kind: &str, text: &str) {
+        let _ = self.append_rollout(RolloutRecord::SteeringNote {
+            turn_id: turn_id.to_string(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+        });
+        let _ = self.event_tx.send(SessionEvent::SteeringInjected {
+            thread_id: self.session_id.clone(),
+            turn_id: turn_id.to_string(),
+            reason: kind.to_string(),
+            message: text.to_string(),
+        });
+    }
+
+    /// Absolute parent-side paths a worktree task would change on merge-back.
+    async fn task_merge_paths(
+        &self,
+        mgr: &SubagentManager,
+        task_id: &str,
+    ) -> Result<Vec<PathBuf>, String> {
+        let entry = mgr
+            .list()
+            .into_iter()
+            .find(|e| e.task_id == task_id)
+            .ok_or_else(|| format!("unknown subagent `{task_id}`"))?;
+        let wt = crate::worktree::TaskWorktree {
+            path: entry
+                .worktree_path
+                .ok_or_else(|| format!("task `{task_id}` did not run in a worktree"))?,
+            branch: entry.worktree_branch.clone().unwrap_or_default(),
+            base_commit: entry.base_commit.clone().unwrap_or_default(),
+        };
+        let rel = crate::worktree::worktree_changes(&wt)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(rel
+            .into_iter()
+            .map(|p| self.workspace_root.join(p))
+            .collect())
     }
 
     fn append_rollout(&mut self, record: RolloutRecord) -> Result<(), CoreError> {

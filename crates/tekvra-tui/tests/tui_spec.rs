@@ -144,6 +144,11 @@ fn scope_ladder_modal_enforces_broad_grant_confirmation_and_tasks_switcher_steer
         background: true,
         status: "running".to_string(),
         summary: "Auditing auth module".to_string(),
+        depth: 1,
+        worktree_path: None,
+        worktree_branch: Some("tekvra/task_abc".to_string()),
+        base_commit: None,
+        diff_summary: None,
     }]);
     app.apply_session_event(SessionEvent::ItemCompleted {
         thread_id: "task_abc".to_string(),

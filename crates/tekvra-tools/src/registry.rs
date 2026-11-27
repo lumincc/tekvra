@@ -289,8 +289,10 @@ pub fn build_tool_definitions_for_model(model: &ModelCapabilities) -> Vec<ToolDe
                     "role": { "type": "string", "description": "Optional subagent role override." },
                     "model": { "type": "string", "description": "Optional model spec override." },
                     "background": { "type": "boolean", "description": "Run without blocking the parent turn." },
+                    "worktree": { "type": "boolean", "description": "Run in a dedicated git worktree (branch `tekvra/<task_id>`); merge back later with `merge`." },
                     "task_id": { "type": "string", "description": "Existing task id to steer instead of spawning." },
-                    "delivery": { "type": "string", "enum": ["guide", "replace"], "description": "How `prompt` reaches a steered task: queued guidance (default) or replacement." }
+                    "delivery": { "type": "string", "enum": ["guide", "replace"], "description": "How `prompt` reaches a steered task: queued guidance (default) or replacement." },
+                    "merge": { "type": "string", "enum": ["merge", "discard"], "description": "With `task_id`: merge the worktree branch into the parent tree, or discard the worktree and branch." }
                 },
                 "required": ["prompt"]
             }),
@@ -717,7 +719,9 @@ impl NativeToolRegistry {
 /// Shared permission evaluation ladder: explicit `allow`/`deny` rules first,
 /// then interactive approval prompts (denying cleanly when no approval callback
 /// is available). Loops so compound shell commands authorize each subcommand.
-async fn run_permission_ladder(
+/// Also used by session-level flows that mutate the workspace outside the
+/// native registry (e.g. `task` worktree merge-back).
+pub async fn run_permission_ladder(
     permissions: &Arc<Mutex<PermissionEvaluator>>,
     approval_cb: Option<&Arc<dyn ApprovalCallback>>,
     state_index: Option<&Arc<Mutex<StateIndex>>>,

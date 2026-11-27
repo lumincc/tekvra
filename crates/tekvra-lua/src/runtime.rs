@@ -5,19 +5,25 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use mlua::chunk::Compiler;
-use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Table, Value as LuaValue};
+use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Table, Value as LuaValue, VmState};
 use serde_json::{Value as JsonValue, json};
 use tekvra_config::ResolvedConfig;
-use tekvra_core::PluginToolExecutor;
+use tekvra_core::{HookEvent, HookEventPayload, HookOutcome, PluginToolExecutor};
 use tekvra_protocol::ToolOutput;
 use tekvra_providers::ToolDefinition;
 
 use crate::LuaHostError;
 use crate::manifest::PluginPermissions;
+
+/// Per-dispatch VM instruction budget for hook handlers (and plugin tool/command
+/// calls): interrupts fire on Luau instruction boundaries and abort the running
+/// call with an error once exhausted, bounding runaway plugins.
+const HOOK_INSTRUCTION_BUDGET: u64 = 5_000_000;
 
 /// CLI/runtime flags controlling [`PluginHost`] initialization.
 #[derive(Debug, Clone, Copy, Default)]
@@ -73,6 +79,10 @@ struct ActiveVmState {
     tools: BTreeMap<String, RegisteredLuaTool>,
     commands: BTreeMap<String, (LuaCommandSpec, RegistryKey)>,
     keymaps: Vec<LuaKeymapSpec>,
+    /// Lifecycle hook handler registry keys, keyed by [`HookEvent::as_str`].
+    hooks: BTreeMap<&'static str, Vec<RegistryKey>>,
+    /// Remaining instruction budget consumed by the VM interrupt callback.
+    hook_budget: Arc<AtomicU64>,
     jit_enabled: bool,
     lua: Lua,
 }
@@ -84,6 +94,11 @@ impl Drop for ActiveVmState {
         }
         for (_, (_, key)) in std::mem::take(&mut self.commands) {
             let _ = self.lua.remove_registry_value(key);
+        }
+        for (_, keys) in std::mem::take(&mut self.hooks) {
+            for key in keys {
+                let _ = self.lua.remove_registry_value(key);
+            }
         }
         let _ = self.lua.gc_collect();
     }
@@ -260,11 +275,30 @@ impl PluginHost {
         lua.set_compiler(compiler.clone());
         lua.sandbox(true)?;
 
+        // Instruction budget enforced via the Luau interrupt callback: the shared
+        // counter is re-armed before every plugin call; exhaustion aborts the call.
+        let hook_budget = Arc::new(AtomicU64::new(HOOK_INSTRUCTION_BUDGET));
+        {
+            let budget_for_interrupt = Arc::clone(&hook_budget);
+            lua.set_interrupt(move |_| {
+                match budget_for_interrupt
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                {
+                    Ok(_) => Ok(VmState::Continue),
+                    Err(_) => Err(mlua::Error::RuntimeError(
+                        "plugin instruction budget exceeded".to_string(),
+                    )),
+                }
+            });
+        }
+
         let shared_tools: Arc<Mutex<BTreeMap<String, RegisteredLuaTool>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
         let shared_cmds: Arc<Mutex<BTreeMap<String, (LuaCommandSpec, RegistryKey)>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
         let shared_keys: Arc<Mutex<Vec<LuaKeymapSpec>>> = Arc::new(Mutex::new(Vec::new()));
+        let shared_hooks: Arc<Mutex<BTreeMap<&'static str, Vec<RegistryKey>>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
 
         let discovered = discover_plugin_targets(&cfg);
         for target in discovered {
@@ -281,6 +315,7 @@ impl PluginHost {
                 Arc::clone(&shared_tools),
                 Arc::clone(&shared_cmds),
                 Arc::clone(&shared_keys),
+                Arc::clone(&shared_hooks),
             )?;
 
             let env = create_plugin_env(&lua, &compiler, &target.plugin_dir, tekvra_tbl)?;
@@ -313,6 +348,11 @@ impl PluginHost {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        let hooks = std::mem::take(
+            &mut *shared_hooks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
 
         report.vm_initialized = true;
         report.jit_enabled = jit_enabled;
@@ -325,6 +365,8 @@ impl PluginHost {
             tools,
             commands,
             keymaps,
+            hooks,
+            hook_budget,
             jit_enabled,
             lua,
         });
@@ -355,6 +397,9 @@ impl PluginToolExecutor for PluginHost {
             .registry_value(&reg_tool.handler_key)
             .map_err(|e| e.to_string())?;
         let lua_args = state.lua.to_value(arguments).map_err(|e| e.to_string())?;
+        state
+            .hook_budget
+            .store(HOOK_INSTRUCTION_BUDGET, Ordering::Relaxed);
         let res: LuaValue = func.call(lua_args).map_err(|e| e.to_string())?;
         let text = match res {
             LuaValue::String(s) => s.to_str().map_err(|e| e.to_string())?.to_string(),
@@ -364,6 +409,95 @@ impl PluginToolExecutor for PluginHost {
             }
         };
         Ok(ToolOutput::Text { text })
+    }
+
+    fn dispatch_hook(&self, event: HookEvent, payload: HookEventPayload) -> HookOutcome {
+        let mut outcome = HookOutcome::default();
+        let guard = self
+            .vm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(state) = guard.as_ref() else {
+            return outcome;
+        };
+        // Registry keys are not `Clone`; iterate in place while holding the VM
+        // lock (same discipline as `execute_plugin_tool`).
+        let handler_count = match state.hooks.get(event.as_str()) {
+            Some(keys) => keys.len(),
+            None => return outcome,
+        };
+        if handler_count == 0 {
+            return outcome;
+        }
+
+        let payload_json = json!({
+            "turn_id": payload.turn_id,
+            "status": payload.status,
+            "model": payload.model,
+            "tool": payload.tool,
+            "arguments": payload.arguments,
+            "call_id": payload.call_id,
+        });
+        let payload_value = match state.lua.to_value(&payload_json) {
+            Ok(v) => v,
+            Err(err) => {
+                outcome
+                    .failures
+                    .push(format!("hook payload encode failed: {err}"));
+                return outcome;
+            }
+        };
+
+        state
+            .hook_budget
+            .store(HOOK_INSTRUCTION_BUDGET, Ordering::Relaxed);
+        for idx in 0..handler_count {
+            let func: Function = match state
+                .hooks
+                .get(event.as_str())
+                .and_then(|keys| keys.get(idx))
+                .map(|key| state.lua.registry_value(key))
+            {
+                Some(Ok(f)) => f,
+                Some(Err(err)) => {
+                    outcome
+                        .failures
+                        .push(format!("handler lookup failed: {err}"));
+                    continue;
+                }
+                None => break,
+            };
+            match func.call::<LuaValue>(payload_value.clone()) {
+                Ok(LuaValue::Nil) => {}
+                Ok(LuaValue::String(note)) => match note.to_str() {
+                    Ok(text) => outcome.notes.push(text.to_string()),
+                    Err(err) => outcome.failures.push(format!("note decode failed: {err}")),
+                },
+                Ok(LuaValue::Table(result)) => {
+                    let decision: Option<String> = result.get("decision").ok();
+                    if decision.as_deref() == Some("deny") {
+                        let reason: String = result.get("reason").unwrap_or_default();
+                        if reason.is_empty() {
+                            outcome
+                                .failures
+                                .push("deny hook returned an empty `reason`".to_string());
+                        } else {
+                            outcome.denied = Some(reason);
+                        }
+                        break;
+                    }
+                }
+                Ok(other) => {
+                    let json_val: JsonValue =
+                        state.lua.from_value(other).unwrap_or(JsonValue::Null);
+                    outcome
+                        .notes
+                        .push(serde_json::to_string(&json_val).unwrap_or_default());
+                }
+                Err(err) => outcome.failures.push(err.to_string()),
+            }
+        }
+        outcome
     }
 }
 
@@ -494,6 +628,7 @@ fn create_plugin_env(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn build_plugin_tekvra_table(
     lua: &Lua,
     _compiler: &Compiler,
@@ -502,6 +637,7 @@ fn build_plugin_tekvra_table(
     tools: Arc<Mutex<BTreeMap<String, RegisteredLuaTool>>>,
     commands: Arc<Mutex<BTreeMap<String, (LuaCommandSpec, RegistryKey)>>>,
     keymaps: Arc<Mutex<Vec<LuaKeymapSpec>>>,
+    hooks: Arc<Mutex<BTreeMap<&'static str, Vec<RegistryKey>>>>,
 ) -> mlua::Result<Table> {
     let tekvra = lua.create_table()?;
 
@@ -558,6 +694,29 @@ fn build_plugin_tekvra_table(
                     let _ = lua_ctx.remove_registry_value(prev_key);
                 }
                 map.insert(name.clone(), (LuaCommandSpec { name, description }, key));
+                Ok(())
+            })?,
+        )?;
+    }
+    {
+        let hooks_ref = Arc::clone(&hooks);
+        api.set(
+            "register_hook",
+            lua.create_function(move |lua_ctx, (event, handler): (String, Function)| {
+                let Some(hook_event) = HookEvent::parse(&event) else {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "unknown hook event `{event}`; expected one of \
+                             session_start, turn_started, turn_completed, \
+                             pre_tool_use, post_tool_use"
+                    )));
+                };
+                let key = lua_ctx.create_registry_value(handler)?;
+                hooks_ref
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(hook_event.as_str())
+                    .or_default()
+                    .push(key);
                 Ok(())
             })?,
         )?;

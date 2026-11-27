@@ -5,9 +5,11 @@
 pub mod context;
 pub mod frame;
 pub mod goal_and_review;
+pub mod hooks;
 pub mod session;
 pub mod steering;
 pub mod subagents;
+pub mod worktree;
 
 use thiserror::Error;
 
@@ -19,6 +21,7 @@ pub use frame::{CompactionConfig, Frame, FrameSnapshot};
 pub use goal_and_review::{
     GoalVerdict, ReviewOutcome, ReviewTarget, collect_review_diff, evaluate_goal, run_code_review,
 };
+pub use hooks::{HookEvent, HookEventPayload, HookOutcome};
 pub use session::{
     PluginToolExecutor, SessionBootstrap, SessionHandle, SessionRuntimeState, spawn_session,
 };

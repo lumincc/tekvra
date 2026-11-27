@@ -23,6 +23,11 @@ All built-in tools live in `crates/tekvra-tools` and operate with zero Lua runti
   - `ConfiguredMcpGateway` connects enabled `[mcp_servers.<name>]` entries over child-process `stdio` JSON-RPC 2.0 (`initialize`, `notifications/initialized`, `tools/list`, `tools/call`) and remote HTTP JSON-RPC 2.0 `POST` endpoints with bounded startup/call timeouts.
   - Connected MCP tools are listed (`mcp_list()`) and called (`await mcp_call(...)` / `mcp_call_sync(...)`) from `code`—and surfaced in `/mcp` and `mcpServerStatus/list`—without mutating top-level LLM `ToolDefinition` schemas when MCP servers connect or change.
   - MCP calls issued from `code` authorize through the same session permission ladder as top-level tools: in `Build` mode an uncovered call prompts interactively via `ApprovalCallback` (async, non-blocking the sandbox service loop) and fails closed when no approval host is attached; `deny` rules still win in every mode.
+- **Durable Subagent Tasks (`task`)**:
+  - `task { prompt, role?, model?, background? }` spawns a steerable subagent session with its own rollout; `task { task_id, prompt, delivery? }` steers (`guide` default, `replace` preempts) via the same tool or `/tasks` (`Ctrl-X`).
+  - `worktree: true` runs the child inside a dedicated `git worktree` (`<state_dir>/worktrees/<repo-slug>/<task_id>` on branch `tekvra/<task_id>`, baselined at the parent's HEAD) so concurrent tasks never race the parent tree; running outside a Git repository rejects the call before any session spawns.
+  - Completion reports the branch plus a changed-file summary; merge-back is explicit: `task { task_id, merge: "merge" }` commits the worktree and merges `--no-ff` into the parent branch (conflicts abort cleanly with both trees intact), `merge: "discard"` removes the worktree and branch. The `merge` verb authorizes the changed paths through the `WriteWorkspace` permission ladder (Build-mode prompts, `deny` rules win).
+  - Nesting is depth-budgeted (`agent.subagent_max_depth`, default `1`): a subagent may spawn its own tasks only when its depth is still under the configured budget; `allow_subagents: false` (or exhausted budget) strips the `task` tool from the child roster entirely.
 
 ## 2. Consent-Driven Execution & Safety Model (No Kernel Sandbox)
 
