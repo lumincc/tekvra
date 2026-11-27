@@ -970,3 +970,62 @@ async fn streamable_http_sse_mcp_bearer_auth_and_list_changed_catalog_refresh() 
         "tools/list_changed catalog refresh must never mutate top-level LLM tool schemas"
     );
 }
+
+/// Windows-only ConPTY diagnostics: prints what the PTY captures for cmd.exe, PowerShell
+/// and python probes so CI logs show where output capture breaks. Always passes; read the
+/// test's stdout in the CI log. Remove once the Windows shell backend is proven.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_pty_capture_diagnostics() {
+    use tekvra_protocol::ToolOutput;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("repo");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&ws).expect("mkdir");
+    let ctx = make_ctx(ws, state, PermissionMode::Build, Vec::new());
+    let reg = NativeToolRegistry::new();
+
+    let probes: &[(&str, &str)] = &[
+        ("cmd", "cmd /c echo CMD_PROBE_OK"),
+        ("pwsh_present", ""),
+        ("ps", "Write-Output PS_PROBE_OK"),
+        ("ps_quoted", "Write-Output 'PS QUOTED OK'"),
+        ("python", "python -c \"print('PY_PROBE_OK')\""),
+    ];
+
+    for (label, cmd) in probes {
+        if *label == "pwsh_present" {
+            let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|dir| dir.join("pwsh.exe"))
+                .find(|candidate| candidate.is_file())
+                .is_some();
+            println!("PROBE pwsh_present: {found}");
+            continue;
+        }
+        let started = std::time::Instant::now();
+        let out = reg
+            .execute(
+                &ctx,
+                &format!("diag_{label}"),
+                "exec_command",
+                &json!({ "cmd": cmd, "yield_time_ms": 8000 }),
+            )
+            .await;
+        match out {
+            Ok(ToolOutput::Terminal {
+                exit_code,
+                raw_output,
+                filtered_output,
+                session_id,
+                ..
+            }) => {
+                println!(
+                    "PROBE {label}: elapsed_ms={} exit={exit_code:?} running_sid={session_id:?} raw={raw_output:?} filtered={filtered_output:?}",
+                    started.elapsed().as_millis()
+                );
+            }
+            other => println!("PROBE {label}: ERROR {other:?}"),
+        }
+    }
+}
