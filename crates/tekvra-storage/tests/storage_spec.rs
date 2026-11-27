@@ -316,3 +316,101 @@ fn multi_turn_workspace_snapshots_fork_and_atomic_conversation_plus_files_revert
         RolloutLog::read_records_readonly(&state_dir, &branch_id).expect("read abandoned branch");
     assert_eq!(branch_records.len(), current_records.len());
 }
+
+#[test]
+fn usage_aggregates_group_by_model_day_session_with_windows_and_empty_zeros() {
+    let tmp = TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let index = StateIndex::open(&state_dir).expect("open StateIndex");
+
+    // Empty ledger: aggregate + rows + totals_since all return zero-shapes.
+    let empty = index
+        .usage_aggregate(None, tekvra_storage::UsageGroupBy::Model)
+        .expect("empty aggregate");
+    assert!(empty.is_empty());
+    assert!(index.usage_rows_since(None).expect("empty rows").is_empty());
+    let totals = index.usage_totals_since(0).expect("empty totals");
+    assert_eq!(totals.input_tokens, 0);
+    assert_eq!(totals.cost_usd, 0.0);
+
+    // Seed two sessions across two local days and two models.
+    let tu = |i: u64, cost: f64| TokenUsage {
+        input_tokens: i * 100,
+        cached_input_tokens: i * 10,
+        output_tokens: i,
+        reasoning_tokens: 0,
+        cost_usd: cost,
+    };
+    // Day A: two turns on model-a/session-1, one on model-b/session-2.
+    index
+        .record_usage("thr_a", "t1", "prov/model-a", &tu(2, 0.010), 1_700_000_000)
+        .expect("seed");
+    index
+        .record_usage("thr_a", "t2", "prov/model-a", &tu(1, 0.002), 1_700_000_100)
+        .expect("seed");
+    index
+        .record_usage("thr_b", "t1", "prov/model-b", &tu(4, 0.020), 1_700_000_200)
+        .expect("seed");
+    // Day B (next day): model-a on session-1.
+    index
+        .record_usage(
+            "thr_a",
+            "t3",
+            "prov/model-a",
+            &tu(3, 0.003),
+            1_700_000_000 + 86_400,
+        )
+        .expect("seed");
+
+    // Group by model: model-b first (highest cost), totals merge both days.
+    let by_model = index
+        .usage_aggregate(None, tekvra_storage::UsageGroupBy::Model)
+        .expect("by model");
+    assert_eq!(by_model.len(), 2);
+    assert_eq!(by_model[0].key, "prov/model-b");
+    assert!((by_model[0].cost_usd - 0.020).abs() < 1e-9);
+    assert_eq!(by_model[1].key, "prov/model-a");
+    assert_eq!(by_model[1].input_tokens, (2 + 1 + 3) * 100);
+    assert!((by_model[1].cost_usd - 0.015).abs() < 1e-9);
+
+    // Group by day: exactly two rows; day A holds all three early turns (0.010+0.002+0.020),
+    // day B holds the next-day turn. Ordered by descending cost.
+    let by_day = index
+        .usage_aggregate(None, tekvra_storage::UsageGroupBy::Day)
+        .expect("by day");
+    assert_eq!(by_day.len(), 2);
+    assert!((by_day[0].cost_usd - 0.032).abs() < 1e-9);
+    assert!((by_day[1].cost_usd - 0.003).abs() < 1e-9);
+
+    // Group by session.
+    let by_session = index
+        .usage_aggregate(None, tekvra_storage::UsageGroupBy::Session)
+        .expect("by session");
+    assert_eq!(by_session.len(), 2);
+    assert!(by_session.iter().any(|r| r.key == "thr_a"));
+    assert!(by_session.iter().any(|r| r.key == "thr_b"));
+
+    // Full-row export keeps per-turn fields, newest first.
+    let rows = index.usage_rows_since(None).expect("rows");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].turn_id, "t3");
+    assert_eq!(rows[3].turn_id, "t1");
+
+    // A 1-day window ending "now" excludes the seeded (2023) records entirely.
+    let recent = index
+        .usage_aggregate(Some(1), tekvra_storage::UsageGroupBy::Model)
+        .expect("windowed");
+    assert!(recent.is_empty());
+    let totals_recent = index
+        .usage_totals_since(1_700_000_000)
+        .expect("totals since");
+    assert_eq!(totals_recent.input_tokens, (2 + 1 + 4 + 3) * 100);
+    assert!((totals_recent.cost_usd - 0.035).abs() < 1e-9);
+
+    // delete_session keeps ledger rows (spec'd retention) — aggregates unchanged.
+    index.delete_session("thr_b").expect("delete session");
+    let by_model_after = index
+        .usage_aggregate(None, tekvra_storage::UsageGroupBy::Model)
+        .expect("by model after delete");
+    assert_eq!(by_model_after.len(), 2);
+}

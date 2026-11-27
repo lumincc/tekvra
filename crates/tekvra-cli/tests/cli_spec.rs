@@ -1272,7 +1272,44 @@ fn installer_ps1_verifies_sha256_and_installs_nested_bundle() {
 
     // The packager fixture only builds the x86_64 archive, so on ARM64 hosts
     // this exercises install.ps1's documented fall-back from aarch64 (probed,
-    // missing) to x86_64-pc-windows-msvc.
+    // missing) to x86_64-pc-windows-msvc. On ARM64 hosts we ALSO package the
+    // native aarch64 archive with a distinct payload and assert the installer
+    // picks it over the x86_64 fallback.
+    let arm64_host = std::env::var("PROCESSOR_ARCHITECTURE")
+        .map(|v| v.eq_ignore_ascii_case("ARM64"))
+        .unwrap_or(false);
+    let arm64_payload_path = payload_dir.join("tekvra-arm64.exe");
+    let arm64_archive_name = "tekvra-v0.1.0-aarch64-pc-windows-msvc.zip";
+    if arm64_host {
+        // A DIFFERENT PE than the x86_64 payload so the byte-comparison can tell
+        // which archive the installer actually pulled.
+        let ps_exe = std::path::Path::new(&system_root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        std::fs::copy(&ps_exe, &arm64_payload_path).expect("copy powershell.exe as arm64 payload");
+        let packaged_arm = StdCommand::new(&python)
+            .args([
+                packager,
+                "--package-release",
+                "--version",
+                "v0.1.0",
+                "--target",
+                "aarch64-pc-windows-msvc",
+                "--binary",
+            ])
+            .arg(&arm64_payload_path)
+            .arg("--out-dir")
+            .arg(&dist_versioned)
+            .output()
+            .expect("run ci_verify_packaging.py --package-release (arm64)");
+        assert!(
+            packaged_arm.status.success(),
+            "arm64 packaging fixture failed: {}",
+            String::from_utf8_lossy(&packaged_arm.stderr)
+        );
+    }
     let target = "x86_64-pc-windows-msvc";
     let archive_name = format!("tekvra-v0.1.0-{target}.zip");
     let packager = concat!(
@@ -1361,15 +1398,33 @@ fn installer_ps1_verifies_sha256_and_installs_nested_bundle() {
     );
     let installed = prefix.join("bin").join("tekvra.exe");
     let installed_bytes = std::fs::read(&installed).expect("read installed binary");
+    // ARM64 host with both archives present: the installer must pick the NATIVE
+    // aarch64 payload, not the x86_64 fallback.
+    if arm64_host {
+        let arm64_bytes = std::fs::read(&arm64_payload_path).expect("read arm64 payload");
+        assert_eq!(
+            installed_bytes, arm64_bytes,
+            "ARM64 host must install the native aarch64 payload"
+        );
+    }
     let payload_bytes = std::fs::read(&payload_path).expect("read payload binary");
-    assert_eq!(
-        installed_bytes, payload_bytes,
-        "installed binary must match the packaged payload"
-    );
-    let run = StdCommand::new(&installed)
-        .args(["/d", "/c", "echo", "FAKE_TEKVRA"])
-        .output()
-        .expect("run installed binary");
+    if !arm64_host {
+        assert_eq!(
+            installed_bytes, payload_bytes,
+            "installed binary must match the packaged payload"
+        );
+    }
+    let run = if arm64_host {
+        StdCommand::new(&installed)
+            .args(["-NoProfile", "-Command", "echo FAKE_TEKVRA"])
+            .output()
+            .expect("run installed arm64 binary")
+    } else {
+        StdCommand::new(&installed)
+            .args(["/d", "/c", "echo", "FAKE_TEKVRA"])
+            .output()
+            .expect("run installed binary")
+    };
     assert!(String::from_utf8_lossy(&run.stdout).contains("FAKE_TEKVRA"));
 }
 
@@ -1443,4 +1498,200 @@ async fn headless_exec_resolves_question_tool_prompts_without_hanging() {
         stdout.contains("QUESTION_RESOLVED_HEADLESS"),
         "turn must continue past the question: {stdout}"
     );
+}
+
+#[tokio::test]
+async fn usage_subcommand_reports_table_json_and_csv_from_seeded_ledger() {
+    let tmp = TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+
+    // Seed the ledger through the storage API (same DB the CLI reads).
+    let index = tekvra_storage::StateIndex::open(&state_dir).expect("open state");
+    let tu = |i: u64, cost: f64| tekvra_protocol::TokenUsage {
+        input_tokens: i * 100,
+        cached_input_tokens: i * 50,
+        output_tokens: i,
+        reasoning_tokens: 0,
+        cost_usd: cost,
+    };
+    index
+        .record_usage(
+            "thr_alpha",
+            "turn_1",
+            "prov/model-a",
+            &tu(2, 0.010),
+            1_700_000_000,
+        )
+        .expect("seed");
+    index
+        .record_usage(
+            "thr_alpha",
+            "turn_2",
+            "prov/model-a",
+            &tu(1, 0.002),
+            1_700_000_100,
+        )
+        .expect("seed");
+    index
+        .record_usage(
+            "thr_beta",
+            "turn_1",
+            "prov/model-b",
+            &tu(4, 0.020),
+            1_700_000_200,
+        )
+        .expect("seed");
+
+    let bin = env!("CARGO_BIN_EXE_tekvra");
+    let run = |args: &[&str]| {
+        Command::new(bin)
+            .current_dir(tmp.path())
+            .env("TEKVRA_STATE_DIR", &state_dir)
+            .env("TEKVRA_CONFIG_DIR", tmp.path().join("cfg"))
+            .args(args)
+            .output()
+    };
+
+    // Table: model grouping (default), cost-descending, 4-decimal costs.
+    let table = run(&["usage"]).await.expect("run usage");
+    assert!(table.status.success(), "usage exit must be 0");
+    let stdout = String::from_utf8_lossy(&table.stdout);
+    assert!(stdout.contains("KEY"), "header row expected: {stdout}");
+    assert!(
+        stdout.contains("prov/model-b"),
+        "top-cost row first: {stdout}"
+    );
+    assert!(
+        stdout.contains("prov/model-a"),
+        "model-a row present: {stdout}"
+    );
+    assert!(
+        stdout.contains("0.0200"),
+        "cost formatted to 4 decimals: {stdout}"
+    );
+    assert!(stdout.contains("0.0120"), "model-a merged cost: {stdout}");
+
+    // JSON shape.
+    let js = run(&["usage", "--json"]).await.expect("run usage json");
+    assert!(js.status.success());
+    let parsed: Value = serde_json::from_slice(&js.stdout).expect("parse json");
+    assert_eq!(parsed["by"], "model");
+    assert!(parsed["days"].is_null());
+    let rows = parsed["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["key"], "prov/model-b");
+    assert_eq!(rows[0]["input_tokens"], 400);
+    assert!((rows[0]["cost_usd"].as_f64().expect("cost") - 0.020).abs() < 1e-9);
+
+    // Session grouping surfaces both sessions.
+    let sess = run(&["usage", "--by", "session"])
+        .await
+        .expect("by session");
+    assert!(sess.status.success());
+    let sess_out = String::from_utf8_lossy(&sess.stdout);
+    assert!(sess_out.contains("thr_alpha") && sess_out.contains("thr_beta"));
+
+    // CSV export round-trips full per-turn fields.
+    let csv_path = tmp.path().join("usage.csv");
+    let csv = run(&["usage", "--csv", csv_path.to_str().expect("utf8")])
+        .await
+        .expect("run usage csv");
+    assert!(csv.status.success());
+    let csv_out = String::from_utf8_lossy(&csv.stdout);
+    assert!(
+        csv_out.contains("wrote 3 usage rows"),
+        "summary line: {csv_out}"
+    );
+    let body = std::fs::read_to_string(&csv_path).expect("read csv");
+    let mut lines = body.lines();
+    assert_eq!(
+        lines.next(),
+        Some(
+            "session_id,turn_id,model,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,cost_usd,recorded_at"
+        )
+    );
+    assert!(lines.count() == 3, "three data rows");
+
+    // Empty state dir -> graceful zero output.
+    let empty_dir = tmp.path().join("empty_state");
+    std::fs::create_dir_all(&empty_dir).expect("mkdir empty");
+    let empty = Command::new(bin)
+        .current_dir(tmp.path())
+        .env("TEKVRA_STATE_DIR", &empty_dir)
+        .env("TEKVRA_CONFIG_DIR", tmp.path().join("cfg"))
+        .args(["usage"])
+        .output()
+        .await
+        .expect("run empty usage");
+    assert!(empty.status.success());
+    let empty_out = String::from_utf8_lossy(&empty.stdout);
+    assert!(
+        empty_out.contains("no usage recorded"),
+        "empty body: {empty_out}"
+    );
+}
+
+/// `tekvra doctor` reports parseable JSON checks (healthy state) and exits non-zero with a
+/// failing check when the global config is unparseable.
+#[tokio::test]
+async fn doctor_reports_checks_and_fails_on_broken_config() {
+    let bin = env!("CARGO_BIN_EXE_tekvra");
+    let tmp = TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cfg_dir = tmp.path().join("cfg");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+    std::fs::create_dir_all(&cfg_dir).expect("mkdir cfg");
+
+    // Healthy: garbage-free config dir, seeded state dir.
+    let out = Command::new(bin)
+        .args(["doctor", "--json"])
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("NO_PROXY", "*")
+        .output()
+        .await
+        .expect("run doctor");
+    assert!(
+        out.status.success(),
+        "doctor stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let parsed: Value = serde_json::from_slice(&out.stdout).expect("doctor json parses");
+    assert_eq!(parsed["healthy"], json!(true));
+    let checks = parsed["checks"].as_array().expect("checks array");
+    let names: Vec<&str> = checks.iter().filter_map(|c| c["name"].as_str()).collect();
+    assert!(names.contains(&"config"), "has config check: {names:?}");
+    assert!(
+        names.iter().any(|n| n.starts_with("state.db")),
+        "has state.db check"
+    );
+    assert!(
+        checks
+            .iter()
+            .all(|c| c["status"] == "ok" || c["status"] == "warn"),
+        "healthy run has no fail entries"
+    );
+
+    // Broken: invalid TOML in the global config → config check fails, exit non-zero.
+    std::fs::write(cfg_dir.join("tekvra.toml"), "version = 2\n[models\n").expect("write bad toml");
+    let out = Command::new(bin)
+        .args(["doctor", "--json"])
+        .env("TEKVRA_STATE_DIR", &state_dir)
+        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
+        .env("NO_PROXY", "*")
+        .output()
+        .await
+        .expect("run doctor broken");
+    assert!(!out.status.success(), "broken config must exit non-zero");
+    let parsed: Value =
+        serde_json::from_slice(&out.stdout).expect("broken doctor still prints json");
+    assert_eq!(parsed["healthy"], json!(false));
+    let config_check = parsed["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|c| c["name"] == "config")
+        .expect("config check present");
+    assert_eq!(config_check["status"], "fail");
 }

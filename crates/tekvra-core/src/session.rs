@@ -607,7 +607,12 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
     }
     base_tools.extend(bootstrap.extra_plugin_tools.clone());
 
-    let developer_instructions = build_developer_instructions(&bootstrap.config, &canonical_ws);
+    // Cross-session project memory: read once at spawn (stable cache prefix); the same
+    // store backs the `memory_save` tool and `/memory`.
+    let memory_store =
+        tekvra_tools::MemoryStore::open(&bootstrap.config.paths.state_dir, &canonical_ws);
+    let developer_instructions =
+        build_developer_instructions(&bootstrap.config, &canonical_ws, &memory_store.load());
     // Plugin `session_start` hook: rollout notes only — no live subscribers exist
     // before the actor loop starts, so transcript events would be lost.
     if let Some(exec) = &bootstrap.plugin_executor {
@@ -838,6 +843,7 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
             allow_subagents: bootstrap.allow_subagents,
             subagents: runner_subagents,
             lsp_manager,
+            memory_store: Some(Arc::new(memory_store)),
             frame,
             mode,
             active_goal: None,
@@ -960,6 +966,7 @@ struct SessionActor {
     allow_subagents: bool,
     subagents: Option<SubagentManager>,
     lsp_manager: Option<Arc<LspManager>>,
+    memory_store: Option<Arc<tekvra_tools::MemoryStore>>,
     frame: Frame,
     mode: PermissionMode,
     active_goal: Option<String>,
@@ -1216,9 +1223,55 @@ impl SessionActor {
         self.execute_turn_loop(turn_id).await;
     }
 
+    /// Cumulative ledger spend for the configured cap window: session totals, or everything
+    /// recorded since the UTC calendar-day boundary.
+    fn window_spend_usd(&self) -> f64 {
+        let Ok(index) = self.state_index.lock() else {
+            return 0.0;
+        };
+        match self.config.settings.agent.spend_limit_window {
+            tekvra_config::SpendWindow::Session => index
+                .session_usage_totals(&self.session_id)
+                .map(|t| t.cost_usd)
+                .unwrap_or_default(),
+            tekvra_config::SpendWindow::Day => {
+                // UTC calendar-day boundary (no tz database in the dependency set; documented).
+                let now = jiff::Timestamp::now().as_second();
+                let day_start = now.div_euclid(86_400) * 86_400;
+                index
+                    .usage_totals_since(day_start)
+                    .map(|t| t.cost_usd)
+                    .unwrap_or_default()
+            }
+        }
+    }
+
     async fn run_user_turn(&mut self, prompt: String, images: Vec<InputImage>) {
         let turn_id = format!("turn_{}", Uuid::now_v7().simple());
         let now = jiff::Timestamp::now().as_second();
+
+        // Spend-cap gate: refuse *before* the turn starts; in-flight turns always complete.
+        // Reads only touch the usage ledger — no frame region, so append-only is untouched.
+        if let Some(limit) = self.config.settings.agent.spend_limit_usd {
+            let spent = self.window_spend_usd();
+            if spent >= limit {
+                let reason = format!(
+                    "spend limit reached: ${spent:.4} of the ${limit:.2} {} cap; \
+                     raise or clear `agent.spend_limit_usd` in tekvra.toml (or `-c \
+                     agent.spend_limit_usd=<higher>`) to continue",
+                    match self.config.settings.agent.spend_limit_window {
+                        tekvra_config::SpendWindow::Session => "session",
+                        tekvra_config::SpendWindow::Day => "day",
+                    }
+                );
+                let _ = self.event_tx.send(SessionEvent::TurnRefused {
+                    thread_id: self.session_id.clone(),
+                    reason: reason.clone(),
+                });
+                eprintln!("turn refused: {reason}");
+                return;
+            }
+        }
 
         // Zero-roundtrip preprocessing: `@path` / `@path#L<n>-L<m>` attachments and `/skill` bodies.
         let expansion = expand_prompt_attachments(&prompt, &self.workspace_root);
@@ -1326,7 +1379,7 @@ impl SessionActor {
 
         let registry = NativeToolRegistry::new();
 
-        loop {
+        'agent_loop: loop {
             if cancel_token.is_cancelled() {
                 final_status = "interrupted".to_string();
                 break;
@@ -1335,7 +1388,7 @@ impl SessionActor {
             // Drain any pending `Guide` inputs at this safe turn boundary BEFORE calling the provider!
             self.drain_guides_into_frame(&turn_id);
 
-            let (provider, model) = match self.router.route_for_mode(self.mode) {
+            let (mut provider, mut model) = match self.router.route_for_mode(self.mode) {
                 Ok((p, m)) => (p.clone(), m),
                 Err(err) => {
                     final_status = "failed".to_string();
@@ -1343,6 +1396,16 @@ impl SessionActor {
                     break;
                 }
             };
+
+            // Fallback chain (Main role only): [primary, ...models.fallback], depth-capped,
+            // deduped. `Plan` mode never degrades silently.
+            let chain = if self.mode == PermissionMode::Plan {
+                Vec::new()
+            } else {
+                self.router
+                    .fallback_chain_for_job(tekvra_providers::JobRole::Main)
+            };
+            let mut tried_specs = vec![model.spec.clone()];
 
             // Context compaction check before assembling outbound request
             if let Ok((compact_prov, compact_model)) =
@@ -1362,57 +1425,110 @@ impl SessionActor {
                     .await;
             }
 
-            let pre_req_snapshot = self.frame.snapshot();
-            let req = self.frame.build_completion_request(
-                &self.session_id,
-                self.config.settings.agent.reasoning_effort.clone(),
-                None,
-            );
+            // Fallback dispatch loop: on a hard provider failure (exhausted accounts /
+            // transport down / non-retryable HTTP), advance down the configured chain with a
+            // steering-note announcement. Usage attributes to whichever model served.
+            #[allow(unused_assignments)] // first iteration always assigns before use
+            let mut pre_req_snapshot = None;
+            #[allow(unused_assignments)]
+            let mut served_item_id = String::new();
+            let resp = loop {
+                let snap = self.frame.snapshot();
+                let req = self.frame.build_completion_request(
+                    &self.session_id,
+                    self.config.settings.agent.reasoning_effort.clone(),
+                    None,
+                );
+                pre_req_snapshot = Some(snap);
 
-            // Emit the assistant item start BEFORE dispatching so hosts can render
-            // live deltas against a stable item id while the stream decodes.
-            let msg_item_id = format!("msg_{}", Uuid::now_v7().simple());
-            let _ = self.event_tx.send(SessionEvent::ItemStarted {
-                thread_id: self.session_id.clone(),
-                turn_id: turn_id.clone(),
-                item_id: msg_item_id.clone(),
-                kind: "agent_message".to_string(),
-            });
-            let delta_event_tx = self.event_tx.clone();
-            let delta_thread_id = self.session_id.clone();
-            let delta_turn_id = turn_id.clone();
-            let delta_item_id = msg_item_id.clone();
-            let on_delta: StreamDeltaSink = Arc::new(move |delta: StreamDelta| {
-                let (channel, text) = match delta {
-                    StreamDelta::TextDelta(text) => ("text", text),
-                    StreamDelta::ReasoningSummaryDelta(text) => ("reasoning_summary", text),
-                };
-                let _ = delta_event_tx.send(SessionEvent::ItemDelta {
-                    thread_id: delta_thread_id.clone(),
-                    turn_id: delta_turn_id.clone(),
-                    item_id: delta_item_id.clone(),
-                    channel: channel.to_string(),
-                    delta: text,
+                // Emit the assistant item start BEFORE dispatching so hosts can render
+                // live deltas against a stable item id while the stream decodes.
+                let msg_item_id = format!("msg_{}", Uuid::now_v7().simple());
+                served_item_id = msg_item_id.clone();
+                let _ = self.event_tx.send(SessionEvent::ItemStarted {
+                    thread_id: self.session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item_id: msg_item_id.clone(),
+                    kind: "agent_message".to_string(),
                 });
-            });
+                let delta_event_tx = self.event_tx.clone();
+                let delta_thread_id = self.session_id.clone();
+                let delta_turn_id = turn_id.clone();
+                let delta_item_id = msg_item_id.clone();
+                let on_delta: StreamDeltaSink = Arc::new(move |delta: StreamDelta| {
+                    let (channel, text) = match delta {
+                        StreamDelta::TextDelta(text) => ("text", text),
+                        StreamDelta::ReasoningSummaryDelta(text) => ("reasoning_summary", text),
+                    };
+                    let _ = delta_event_tx.send(SessionEvent::ItemDelta {
+                        thread_id: delta_thread_id.clone(),
+                        turn_id: delta_turn_id.clone(),
+                        item_id: delta_item_id.clone(),
+                        channel: channel.to_string(),
+                        delta: text,
+                    });
+                });
 
-            let complete_res = tokio::select! {
-                biased;
-                () = cancel_token.cancelled() => {
-                    final_status = "interrupted".to_string();
-                    break;
-                }
-                res = self.driver.complete_streaming(&provider, &model, &req, Some(on_delta)) => res,
-            };
+                let complete_res = tokio::select! {
+                    biased;
+                    () = cancel_token.cancelled() => {
+                        final_status = "interrupted".to_string();
+                        break 'agent_loop;
+                    }
+                    res = self.driver.complete_streaming(&provider, &model, &req, Some(on_delta)) => res,
+                };
 
-            let resp = match complete_res {
-                Ok(r) => r,
-                Err(err) => {
-                    final_status = "failed".to_string();
-                    final_error = Some(err.to_string());
-                    break;
+                match complete_res {
+                    Ok(r) => break r,
+                    Err(err) => {
+                        if !err.is_hard_failure() || chain.is_empty() {
+                            final_status = "failed".to_string();
+                            final_error = Some(err.to_string());
+                            break 'agent_loop;
+                        }
+                        let next_spec = chain.iter().find(|s| !tried_specs.contains(*s)).cloned();
+                        let Some(next_spec) = next_spec else {
+                            final_status = "failed".to_string();
+                            final_error = Some(format!(
+                                "all fallback models exhausted: {} (tried: {})",
+                                err,
+                                tried_specs.join(" → ")
+                            ));
+                            break 'agent_loop;
+                        };
+                        let (next_provider, next_model) = match self.router.route_spec(&next_spec) {
+                            Ok(res) => (res.0.clone(), res.1),
+                            Err(e) => {
+                                final_status = "failed".to_string();
+                                final_error = Some(format!(
+                                    "fallback model `{next_spec}` is not resolvable: {e} (origin: {err})"
+                                ));
+                                break 'agent_loop;
+                            }
+                        };
+                        let failed_spec = model.spec.clone();
+                        tried_specs.push(next_model.spec.clone());
+                        let note = format!(
+                            "provider `{failed_spec}` failed hard ({err}); falling back to `{}`",
+                            next_model.spec
+                        );
+                        let _ = self.append_rollout(RolloutRecord::SteeringNote {
+                            turn_id: turn_id.clone(),
+                            kind: "model_fallback".to_string(),
+                            text: note.clone(),
+                        });
+                        let _ = self.event_tx.send(SessionEvent::SteeringInjected {
+                            thread_id: self.session_id.clone(),
+                            turn_id: turn_id.clone(),
+                            reason: "model_fallback".to_string(),
+                            message: note,
+                        });
+                        provider = next_provider.clone();
+                        model = next_model;
+                    }
                 }
             };
+            let pre_req_snapshot = pre_req_snapshot.unwrap_or_else(|| self.frame.snapshot());
 
             accumulate_usage(&mut turn_usage, &resp.usage);
             accumulate_usage(&mut self.cumulative_usage, &resp.usage);
@@ -1428,7 +1544,7 @@ impl SessionActor {
             let _ = self.event_tx.send(SessionEvent::ItemCompleted {
                 thread_id: self.session_id.clone(),
                 turn_id: turn_id.clone(),
-                item_id: msg_item_id,
+                item_id: served_item_id,
                 text: assistant_text.clone(),
                 tool_output: None,
             });
@@ -2076,6 +2192,7 @@ impl SessionActor {
             approval_cb: Some(Arc::clone(&self.bridge) as Arc<dyn ApprovalCallback>),
             question_cb: Some(Arc::clone(&self.bridge) as Arc<dyn QuestionCallback>),
             lsp_manager: self.lsp_manager.clone(),
+            memory_store: self.memory_store.clone(),
             plan_markdown: Arc::clone(&self.plan_markdown),
         };
 
@@ -2225,6 +2342,7 @@ fn message_text(message: &ProviderMessage) -> String {
 fn build_developer_instructions(
     config: &ResolvedConfig,
     workspace_root: &std::path::Path,
+    memory: &str,
 ) -> String {
     let mut out = format!(
         "You are Tekvra, a native Rust coding agent operating in workspace `{}`.\nPrefer concise, verified changes backed by concrete tool outputs.",
@@ -2236,6 +2354,13 @@ fn build_developer_instructions(
             out.push_str(doc.content.trim());
             out.push('\n');
         }
+    }
+    // Cross-session project memory: fixed position after workspace instructions, content is
+    // the exact file bytes read once at spawn — stable prefix for the prompt cache.
+    if !memory.is_empty() {
+        out.push_str("\n\n## Project memory\n");
+        out.push_str(memory.trim_end());
+        out.push('\n');
     }
     // Deterministic skill metadata: dedupe by name, sort by name so the
     // developer-instruction prefix stays byte-stable for prompt caching.

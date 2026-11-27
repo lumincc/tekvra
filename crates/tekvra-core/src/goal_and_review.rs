@@ -269,6 +269,7 @@ pub async fn run_code_review(
         approval_cb: None,
         question_cb: None,
         lsp_manager: None,
+        memory_store: None,
         plan_markdown: Arc::new(Mutex::new(String::new())),
     };
 

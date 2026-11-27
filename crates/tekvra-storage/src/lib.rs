@@ -11,6 +11,7 @@ use thiserror::Error;
 
 pub use index::{
     HistorySearchHit, RetainedOutputPage, SessionSummary, StateIndex, StoredPermissionGrant,
+    UsageGroupBy, UsageRecordRow, UsageRow,
 };
 pub use rollout::{RolloutHeader, RolloutLog, RolloutRecord, SessionLease, rollout_path};
 pub use snapshots::{FilePreImage, RevertOutcome, SnapshotManifest, WorkspaceSnapshotStore};

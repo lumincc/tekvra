@@ -93,6 +93,11 @@ pub enum ApprovalScope {
         /// Tool name, or `*` for all tools on that server.
         tool: String,
     },
+    /// Session-wide tool permission (no narrower scope meaningful).
+    SessionTool {
+        /// Tool name.
+        tool: String,
+    },
 }
 
 impl ApprovalScope {
@@ -115,6 +120,8 @@ impl ApprovalScope {
                 prefix == "*" || prefix == "https://*" || prefix == "http://*"
             }
             Self::McpTool { tool, .. } => tool == "*",
+            // Session-wide scopes are the session itself; persisting is inherently broad.
+            Self::SessionTool { .. } => false,
         }
     }
 }

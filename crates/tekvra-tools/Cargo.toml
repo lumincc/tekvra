@@ -25,6 +25,7 @@ globset = { workspace = true }
 ignore = { workspace = true }
 indexmap = { workspace = true }
 ipnet = { workspace = true }
+jiff = { workspace = true }
 monty = { workspace = true }
 monty-types = { workspace = true }
 portable-pty = { workspace = true }

@@ -42,6 +42,7 @@ fn make_ctx(
         approval_cb: None,
         question_cb: None,
         lsp_manager: lsp.map(std::sync::Arc::new),
+        memory_store: None,
         plan_markdown: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
     }
 }

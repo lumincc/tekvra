@@ -71,4 +71,10 @@ pub enum CoreError {
         /// Explanation.
         message: String,
     },
+    /// Project-memory store failure (size caps, unreadable path).
+    #[error("memory error: {message}")]
+    Memory {
+        /// Explanation.
+        message: String,
+    },
 }

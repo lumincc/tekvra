@@ -28,6 +28,9 @@ Built on a unified `tokio` + `reqwest` (`rustls` + `aws-lc-rs`) async foundation
   - Append-only JSONL rollouts (`~/.local/share/tekvra/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`) + SQLite WAL metadata index (`state.db`), supporting `resume`, `fork`, and reversible `/undo` across file mutations.
   - Reverse token-budget compaction preserving recent turns and active `plan` state while summarizing older history, plus pruned large tool outputs recoverable via `tool_output`.
   - Depth-bounded (`agent.subagent_max_depth`, default `1`) subagent orchestration via the `task` tool and `SubagentManager` (`spawn`/`steer`/`list`, foreground or background, optional worktree isolation with explicit merge-back) and dedicated read-only `/review` (`tekvra review`).
+- **Ops Resilience & Observability**:
+  - Hard spend ceiling (`agent.spend_limit_usd`, `session`/`day` windows) refusing the next turn with `TurnRefused` + `remainingBudget` surfaces, configurable model fallback chains (`models.fallback`, depth-capped, steering-note announced on hard provider failures), and a per-project `MEMORY.md` (`memory_save` tool, `/memory`, `tekvra memory`) injected prompt-cache-stably.
+  - Stateless CLI observability: `tekvra usage` (table/JSON/CSV spend ledger views), `tekvra memory`, and `tekvra doctor` (`--json`, `--net`) diagnosing config, trust, providers, MCP PATH resolution, `state.db` integrity, and tool presence; hermetic golden-task eval + perf-smoke gate via `cargo test -p tekvra-eval`.
 - **Fullscreen Alt-Screen TUI, Headless `exec`, Codex v2 `app-server` & `acp`**:
   - `ratatui` + `crossterm` Alt-Screen TUI (`tekvra-tui`) with live streaming Markdown, `syntect` syntax highlighting, inline diff hunks, Raw/Filtered tool output toggle (`Ctrl-O`), interactive permission approval modal, UTF-8/CJK cursor-aware composer, `/queue` vs `/steer` mid-turn submission, slash commands (`/help`, `/model`, `/mode`, `/mcp`, `/review`, `/undo`, `/compact`), and opt-in Luau (`mlua` 0.12) custom commands (`experimental.lua_plugins = true`).
   - Non-interactive `tekvra exec` (`text`, `--json` JSONL events, `--output-schema`, `-o`).
@@ -129,6 +132,7 @@ tekvra acp
 - [Configuration & Folder Trust Guide](docs/configuration.md)
 - [Providers, OAuth & Role Routing](docs/providers.md)
 - [Native Tools, PTY, MCP & Permission Model](docs/tools-and-permissions.md)
+- [Usage, Cost & Health (`tekvra usage` / `doctor` / `memory`)](docs/usage-and-cost.md)
 - [Codex v2 `app-server` & `acp` Protocol Guide](docs/app-server.md)
 - [Opt-In Sandboxed Luau Plugins](docs/plugins.md)
 - [CI/CD & Multi-Platform Release Pipeline](docs/ci-cd.md)
@@ -143,6 +147,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo deny --offline check licenses bans sources
 python3 scripts/ci_verify_packaging.py --check-workflows
+# Eval gate: hermetic golden-task evals + perf smokes (also runs under `cargo test --workspace`).
+cargo test --locked -p tekvra-eval
 ```
 
 ## License

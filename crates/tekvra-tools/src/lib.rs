@@ -5,6 +5,7 @@
 pub mod fs_tools;
 pub mod lsp_client;
 pub mod mcp_client;
+pub mod memory;
 pub mod output_filter;
 pub mod patch;
 pub mod permissions;
@@ -24,6 +25,7 @@ pub use fs_tools::{
 };
 pub use lsp_client::{LspDiagnostic, LspManager};
 pub use mcp_client::{ConfiguredMcpGateway, McpStartupReport};
+pub use memory::{MEMORY_ENTRY_LIMIT, MEMORY_FILE_LIMIT, MemoryStore, memory_slug};
 pub use output_filter::{
     Corpus, FilteredOutput, RowRenderer, collapse_progress_lines, filter_command_output,
     render_terminal, strip_escape_sequences,

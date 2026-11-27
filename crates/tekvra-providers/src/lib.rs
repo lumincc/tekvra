@@ -14,7 +14,8 @@ pub use auth::{
     generate_pkce_pair, poll_device_code_token, refresh_oauth_account, request_device_code,
 };
 pub use catalog::{
-    JobRole, ModelCapabilities, ModelRouter, ProviderDefinition, ProviderRegistry, WireProtocol,
+    FALLBACK_CHAIN_CAP, JobRole, ModelCapabilities, ModelRouter, ProviderDefinition,
+    ProviderRegistry, WireProtocol,
 };
 pub use driver::{
     CompletionRequest, CompletionResponse, HttpProviderDriver, MessagePart, MessageRole,
@@ -105,4 +106,18 @@ pub enum ProviderError {
         /// Error detail.
         message: String,
     },
+}
+
+impl ProviderError {
+    /// `true` when retrying the *same* model cannot succeed: the provider's accounts are
+    /// exhausted, the transport is down, or the provider returned a non-retryable HTTP
+    /// status. These are the conditions that trigger a configured fallback chain.
+    #[must_use]
+    pub fn is_hard_failure(&self) -> bool {
+        match self {
+            Self::NoEligibleAccount { .. } | Self::Transport { .. } => true,
+            Self::HttpStatus { status, .. } => !crate::driver::is_retryable_status(*status),
+            _ => false,
+        }
+    }
 }

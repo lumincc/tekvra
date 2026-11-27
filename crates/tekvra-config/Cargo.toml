@@ -24,3 +24,6 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tekvra-providers = { workspace = true }

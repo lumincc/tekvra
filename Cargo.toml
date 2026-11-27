@@ -12,6 +12,7 @@ members = [
   "crates/tekvra-app-server",
   "crates/tekvra-acp",
   "crates/tekvra-cli",
+  "crates/tekvra-eval",
 ]
 exclude = [".tmp"]
 

@@ -713,14 +713,54 @@ impl JsonRpcConnection {
             .filter(|(_, _, _, exhausted)| !exhausted)
             .map(|(_, _, ratio, _)| *ratio)
             .fold(1.0_f64, f64::min);
+        let (spend_limit, spend_window) = {
+            let config = self
+                .state
+                .config
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                config.settings.agent.spend_limit_usd,
+                config.settings.agent.spend_limit_window,
+            )
+        };
+        // Config-driven OR term: a configured spend cap that is already reached marks the
+        // session spend-control as active even while accounts still have quota. The
+        // account-scoped RPC has no thread identity, so the session window conservatively
+        // sums the whole ledger (may only over-report, never under-report).
+        let spend_spent = spend_limit.map(|_| {
+            let index = self
+                .state
+                .state_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match spend_window {
+                tekvra_config::SpendWindow::Session => index
+                    .usage_totals_since(0)
+                    .map(|t| t.cost_usd)
+                    .unwrap_or_default(),
+                tekvra_config::SpendWindow::Day => {
+                    let now = jiff::Timestamp::now().as_second();
+                    index
+                        .usage_totals_since(now.div_euclid(86_400) * 86_400)
+                        .map(|t| t.cost_usd)
+                        .unwrap_or_default()
+                }
+            }
+        });
+        let spend_reached = match (spend_limit, spend_spent) {
+            (Some(limit), Some(spent)) => spent >= limit,
+            _ => false,
+        };
         Ok(json!({
             "rateLimits": {
                 "primaryWindow": {
                     "remainingRatio": worst,
                     "usedPercent": ((1.0 - worst) * 100.0).round() as i64,
                 },
-                "spendControlReached": !rows.is_empty()
-                    && rows.iter().all(|(_, _, _, exhausted)| *exhausted),
+                "spendControlReached": (!rows.is_empty()
+                    && rows.iter().all(|(_, _, _, exhausted)| *exhausted))
+                    || spend_reached,
             },
             "accounts": accounts,
         }))
@@ -1389,6 +1429,8 @@ impl JsonRpcConnection {
         let out_tx = self.out_tx.clone();
         let pending_rpcs = Arc::clone(&self.pending_client_rpcs);
         let handle_for_replies = handle.clone();
+        let forwarder_config = Arc::clone(&self.state.config);
+        let forwarder_state_index = Arc::clone(&self.state.state_index);
 
         tokio::spawn(async move {
             while let Ok(ev) = rx.recv().await {
@@ -1544,6 +1586,41 @@ impl JsonRpcConnection {
                             "reasoningOutputTokens": usage.reasoning_tokens,
                             "totalTokens": total_toks,
                         });
+                        // Live remaining-budget surface for a configured spend cap.
+                        let (spend_limit, spend_window) = {
+                            let config = forwarder_config
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            (
+                                config.settings.agent.spend_limit_usd,
+                                config.settings.agent.spend_limit_window,
+                            )
+                        };
+                        let remaining_budget = spend_limit.map(|limit| {
+                            let spent = {
+                                let index = forwarder_state_index
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                match spend_window {
+                                    tekvra_config::SpendWindow::Session => index
+                                        .session_usage_totals(&thread_id)
+                                        .map(|t| t.cost_usd)
+                                        .unwrap_or_default(),
+                                    tekvra_config::SpendWindow::Day => {
+                                        let now = jiff::Timestamp::now().as_second();
+                                        index
+                                            .usage_totals_since(now.div_euclid(86_400) * 86_400)
+                                            .map(|t| t.cost_usd)
+                                            .unwrap_or_default()
+                                    }
+                                }
+                            };
+                            json!({
+                                "limitUsd": limit,
+                                "spentUsd": spent,
+                                "remainingUsd": (limit - spent).max(0.0),
+                            })
+                        });
                         emit_notif_raw(
                             &out_tx,
                             "thread/tokenUsage/updated",
@@ -1553,7 +1630,18 @@ impl JsonRpcConnection {
                                 "tokenUsage": {
                                     "last": breakdown,
                                     "total": breakdown,
+                                    "remainingBudget": remaining_budget,
                                 }
+                            }),
+                        );
+                    }
+                    SessionEvent::TurnRefused { thread_id, reason } => {
+                        emit_notif_raw(
+                            &out_tx,
+                            "turn/refused",
+                            json!({
+                                "threadId": thread_id,
+                                "reason": reason,
                             }),
                         );
                     }

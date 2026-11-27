@@ -424,6 +424,8 @@ pub enum ToolAction {
         /// MCP tool name.
         tool: String,
     },
+    /// Appending a project-memory entry (`memory_save`).
+    UpdateMemory,
 }
 
 /// Outcome of evaluating a [`ToolAction`] against modes, rules, and remembered grants.
@@ -586,6 +588,29 @@ impl PermissionEvaluator {
                     PermissionDecision::Allow
                 } else {
                     PermissionDecision::Prompt(self.build_mcp_prompt(item_id, server, tool))
+                }
+            }
+            ToolAction::UpdateMemory => {
+                if self.matches_rule("memory_save", "*", RuleAction::Allow)
+                    || self.is_scope_granted_for_memory()
+                {
+                    PermissionDecision::Allow
+                } else if self.matches_rule("memory_save", "*", RuleAction::Ask) {
+                    if self.mode == PermissionMode::Yolo {
+                        PermissionDecision::Allow
+                    } else {
+                        PermissionDecision::Prompt(self.build_memory_prompt(item_id))
+                    }
+                } else if matches!(self.mode, PermissionMode::Build | PermissionMode::Yolo) {
+                    PermissionDecision::Prompt(self.build_memory_prompt(item_id))
+                } else if self.mode == PermissionMode::Auto {
+                    PermissionDecision::Allow
+                } else {
+                    PermissionDecision::Deny {
+                        reason: "Project memory updates require `build`/`auto` mode or an \
+                                 explicit `allow` rule for `memory_save`."
+                            .to_string(),
+                    }
                 }
             }
         }
@@ -837,6 +862,9 @@ impl PermissionEvaluator {
                     .then(|| format!("MCP call `{target}` blocked by explicit `deny` rule"))
             }
             ToolAction::UpdatePlan => None,
+            ToolAction::UpdateMemory => self
+                .matches_rule("memory_save", "*", RuleAction::Deny)
+                .then(|| "`memory_save` blocked by explicit `deny` rule".to_string()),
         }
     }
 
@@ -895,6 +923,30 @@ impl PermissionEvaluator {
             ApprovalScope::McpTool { server: s, tool: t } => s == server && (t == "*" || t == tool),
             _ => false,
         })
+    }
+
+    fn is_scope_granted_for_memory(&self) -> bool {
+        self.all_grants().any(
+            |scope| matches!(scope, ApprovalScope::SessionTool { tool } if tool == "memory_save"),
+        )
+    }
+
+    fn build_memory_prompt(&self, item_id: &str) -> ApprovalPrompt {
+        ApprovalPrompt {
+            approval_id: format!("appr_{}", Uuid::now_v7().simple()),
+            item_id: item_id.to_string(),
+            tool_name: "memory_save".to_string(),
+            summary: "Append a project memory entry".to_string(),
+            cwd: None,
+            once_only: false,
+            ladder: vec![ScopeLadderOption {
+                label: "This session".to_string(),
+                broad_grant: false,
+                scope: ApprovalScope::SessionTool {
+                    tool: "memory_save".to_string(),
+                },
+            }],
+        }
     }
 
     fn build_path_prompt(&self, item_id: &str, tool_name: &str, path: &Path) -> ApprovalPrompt {

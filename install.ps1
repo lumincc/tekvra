@@ -7,7 +7,7 @@
 #   TEKVRA_INSTALL_PREFIX  install prefix (default: $env:LOCALAPPDATA\Programs\tekvra)
 #   TEKVRA_DOWNLOAD_PREFIX base URL for release assets (default: the GitHub release download URL)
 #   TEKVRA_FORCE_TARGET    override the detected Rust target triple (e.g. force
-#                          aarch64-pc-windows-msvc once a native ARM64 archive ships)
+#                          aarch64-pc-windows-msvc, which release.yml publishes)
 #
 # The installer aborts with a non-zero exit status BEFORE placing any binary in
 # the target directory when the computed digest does not match SHA256SUMS.txt.
@@ -47,9 +47,9 @@ if ($env:TEKVRA_FORCE_TARGET) {
     switch ($env:PROCESSOR_ARCHITECTURE) {
         "AMD64" { $target = "x86_64-pc-windows-msvc" }
         "ARM64" {
-            # No native Windows ARM64 archive is published yet. Probe for one and
+            # Prefer the native ARM64 archive when release.yml has published one;
             # fall back cleanly to x86_64 (ARM64 Windows 11 runs x64 binaries
-            # natively via the Prism emulator) until release.yml adds an ARM64 job.
+            # natively via the Prism emulator) while the ARM64 job is fresh.
             $target = "x86_64-pc-windows-msvc"
             try {
                 $probeUri = "$baseUrl/tekvra-$TekvraVersion-aarch64-pc-windows-msvc.zip"

@@ -36,9 +36,10 @@ use uuid::Uuid;
 mod ops;
 
 use ops::{
-    ConfigScope, McpAction, McpAddSpec, TrustAction, apply_skill_flag, ensure_worktree,
-    ensure_worktree_name, generate_completion, handle_mcp_command, handle_trust_command,
-    load_image_attachments,
+    ConfigScope, McpAction, McpAddSpec, TrustAction, UsageOptions, apply_skill_flag,
+    ensure_worktree, ensure_worktree_name, generate_completion, handle_doctor_command,
+    handle_mcp_command, handle_memory_command, handle_trust_command, handle_usage_command,
+    load_image_attachments, parse_usage_group_by,
 };
 
 #[derive(Debug, Parser)]
@@ -128,6 +129,12 @@ enum Commands {
     Completion(CompletionArgs),
     /// Create or reuse a managed git worktree without starting a session.
     Worktree(WorktreeArgs),
+    /// Report aggregated token/cost usage from the local ledger.
+    Usage(UsageArgs),
+    /// Print the cross-session project memory (optionally append an entry).
+    Memory(MemoryArgs),
+    /// Run read-only health checks (config, trust, providers, MCP, state).
+    Doctor(DoctorArgs),
 }
 
 #[derive(Debug, Args)]
@@ -316,6 +323,39 @@ struct WorktreeArgs {
     action: WorktreeSubAction,
 }
 
+#[derive(Debug, Args)]
+struct UsageArgs {
+    /// Limit to the trailing N days (omit for the whole ledger).
+    #[arg(long)]
+    days: Option<u32>,
+    /// Group rows by `model` (default), `day`, or `session`.
+    #[arg(long)]
+    by: Option<String>,
+    /// Print machine-readable JSON instead of a table.
+    #[arg(long, conflicts_with = "csv")]
+    json: bool,
+    /// Export full per-turn rows as CSV to `<PATH>`.
+    #[arg(long, value_name = "PATH")]
+    csv: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct MemoryArgs {
+    /// Append one dated entry instead of printing the file.
+    #[arg(long, value_name = "TEXT")]
+    append: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Print the check array as JSON.
+    #[arg(long)]
+    json: bool,
+    /// Probe builtin provider endpoints with bounded TCP connects.
+    #[arg(long)]
+    net: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum WorktreeSubAction {
     /// List managed worktrees for the current repository.
@@ -382,6 +422,21 @@ async fn try_main() -> Result<()> {
         no_plugins: cli.no_plugins,
     };
 
+    // `tekvra doctor` runs read-only checks and exits non-zero on failures. It must run
+    // BEFORE the strict config load: a broken global config is exactly what it diagnoses.
+    if let Some(Commands::Doctor(doctor_args)) = &cli.command {
+        return handle_doctor_command(
+            &ConfigPaths::from_env(),
+            &cwd,
+            &overrides,
+            ops::DoctorOptions {
+                json: doctor_args.json,
+                net: doctor_args.net,
+            },
+        )
+        .await;
+    }
+
     let mut resolved = load_config(ConfigPaths::from_env(), &cwd, &overrides)?;
     if let Some(mode_str) = &cli.mode {
         resolved.settings.agent.default_mode = parse_mode(mode_str)?;
@@ -404,6 +459,32 @@ async fn try_main() -> Result<()> {
 
     if let Some(Commands::Auth(auth_args)) = cli.command {
         return handle_auth_command(&resolved, auth_args).await;
+    }
+
+    // `tekvra usage` is a stateless ledger read: short-circuit before plugin/session init.
+    if let Some(Commands::Usage(usage_args)) = &cli.command {
+        let by = match usage_args.by.as_deref() {
+            Some(by) => parse_usage_group_by(by)?,
+            None => tekvra_storage::UsageGroupBy::Model,
+        };
+        return handle_usage_command(
+            &ConfigPaths::from_env(),
+            &UsageOptions {
+                days: usage_args.days,
+                by,
+                json: usage_args.json,
+                csv: usage_args.csv.clone(),
+            },
+        );
+    }
+
+    // `tekvra memory` is a stateless project-memory read/append: same short-circuit rules.
+    if let Some(Commands::Memory(memory_args)) = &cli.command {
+        return handle_memory_command(
+            &ConfigPaths::from_env(),
+            &cwd,
+            memory_args.append.as_deref(),
+        );
     }
 
     // Local trust/mcp/completion/worktree operations short-circuit before plugin/MCP/session init.
@@ -840,7 +921,10 @@ async fn try_main() -> Result<()> {
         Some(Commands::Mcp(_))
         | Some(Commands::Trust(_))
         | Some(Commands::Completion(_))
-        | Some(Commands::Worktree(_)) => unreachable!("handled above"),
+        | Some(Commands::Worktree(_))
+        | Some(Commands::Usage(_))
+        | Some(Commands::Memory(_))
+        | Some(Commands::Doctor(_)) => unreachable!("handled above"),
         None => {
             let handle = spawn_cli_session(
                 None,
@@ -919,6 +1003,9 @@ async fn launch_interactive_tui(
     let sw_mcp = mcp_gateway_opt;
     let sw_plug = plugin_exec_opt;
     let sw_tools = extra_tools;
+    // `/memory` viewer state — captured before `sw_resolved` moves into a hook closure.
+    let mem_state = sw_resolved.paths.state_dir.clone();
+    let mem_cwd = sw_resolved.cwd.clone();
 
     let hooks = TuiRuntimeHooks {
         initial_records,
@@ -1023,6 +1110,18 @@ async fn launch_interactive_tui(
             )
             .map_err(|e| e.to_string())
         })),
+        on_memory_view: {
+            Some(Box::new(move || {
+                let store = tekvra_tools::MemoryStore::open(&mem_state, &mem_cwd);
+                let content = store.load();
+                let body = if content.trim().is_empty() {
+                    "(empty — the model can add entries with the `memory_save` tool)"
+                } else {
+                    content.trim_end()
+                };
+                format!("{}\n\n{body}", store.path().display())
+            }))
+        },
     };
 
     tekvra_tui::run_fullscreen_tui(handle, state_index, snapshots, hooks).await?;

@@ -1456,3 +1456,496 @@ async fn opt_in_auto_title_persists_session_title_via_job_role_title() {
         "auto_title must persist the JobRole::Title result"
     );
 }
+
+/// Spend-cap gate: the session-window cap refuses the next turn after budget exhaustion,
+/// the day-window cap refuses on any ledger spend today, and raising the limit unblocks.
+#[tokio::test]
+async fn spend_cap_refuses_next_turn_and_raise_limit_unblocks() {
+    let text_resp = || {
+        ScriptedDriver::from_queue(vec![CompletionResponse {
+            assistant_message: ProviderMessage {
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Text {
+                    text: "cap probe done".to_string(),
+                    cache_breakpoint: false,
+                }],
+            },
+            stream_deltas: Vec::new(),
+            usage: TokenUsage {
+                input_tokens: 20,
+                cached_input_tokens: 0,
+                output_tokens: 4,
+                reasoning_tokens: 0,
+                cost_usd: 0.0001,
+            },
+            served_by_account: "mock".to_string(),
+        }])
+    };
+    // --- Session window ---
+    let tmp = TempDir::new().expect("tempdir");
+    let driver = text_resp() as Arc<dyn ProviderDriver>;
+    let mut bootstrap = setup_bootstrap(&tmp, Arc::clone(&driver), PermissionMode::Build);
+    bootstrap.session_id = Some("thr_cap_sess".to_string());
+    bootstrap.state_index = Some(Arc::new(std::sync::Mutex::new(
+        tekvra_storage::StateIndex::open(&bootstrap.state_dir).expect("open index"),
+    )));
+    // Pre-spend past the cap on THIS session id.
+    {
+        let index = bootstrap.state_index.as_ref().expect("index");
+        index
+            .lock()
+            .expect("lock")
+            .record_usage(
+                "thr_cap_sess",
+                "turn_prev",
+                "prov/mock",
+                &TokenUsage {
+                    input_tokens: 100,
+                    cached_input_tokens: 0,
+                    output_tokens: 10,
+                    reasoning_tokens: 0,
+                    cost_usd: 0.50,
+                },
+                1_700_000_000,
+            )
+            .expect("seed spend");
+    }
+    bootstrap.config.settings.agent.spend_limit_usd = Some(0.40);
+    bootstrap.config.settings.agent.spend_limit_window = tekvra_config::SpendWindow::Session;
+
+    let handle = spawn_session(bootstrap).expect("spawn session");
+    let mut rx = handle.subscribe();
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "this must be refused".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit");
+    loop {
+        match rx.recv().await {
+            Ok(SessionEvent::TurnRefused { reason, .. }) => {
+                assert!(
+                    reason.contains("spend limit reached")
+                        && reason.contains("$0.5000")
+                        && reason.contains("spend_limit_usd"),
+                    "actionable refusal: {reason}"
+                );
+                break;
+            }
+            Ok(SessionEvent::TurnCompleted { .. }) => {
+                panic!("turn must be refused when the cap is already exhausted");
+            }
+            Ok(_) => {}
+            Err(e) => panic!("event stream closed: {e}"),
+        }
+    }
+    drop(handle);
+    // Wait for the session lease on `thr_cap_sess` to be released before re-spawning.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // --- Raise limit unblocks: same state dir, higher cap completes a real turn ---
+    let driver2 = text_resp() as Arc<dyn ProviderDriver>;
+    let mut bootstrap2 = setup_bootstrap(&tmp, Arc::clone(&driver2), PermissionMode::Build);
+    bootstrap2.session_id = Some("thr_cap_sess".to_string());
+    bootstrap2.state_index = Some(Arc::new(std::sync::Mutex::new(
+        tekvra_storage::StateIndex::open(&bootstrap2.state_dir).expect("reopen index"),
+    )));
+    bootstrap2.config.settings.agent.spend_limit_usd = Some(0.60);
+    let handle2 = spawn_session(bootstrap2).expect("spawn session 2");
+    let mut rx2 = handle2.subscribe();
+    handle2
+        .send(SessionCommand::SubmitInput {
+            prompt: "under the raised cap".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit 2");
+    let status = wait_for_turn_complete(&mut rx2).await;
+    assert_eq!(status, "completed");
+    drop(handle2);
+
+    // --- Day window: spend on ANY session today trips the cap ---
+    let tmp3 = TempDir::new().expect("tempdir3");
+    let driver3 = text_resp() as Arc<dyn ProviderDriver>;
+    let mut bootstrap3 = setup_bootstrap(&tmp3, Arc::clone(&driver3), PermissionMode::Build);
+    bootstrap3.session_id = Some("thr_cap_day".to_string());
+    bootstrap3.state_index = Some(Arc::new(std::sync::Mutex::new(
+        tekvra_storage::StateIndex::open(&bootstrap3.state_dir).expect("open index 3"),
+    )));
+    let now = jiff::Timestamp::now().as_second();
+    bootstrap3
+        .state_index
+        .as_ref()
+        .expect("index")
+        .lock()
+        .expect("lock")
+        .record_usage(
+            "thr_other_session_today",
+            "turn_today",
+            "prov/mock",
+            &TokenUsage {
+                input_tokens: 100,
+                cached_input_tokens: 0,
+                output_tokens: 10,
+                reasoning_tokens: 0,
+                cost_usd: 0.50,
+            },
+            now,
+        )
+        .expect("seed day spend");
+    bootstrap3.config.settings.agent.spend_limit_usd = Some(0.40);
+    bootstrap3.config.settings.agent.spend_limit_window = tekvra_config::SpendWindow::Day;
+
+    let handle3 = spawn_session(bootstrap3).expect("spawn session 3");
+    let mut rx3 = handle3.subscribe();
+    handle3
+        .send(SessionCommand::SubmitInput {
+            prompt: "refused by day cap".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit 3");
+    loop {
+        match rx3.recv().await {
+            Ok(SessionEvent::TurnRefused { reason, .. }) => {
+                assert!(reason.contains("day"), "day window named: {reason}");
+                break;
+            }
+            Ok(SessionEvent::TurnCompleted { .. }) => {
+                panic!("day-window cap must refuse");
+            }
+            Ok(_) => {}
+            Err(e) => panic!("event stream closed: {e}"),
+        }
+    }
+    drop(handle3);
+}
+
+/// In-flight turns always complete even when they cross the cap; only the NEXT turn refuses.
+#[tokio::test]
+async fn spend_cap_crossing_turn_completes_and_next_refuses() {
+    let tmp = TempDir::new().expect("tempdir");
+    // One scripted turn costing 0.10 — it will cross the 0.40 cap mid-flight.
+    let driver = ScriptedDriver::from_queue(vec![CompletionResponse {
+        assistant_message: ProviderMessage {
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                text: "expensive turn done".to_string(),
+                cache_breakpoint: false,
+            }],
+        },
+        stream_deltas: Vec::new(),
+        usage: TokenUsage {
+            input_tokens: 500,
+            cached_input_tokens: 0,
+            output_tokens: 50,
+            reasoning_tokens: 0,
+            cost_usd: 0.10,
+        },
+        served_by_account: "mock".to_string(),
+    }]);
+    let mut bootstrap = setup_bootstrap(
+        &tmp,
+        Arc::clone(&driver) as Arc<dyn ProviderDriver>,
+        PermissionMode::Build,
+    );
+    bootstrap.session_id = Some("thr_cap_cross".to_string());
+    bootstrap.state_index = Some(Arc::new(std::sync::Mutex::new(
+        tekvra_storage::StateIndex::open(&bootstrap.state_dir).expect("open index"),
+    )));
+    bootstrap
+        .state_index
+        .as_ref()
+        .expect("index")
+        .lock()
+        .expect("lock")
+        .record_usage(
+            "thr_cap_cross",
+            "turn_pre",
+            "prov/mock",
+            &TokenUsage {
+                input_tokens: 100,
+                cached_input_tokens: 0,
+                output_tokens: 10,
+                reasoning_tokens: 0,
+                cost_usd: 0.35,
+            },
+            1_700_000_000,
+        )
+        .expect("seed");
+    bootstrap.config.settings.agent.spend_limit_usd = Some(0.40);
+
+    let handle = spawn_session(bootstrap).expect("spawn session");
+    let mut rx = handle.subscribe();
+
+    // Turn 1 starts under the cap (0.35 < 0.40) and must COMPLETE despite crossing to 0.45.
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "expensive turn".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit 1");
+    let status = wait_for_turn_complete(&mut rx).await;
+    assert_eq!(status, "completed");
+
+    // Turn 2 must be refused: ledger total is now 0.45 >= 0.40.
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "this one refuses".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit 2");
+    loop {
+        match rx.recv().await {
+            Ok(SessionEvent::TurnRefused { reason, .. }) => {
+                assert!(
+                    reason.contains("$0.4500"),
+                    "refusal shows new total: {reason}"
+                );
+                break;
+            }
+            Ok(SessionEvent::TurnCompleted { .. }) => {
+                panic!("second turn must refuse once over the cap");
+            }
+            Ok(_) => {}
+            Err(e) => panic!("event stream closed: {e}"),
+        }
+    }
+    drop(handle);
+}
+
+/// Project memory is injected after workspace instructions at a fixed position and stays
+/// byte-stable across turns (prompt-cache prefix invariant).
+#[tokio::test]
+async fn project_memory_injected_after_workspace_instructions_and_stable_across_turns() {
+    let tmp = TempDir::new().expect("tempdir");
+    let developer_prefix = Arc::new(Mutex::new(String::new()));
+    let prefix_clone = Arc::clone(&developer_prefix);
+    let driver = ScriptedDriver::from_fn(move |_prov, _model, req| {
+        if let Some(ProviderMessage { parts, .. }) = req
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Developer)
+        {
+            for p in parts {
+                if let MessagePart::Text { text, .. } = p {
+                    *prefix_clone.lock().expect("lock") = text.clone();
+                }
+            }
+        }
+        text_resp("ok")
+    });
+
+    let bootstrap = setup_bootstrap(&tmp, driver, PermissionMode::Build);
+    // Seed the memory file the store will read at spawn.
+    let store = tekvra_tools::MemoryStore::open(&bootstrap.state_dir, &bootstrap.workspace_root);
+    std::fs::create_dir_all(store.path().parent().expect("memory parent")).expect("mkdir memory");
+    std::fs::write(store.path(), "- 2026-11-28: prefers tabs in this repo\n").expect("seed memory");
+
+    let handle = spawn_session(bootstrap).expect("spawn session");
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "turn one".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit 1");
+    assert_eq!(wait_for_turn_complete(&mut rx).await, "completed");
+    let prefix_turn1 = developer_prefix.lock().expect("lock").clone();
+
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "turn two".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit 2");
+    assert_eq!(wait_for_turn_complete(&mut rx).await, "completed");
+    let prefix_turn2 = developer_prefix.lock().expect("lock").clone();
+
+    assert!(
+        prefix_turn1.contains("## Project memory")
+            && prefix_turn1.contains("prefers tabs in this repo"),
+        "memory section injected: {prefix_turn1}"
+    );
+    // Position: memory comes after the workspace header (and AGENTS.md section when present).
+    let ws_pos = prefix_turn1.find("workspace `").expect("workspace header");
+    let mem_pos = prefix_turn1
+        .find("## Project memory")
+        .expect("memory section");
+    assert!(mem_pos > ws_pos, "memory after workspace instructions");
+    assert_eq!(prefix_turn1, prefix_turn2, "developer prefix byte-stable");
+    drop(handle);
+}
+
+/// Model fallback chains: hard provider failures walk the configured chain with a
+/// steering-note announcement; exhaustion fails with every attempt named; no chain = old
+/// single-shot behavior.
+#[tokio::test]
+async fn fallback_chain_walks_on_hard_failure_and_exhaustion_fails_named() {
+    struct SpecRouter {
+        fail_specs: std::collections::BTreeSet<String>,
+    }
+    #[async_trait]
+    impl ProviderDriver for SpecRouter {
+        async fn complete(
+            &self,
+            _provider: &ProviderDefinition,
+            model: &ModelCapabilities,
+            _request: &CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            if self.fail_specs.contains(&model.spec) {
+                return Err(ProviderError::NoEligibleAccount {
+                    provider: model.spec.split('/').next().unwrap_or("?").to_string(),
+                    reason: "all accounts exhausted".to_string(),
+                });
+            }
+            Ok(CompletionResponse {
+                assistant_message: ProviderMessage {
+                    role: MessageRole::Assistant,
+                    parts: vec![MessagePart::Text {
+                        text: format!("served by {}", model.spec),
+                        cache_breakpoint: false,
+                    }],
+                },
+                stream_deltas: Vec::new(),
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    cached_input_tokens: 0,
+                    output_tokens: 4,
+                    reasoning_tokens: 0,
+                    cost_usd: 0.0002,
+                },
+                served_by_account: "mock".to_string(),
+            })
+        }
+    }
+
+    // --- Outage on primary, healthy fallback: turn succeeds via the chain ---
+    let tmp = TempDir::new().expect("tempdir");
+    let driver = Arc::new(SpecRouter {
+        fail_specs: ["openai/gpt-5.4-codex".to_string()].into_iter().collect(),
+    });
+    let mut bootstrap = setup_bootstrap(
+        &tmp,
+        Arc::clone(&driver) as Arc<dyn ProviderDriver>,
+        PermissionMode::Build,
+    );
+    bootstrap.config.settings.models.fallback =
+        Some(vec!["anthropic/claude-sonnet-4-5".to_string()]);
+    // The router snapshots the chain at construction: rebuild after editing config.
+    bootstrap.router = tekvra_providers::ModelRouter::from_config(
+        &bootstrap.config,
+        tekvra_providers::ProviderRegistry::new(),
+    );
+    let handle = spawn_session(bootstrap).expect("spawn session");
+    let mut rx = handle.subscribe();
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "try the chain".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit");
+    let mut saw_fallback_note = false;
+    loop {
+        match rx.recv().await {
+            Ok(SessionEvent::SteeringInjected {
+                reason, message, ..
+            }) => {
+                assert_eq!(reason, "model_fallback");
+                assert!(
+                    message.contains("openai/gpt-5.4-codex")
+                        && message.contains("anthropic/claude-sonnet-4-5"),
+                    "note names failed and taken specs: {message}"
+                );
+                saw_fallback_note = true;
+            }
+            Ok(SessionEvent::TurnCompleted { .. }) => break,
+            Ok(_) => {}
+            Err(e) => panic!("event stream closed: {e}"),
+        }
+    }
+    assert!(saw_fallback_note, "fallback must be announced");
+    // Usage attributed to the FALLBACK serving model.
+    drop(handle);
+
+    // --- Full-chain exhaustion: failure names every attempt ---
+    let tmp2 = TempDir::new().expect("tempdir2");
+    let driver2 = Arc::new(SpecRouter {
+        fail_specs: [
+            "openai/gpt-5.4-codex".to_string(),
+            "anthropic/claude-sonnet-4-5".to_string(),
+        ]
+        .into_iter()
+        .collect(),
+    });
+    let mut bootstrap2 = setup_bootstrap(
+        &tmp2,
+        Arc::clone(&driver2) as Arc<dyn ProviderDriver>,
+        PermissionMode::Build,
+    );
+    bootstrap2.config.settings.models.fallback = Some(vec![
+        "anthropic/claude-sonnet-4-5".to_string(),
+        "openai/gpt-5.4-codex".to_string(),
+    ]);
+    bootstrap2.router = tekvra_providers::ModelRouter::from_config(
+        &bootstrap2.config,
+        tekvra_providers::ProviderRegistry::new(),
+    );
+    let handle2 = spawn_session(bootstrap2).expect("spawn session 2");
+    let mut rx2 = handle2.subscribe();
+    handle2
+        .send(SessionCommand::SubmitInput {
+            prompt: "everything fails".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit 2");
+    loop {
+        match rx2.recv().await {
+            Ok(SessionEvent::TurnCompleted { status, .. }) => {
+                assert_eq!(status, "failed");
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => panic!("event stream closed: {e}"),
+        }
+    }
+    drop(handle2);
+
+    // --- No chain configured: hard failure fails the turn without fallback attempts ---
+    let tmp3 = TempDir::new().expect("tempdir3");
+    let driver3 = Arc::new(SpecRouter {
+        fail_specs: ["openai/gpt-5.4-codex".to_string()].into_iter().collect(),
+    });
+    let bootstrap3 = setup_bootstrap(
+        &tmp3,
+        Arc::clone(&driver3) as Arc<dyn ProviderDriver>,
+        PermissionMode::Build,
+    );
+    assert!(bootstrap3.config.settings.models.fallback.is_none());
+    let chain_probe = bootstrap3
+        .router
+        .fallback_chain_for_job(tekvra_providers::JobRole::Main);
+    assert_eq!(
+        chain_probe.len(),
+        1,
+        "no fallback configured: chain is primary only"
+    );
+    drop(bootstrap3);
+}

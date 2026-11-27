@@ -14,11 +14,11 @@ use tekvra_protocol::{
 use tekvra_providers::ModelCapabilities;
 use tekvra_storage::{StateIndex, WorkspaceSnapshotStore};
 use tekvra_tools::{
-    McpGateway, McpToolDescriptor, MontyCodeSandbox, NativeToolRegistry, PermissionDecision,
-    PermissionEvaluator, PtySessionManager, SafeWebFetcher, ShellSyntax, ToolAction,
-    ToolExecutionContext, WorkspacePathLocks, active_shell_syntax,
-    build_tool_definitions_for_model, decompose_bash_command, decompose_powershell_command,
-    decompose_shell_command_for,
+    MEMORY_ENTRY_LIMIT, MEMORY_FILE_LIMIT, McpGateway, McpToolDescriptor, MemoryStore,
+    MontyCodeSandbox, NativeToolRegistry, PermissionDecision, PermissionEvaluator,
+    PtySessionManager, SafeWebFetcher, ShellSyntax, ToolAction, ToolExecutionContext,
+    WorkspacePathLocks, active_shell_syntax, build_tool_definitions_for_model,
+    decompose_bash_command, decompose_powershell_command, decompose_shell_command_for, memory_slug,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,6 +55,7 @@ fn make_ctx(
         approval_cb: None,
         question_cb: None,
         lsp_manager: None,
+        memory_store: None,
         plan_markdown: Arc::new(Mutex::new(String::new())),
     }
 }
@@ -1897,3 +1898,146 @@ const SEARCH_PAGE: &str = r##"<html><body>
   <a class="result__snippet" href="#">A plain snippet</a>
 </div>
 </body></html>"##;
+
+#[tokio::test]
+async fn memory_store_caps_and_memory_save_ladder() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("repo");
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir ws");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+
+    // --- MemoryStore unit behavior: dated append + entry/file caps + slug ---
+    let store = MemoryStore::open(&state_dir, &ws);
+    store.append("prefers tabs").expect("append 1");
+    store.append("uses ruff for lint").expect("append 2");
+    let body = std::fs::read_to_string(store.path()).expect("read memory");
+    assert!(body.contains("- 20"), "dated entry: {body}");
+    assert!(body.contains("prefers tabs") && body.contains("uses ruff for lint"));
+    let big = "x".repeat(MEMORY_ENTRY_LIMIT + 1);
+    let err = store.append(&big).expect_err("entry cap");
+    assert!(err.to_string().contains("the limit is"), "entry cap: {err}");
+    // File cap: fill close to the limit, then refuse the next big append.
+    std::fs::write(store.path(), "y".repeat(MEMORY_FILE_LIMIT - 8)).expect("fill memory");
+    let err = store.append("another entry").expect_err("file cap");
+    assert!(
+        err.to_string().contains("memory file is full"),
+        "file cap: {err}"
+    );
+    let slug = memory_slug(&ws);
+    assert!(
+        !slug.is_empty()
+            && !slug.contains('/')
+            && !slug.contains('\\')
+            && slug
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "safe slug: {slug}"
+    );
+
+    // --- Registry arm through the ladder ---
+    let reg = NativeToolRegistry::new();
+    let store_ok = MemoryStore::open(&state_dir.join("mem_ws_state"), &ws);
+
+    // ReadOnly mode: default-deny even with a store attached.
+    let ctx_ro = make_ctx(
+        ws.clone(),
+        state_dir.join("ro_state"),
+        PermissionMode::ReadOnly,
+        Vec::new(),
+    );
+    // Attach the store manually (make_ctx passes None).
+    let mut ctx_ro_with = ctx_ro;
+    ctx_ro_with.memory_store = Some(Arc::new(store_ok.clone()));
+    let out = reg
+        .execute(
+            &ctx_ro_with,
+            "mem_ro_1",
+            "memory_save",
+            &json!({ "content": "should be denied" }),
+        )
+        .await;
+    let err = match out {
+        Err(err) => err,
+        Ok(other) => panic!("read-only must deny memory_save: {other:?}"),
+    };
+    assert!(
+        err.to_string().contains("require `build`/`auto` mode")
+            || err.to_string().contains("permission denied"),
+        "read-only denial: {err}"
+    );
+
+    // Build mode without an approval host fails closed.
+    let ctx_build = make_ctx(
+        ws.clone(),
+        state_dir.join("build_state"),
+        PermissionMode::Build,
+        Vec::new(),
+    );
+    let mut ctx_build_with = ctx_build;
+    ctx_build_with.memory_store = Some(Arc::new(store_ok.clone()));
+    let out = reg
+        .execute(
+            &ctx_build_with,
+            "mem_build_1",
+            "memory_save",
+            &json!({ "content": "needs approval" }),
+        )
+        .await;
+    assert!(out.is_err(), "build without approval host must fail closed");
+
+    // Explicit allow rule overrides the ladder in any mode.
+    let allow_rules = vec![PermissionRule {
+        tool: "memory_save".to_string(),
+        pattern: "*".to_string(),
+        action: RuleAction::Allow,
+    }];
+    let store_allow = MemoryStore::open(&state_dir.join("allow_state"), &ws);
+    let ctx_allow = make_ctx(
+        ws.clone(),
+        state_dir.join("allow_ctx_state"),
+        PermissionMode::ReadOnly,
+        allow_rules,
+    );
+    let mut ctx_allow_with = ctx_allow;
+    ctx_allow_with.memory_store = Some(Arc::new(store_allow.clone()));
+    let out = reg
+        .execute(
+            &ctx_allow_with,
+            "mem_allow_1",
+            "memory_save",
+            &json!({ "content": "allowed by rule" }),
+        )
+        .await
+        .expect("allow-rule override");
+    let ToolOutput::Text { text } = out else {
+        panic!("expected Text confirmation");
+    };
+    assert!(text.contains("saved to"), "confirmation: {text}");
+    let body = std::fs::read_to_string(store_allow.path()).expect("read allowed memory");
+    assert!(body.contains("allowed by rule"));
+
+    // Deny rule wins in every mode.
+    let deny_rules = vec![PermissionRule {
+        tool: "memory_save".to_string(),
+        pattern: "*".to_string(),
+        action: RuleAction::Deny,
+    }];
+    let ctx_deny = make_ctx(
+        ws,
+        state_dir.join("deny_ctx_state"),
+        PermissionMode::Yolo,
+        deny_rules,
+    );
+    let mut ctx_deny_with = ctx_deny;
+    ctx_deny_with.memory_store = Some(Arc::new(store_ok));
+    let out = reg
+        .execute(
+            &ctx_deny_with,
+            "mem_deny_1",
+            "memory_save",
+            &json!({ "content": "must be denied" }),
+        )
+        .await;
+    assert!(out.is_err(), "deny rule must refuse memory_save");
+}

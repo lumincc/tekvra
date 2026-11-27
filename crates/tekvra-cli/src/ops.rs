@@ -11,13 +11,486 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use clap::Command as ClapCommand;
 use tekvra_config::{
-    ConfigPaths, McpServerConfig, ResolvedConfig, TrustStore, canonicalize_or_clean,
+    CliConfigOverrides, ConfigPaths, McpServerConfig, ResolvedConfig, TrustStore,
+    canonicalize_or_clean, load_config,
 };
 use tekvra_protocol::InputImage;
+use tekvra_storage::{StateIndex, UsageGroupBy, UsageRow};
 use tekvra_tools::{ConfiguredMcpGateway, McpGateway};
 
 /// Maximum accepted image attachment size per file (10 MiB).
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Parsed `tekvra usage` invocation.
+#[derive(Debug, Clone)]
+pub struct UsageOptions {
+    /// Optional trailing window in days.
+    pub days: Option<u32>,
+    /// Grouping key (model default).
+    pub by: UsageGroupBy,
+    /// Emit JSON instead of a table.
+    pub json: bool,
+    /// Optional CSV export path (full per-turn rows).
+    pub csv: Option<PathBuf>,
+}
+
+/// Parses the `--by` string into a [`UsageGroupBy`].
+///
+/// # Errors
+/// Returns an error for unknown grouping keys.
+pub fn parse_usage_group_by(by: &str) -> Result<UsageGroupBy> {
+    match by {
+        "model" => Ok(UsageGroupBy::Model),
+        "day" => Ok(UsageGroupBy::Day),
+        "session" => Ok(UsageGroupBy::Session),
+        other => bail!("unknown --by grouping `{other}`; expected model|day|session"),
+    }
+}
+
+/// Formats usage rows as an aligned ASCII table (costs to 4 decimals).
+pub fn format_usage_table(rows: &[UsageRow]) -> String {
+    if rows.is_empty() {
+        return "no usage recorded.\n".to_string();
+    }
+    let mut out = String::new();
+    let key_w = rows
+        .iter()
+        .map(|r| r.key.len())
+        .max()
+        .unwrap_or(3)
+        .max("KEY".len());
+    let num_w = 10usize;
+    out.push_str(&format!(
+        "{:<key_w$}  {:>num_w$}  {:>num_w$}  {:>num_w$}  {:>num_w$}  {:>10}\n",
+        "KEY", "INPUT", "CACHED", "OUTPUT", "REASON", "COST"
+    ));
+    for r in rows {
+        out.push_str(&format!(
+            "{:<key_w$}  {:>num_w$}  {:>num_w$}  {:>num_w$}  {:>num_w$}  {:>10.4}\n",
+            r.key,
+            r.input_tokens,
+            r.cached_input_tokens,
+            r.output_tokens,
+            r.reasoning_tokens,
+            r.cost_usd
+        ));
+    }
+    out
+}
+
+/// Escapes one CSV field per RFC 4180 (quote-wrap on comma/quote/newline).
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// Serializes per-turn usage rows as CSV (header + one line per record).
+pub fn format_usage_csv(rows: &[tekvra_storage::UsageRecordRow]) -> String {
+    let mut out = String::from(
+        "session_id,turn_id,model,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,cost_usd,recorded_at\n",
+    );
+    for r in rows {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{}\n",
+            csv_field(&r.session_id),
+            csv_field(&r.turn_id),
+            csv_field(&r.model),
+            r.input_tokens,
+            r.cached_input_tokens,
+            r.output_tokens,
+            r.reasoning_tokens,
+            r.cost_usd,
+            r.recorded_at,
+        ));
+    }
+    out
+}
+
+/// Runs `tekvra usage` against the local ledger (read-only; short-circuits before plugins).
+///
+/// # Errors
+/// Returns an error when the state index cannot be opened or the CSV target cannot be written.
+pub fn handle_usage_command(paths: &ConfigPaths, options: &UsageOptions) -> Result<()> {
+    let index = StateIndex::open(&paths.state_dir).context("opening state index")?;
+
+    if let Some(csv_path) = &options.csv {
+        let rows = index.usage_rows_since(options.days)?;
+        let body = format_usage_csv(&rows);
+        std::fs::write(csv_path, body)
+            .with_context(|| format!("writing CSV to {}", csv_path.display()))?;
+        println!("wrote {} usage rows to {}", rows.len(), csv_path.display());
+        return Ok(());
+    }
+
+    let rows = index.usage_aggregate(options.days, options.by)?;
+    if options.json {
+        let value = serde_json::json!({
+            "days": options.days,
+            "by": match options.by {
+                UsageGroupBy::Model => "model",
+                UsageGroupBy::Day => "day",
+                UsageGroupBy::Session => "session",
+            },
+            "rows": rows
+                .iter()
+                .map(|r| serde_json::json!({
+                    "key": r.key,
+                    "input_tokens": r.input_tokens,
+                    "cached_input_tokens": r.cached_input_tokens,
+                    "output_tokens": r.output_tokens,
+                    "reasoning_tokens": r.reasoning_tokens,
+                    "cost_usd": r.cost_usd,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).context("serializing usage JSON")?
+        );
+        return Ok(());
+    }
+    print!("{}", format_usage_table(&rows));
+    Ok(())
+}
+
+/// Runs `tekvra memory` — print the project MEMORY.md (path + content), or `--append TEXT`
+/// to add one dated entry. Stateless: short-circuits before plugins/session init.
+///
+/// # Errors
+/// Returns an error when appending fails (size caps, unwritable path).
+pub fn handle_memory_command(paths: &ConfigPaths, cwd: &Path, append: Option<&str>) -> Result<()> {
+    let store = tekvra_tools::MemoryStore::open(&paths.state_dir, cwd);
+    match append {
+        Some(entry) => {
+            store.append(entry)?;
+            println!("saved to {}", store.path().display());
+        }
+        None => {
+            println!("memory file: {}", store.path().display());
+            let content = store.load();
+            if content.trim().is_empty() {
+                println!("(empty)");
+            } else {
+                println!();
+                print!("{content}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One `tekvra doctor` health-check result.
+#[derive(Debug, Clone)]
+pub struct DoctorCheck {
+    /// Short check name.
+    pub name: String,
+    /// Outcome (`ok`, `warn`, `fail`).
+    pub status: &'static str,
+    /// Human detail line.
+    pub detail: String,
+}
+
+/// Parsed `tekvra doctor` invocation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DoctorOptions {
+    /// Emit the check array as JSON instead of a table.
+    pub json: bool,
+    /// Probe provider base URLs with a bounded HEAD (network access).
+    pub net: bool,
+}
+
+/// Runs the read-only `tekvra doctor` health checks (never heals; never prints tokens).
+///
+/// # Errors
+/// Returns an error when at least one check fails (exit-code signal); table/JSON output
+/// is still printed first.
+pub async fn handle_doctor_command(
+    paths: &ConfigPaths,
+    cwd: &Path,
+    overrides: &CliConfigOverrides,
+    options: DoctorOptions,
+) -> Result<()> {
+    let mut checks: Vec<DoctorCheck> = Vec::new();
+
+    // 1. Config load: notices downgrade to warns, hard load errors fail.
+    let resolved = match load_config(paths.clone(), cwd, overrides) {
+        Ok(resolved) => {
+            let notices = resolved.notices.len();
+            checks.push(DoctorCheck {
+                name: "config".to_string(),
+                status: if notices == 0 { "ok" } else { "warn" },
+                detail: if notices == 0 {
+                    "loaded clean".to_string()
+                } else {
+                    format!("loaded with {notices} notice(s)")
+                },
+            });
+            Some(resolved)
+        }
+        Err(err) => {
+            checks.push(DoctorCheck {
+                name: "config".to_string(),
+                status: "fail",
+                detail: err.to_string(),
+            });
+            None
+        }
+    };
+
+    // 2. Workspace trust.
+    let canonical = canonicalize_or_clean(cwd);
+    match TrustStore::load(&paths.state_dir) {
+        Ok(store) => {
+            if store.is_trusted(&canonical) {
+                checks.push(DoctorCheck {
+                    name: "trust".to_string(),
+                    status: "ok",
+                    detail: format!("{} is trusted", canonical.display()),
+                });
+            } else {
+                checks.push(DoctorCheck {
+                    name: "trust".to_string(),
+                    status: "warn",
+                    detail: format!(
+                        "{} is not trusted (run `tekvra trust allow`)",
+                        canonical.display()
+                    ),
+                });
+            }
+        }
+        Err(err) => checks.push(DoctorCheck {
+            name: "trust".to_string(),
+            status: "fail",
+            detail: err.to_string(),
+        }),
+    }
+
+    if let Some(resolved) = &resolved {
+        // 3. Per-provider: key env resolution + stored account names (never values).
+        let registry = tekvra_providers::ProviderRegistry::new();
+        let cred = tekvra_providers::CredentialStore::load(&paths.state_dir).ok();
+        for def in registry.iter() {
+            let accounts = cred
+                .as_ref()
+                .map(|c| c.list_for_provider(&def.id).len())
+                .unwrap_or(0);
+            let env_state = match def.default_api_key_env.as_deref() {
+                Some(key) if std::env::var_os(key).is_some_and(|v| !v.is_empty()) => "set",
+                Some(key) => key,
+                None => "none",
+            };
+            let status = if accounts > 0 || env_state == "set" {
+                "ok"
+            } else {
+                "warn"
+            };
+            checks.push(DoctorCheck {
+                name: format!("provider {}", def.id),
+                status,
+                detail: format!("api_key_env {env_state}; {} stored account(s)", accounts),
+            });
+        }
+        for (id, entry) in &resolved.providers.providers {
+            let base = entry.base_url.as_deref().unwrap_or("(builtin)");
+            checks.push(DoctorCheck {
+                name: format!("provider {id} (custom)"),
+                status: "ok",
+                detail: format!("base_url {base}"),
+            });
+        }
+
+        // 4. MCP server commands resolvable on PATH.
+        for (name, server) in &resolved.settings.mcp_servers {
+            let Some(cmd) = server.command.as_deref() else {
+                continue;
+            };
+            let found = resolve_on_path(cmd).is_some();
+            checks.push(DoctorCheck {
+                name: format!("mcp {name}"),
+                status: if found { "ok" } else { "warn" },
+                detail: if found {
+                    format!("`{cmd}` found")
+                } else {
+                    format!("`{cmd}` not found on PATH")
+                },
+            });
+        }
+    }
+
+    // 5. state.db opens read-write and passes integrity_check.
+    match tekvra_storage::StateIndex::open(&paths.state_dir) {
+        Ok(index) => match index.integrity_check() {
+            Ok(detail) => checks.push(DoctorCheck {
+                name: "state.db".to_string(),
+                status: "ok",
+                detail,
+            }),
+            Err(err) => checks.push(DoctorCheck {
+                name: "state.db".to_string(),
+                status: "fail",
+                detail: err.to_string(),
+            }),
+        },
+        Err(err) => checks.push(DoctorCheck {
+            name: "state.db".to_string(),
+            status: "fail",
+            detail: err.to_string(),
+        }),
+    }
+
+    // 6. State dirs writable (scratch probe, cleaned up after).
+    let scratch = paths.state_dir.join("doctor-scratch");
+    match std::fs::create_dir_all(&scratch) {
+        Ok(()) => {
+            let writable = std::fs::write(scratch.join("probe"), b"ok").is_ok();
+            let _ = std::fs::remove_dir_all(&scratch);
+            checks.push(DoctorCheck {
+                name: "state-dirs".to_string(),
+                status: if writable { "ok" } else { "fail" },
+                detail: format!("{} writable: {}", paths.state_dir.display(), writable),
+            });
+        }
+        Err(err) => checks.push(DoctorCheck {
+            name: "state-dirs".to_string(),
+            status: "fail",
+            detail: format!("{}: {err}", paths.state_dir.display()),
+        }),
+    }
+
+    // 7. Tool presence (warn-only).
+    for (name, args) in [("git", &["--version"][..]), ("cargo", &["--version"][..])] {
+        let present = StdCommand::new(name)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        checks.push(DoctorCheck {
+            name: name.to_string(),
+            status: if present { "ok" } else { "warn" },
+            detail: if present {
+                "found".to_string()
+            } else {
+                "not found (warn-only)".to_string()
+            },
+        });
+    }
+
+    // 8. Optional network probe (bounded TCP connect per builtin provider base URL).
+    if options.net {
+        let registry = tekvra_providers::ProviderRegistry::new();
+        for def in registry.iter() {
+            let host_port = host_port_of(&def.base_url);
+            let detail = match host_port {
+                Some((host, port)) => {
+                    let timeout = std::time::Duration::from_secs(5);
+                    match tokio::time::timeout(
+                        timeout,
+                        tokio::net::TcpStream::connect((host.as_str(), port)),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => format!("tcp {host}:{port} reachable"),
+                        Ok(Err(e)) => format!("tcp {host}:{port}: {e}"),
+                        Err(_) => format!("tcp {host}:{port}: timed out after 5s"),
+                    }
+                }
+                None => "unparseable base_url".to_string(),
+            };
+            checks.push(DoctorCheck {
+                name: format!("net {}", def.id),
+                status: if detail.contains("reachable") {
+                    "ok"
+                } else {
+                    "warn"
+                },
+                detail,
+            });
+        }
+    }
+
+    // Report.
+    let failed = checks.iter().filter(|c| c.status == "fail").count();
+    if options.json {
+        let arr = checks
+            .iter()
+            .map(|c| serde_json::json!({ "name": c.name, "status": c.status, "detail": c.detail }))
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "checks": arr,
+                "healthy": failed == 0,
+            }))?
+        );
+    } else {
+        for c in &checks {
+            println!(
+                "[{:>4}] {:28} {}",
+                c.status.to_uppercase(),
+                c.name,
+                c.detail
+            );
+        }
+        println!("\n{} check(s), {failed} failure(s)", checks.len());
+    }
+    if failed == 0 {
+        Ok(())
+    } else {
+        bail!("doctor found {failed} failing check(s)");
+    }
+}
+
+/// Extracts `(host, port)` from an HTTP(S) base URL without a URL crate.
+#[must_use]
+fn host_port_of(base_url: &str) -> Option<(String, u16)> {
+    let rest = base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"))?;
+    let host_part = rest.split(['/', '?', '#']).next()?;
+    let (host, port) = if let Some((h, p)) = host_part.rsplit_once(':') {
+        (h.to_string(), p.parse::<u16>().ok()?)
+    } else if base_url.starts_with("https://") {
+        (host_part.to_string(), 443)
+    } else {
+        (host_part.to_string(), 80)
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some((host, port))
+    }
+}
+
+/// `which`-style PATH scan for a command name (Windows-aware via PATHEXT).
+#[must_use]
+fn resolve_on_path(cmd: &str) -> Option<PathBuf> {
+    let candidates: Vec<PathBuf> = if cmd.contains('/') || cmd.contains('\\') {
+        vec![PathBuf::from(cmd)]
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .flat_map(|dir| {
+                #[cfg(windows)]
+                {
+                    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT".into());
+                    let mut v = vec![dir.join(cmd)];
+                    for ext in exts.split(';').filter(|e| !e.is_empty()) {
+                        v.push(dir.join(format!("{cmd}{}", ext.to_ascii_lowercase())));
+                    }
+                    v
+                }
+                #[cfg(not(windows))]
+                {
+                    vec![dir.join(cmd)]
+                }
+            })
+            .collect()
+    };
+    candidates.into_iter().find(|p| p.is_file())
+}
 
 // ---------------------------------------------------------------------------
 // trust

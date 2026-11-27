@@ -41,10 +41,13 @@ pub struct ModelJobRouting {
     pub title: Option<String>,
     /// Lightweight/fast helper model.
     pub fast: Option<String>,
+    /// Ordered fallback model specs for the `Main` role (consulted when the primary's
+    /// provider is exhausted or dies with a non-retryable error; chain depth cap 3).
+    pub fallback: Option<Vec<String>>,
 }
 
 /// Shell environment sanitization and foreground timeout configuration (`[agent]`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentSettings {
     /// Default session permission mode on startup.
@@ -69,6 +72,22 @@ pub struct AgentSettings {
     pub subagent_max_depth: u32,
     /// Optional `web_search` HTML endpoint override (default: DuckDuckGo HTML Lite).
     pub websearch_base_url: Option<String>,
+    /// Optional cumulative spend cap in USD. Enforcement is at turn start; in-flight turns
+    /// always complete.
+    pub spend_limit_usd: Option<f64>,
+    /// Aggregation window for the spend cap (`session` default, `day`).
+    pub spend_limit_window: SpendWindow,
+}
+
+/// Window over which the spend cap accumulates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpendWindow {
+    /// Cumulative cost of the current session.
+    #[default]
+    Session,
+    /// Cumulative cost since the start of the local calendar day.
+    Day,
 }
 
 impl Default for AgentSettings {
@@ -85,6 +104,8 @@ impl Default for AgentSettings {
             auto_title: false,
             subagent_max_depth: 1,
             websearch_base_url: None,
+            spend_limit_usd: None,
+            spend_limit_window: SpendWindow::Session,
         }
     }
 }
@@ -143,7 +164,7 @@ pub struct ProfileOverride {
 }
 
 /// Declarative `tekvra.toml` document structure.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TekvraToml {
     /// Schema version (`CURRENT_CONFIG_VERSION`).

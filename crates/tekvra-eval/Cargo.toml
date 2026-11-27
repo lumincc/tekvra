@@ -1,0 +1,26 @@
+[package]
+name = "tekvra-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Hermetic golden-task evals and perf smokes (cargo test -p tekvra-eval = eval gate)"
+
+[lints]
+workspace = true
+
+[dependencies]
+tekvra-protocol = { workspace = true }
+tekvra-config = { workspace = true }
+tekvra-providers = { workspace = true }
+tekvra-storage = { workspace = true }
+tekvra-core = { workspace = true }
+tekvra-tools = { workspace = true }
+
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }

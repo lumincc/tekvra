@@ -193,6 +193,9 @@ pub struct TuiRuntimeHooks {
     pub on_plugin_command: Option<PluginCommandHandler>,
     /// Invoked on `/mcp` to format live MCP server and tool status.
     pub on_mcp_status: Option<Box<dyn FnMut() -> String + Send>>,
+
+    /// `/memory` support: returns the project memory content plus its file path.
+    pub on_memory_view: Option<Box<dyn FnMut() -> String + Send>>,
     /// Invoked on `/review` to execute a read-only diff review pass.
     pub on_run_review: Option<Box<dyn FnMut(ReviewTarget) -> BoxReviewFuture + Send>>,
     /// Invoked when the user selects a session to resume or fork in `/sessions`.
@@ -235,6 +238,8 @@ pub struct TuiApp {
     pub skills: Vec<(String, String)>,
     /// Selectable models for the interactive `/model` picker.
     pub available_models: Vec<(String, String)>,
+    /// `/memory` support: returns the project memory content plus its file path.
+    pub memory_view: Option<Box<dyn FnMut() -> String + Send>>,
     /// Context window (tokens) of the active model for utilization telemetry.
     pub context_window: u64,
     /// Active inline `/` or `@file` fuzzy completion popup.
@@ -269,6 +274,7 @@ impl TuiApp {
             extra_slash_commands: Vec::new(),
             skills: Vec::new(),
             available_models: Vec::new(),
+            memory_view: None,
             context_window: 0,
             completion: None,
             overlay: ActiveOverlay::None,
@@ -292,6 +298,11 @@ impl TuiApp {
     pub fn set_extra_slash_commands(&mut self, cmds: Vec<(String, String)>) {
         self.extra_slash_commands = cmds;
         self.refresh_completions();
+    }
+
+    /// Attaches the `/memory` viewer (project memory content + file path).
+    pub fn set_memory_view(&mut self, cb: Box<dyn FnMut() -> String + Send>) {
+        self.memory_view = Some(cb);
     }
 
     /// Sets discovered `(name, description)` SKILL.md packages for `/skill` completion.
@@ -1190,6 +1201,29 @@ impl TuiApp {
                 if trimmed == "/mcp" {
                     return TuiCommand::ShowMcpStatus;
                 }
+                if trimmed == "/memory" || trimmed == "/memory edit" {
+                    let edit = trimmed == "/memory edit";
+                    let text = match self.memory_view.as_mut() {
+                        Some(cb) => cb(),
+                        None => "Project memory unavailable (no memory hook attached).".to_string(),
+                    };
+                    if edit {
+                        // Purely informational: MEMORY.md is plain Markdown, edit it in any editor.
+                        let path = text.lines().next().unwrap_or("<unknown path>").to_string();
+                        self.main_transcript.push(TranscriptEntry::SystemBanner {
+                            tag: "memory".to_string(),
+                            text: format!(
+                                "Edit {path} in your editor; it is re-read at session start."
+                            ),
+                        });
+                    } else {
+                        self.main_transcript.push(TranscriptEntry::SystemBanner {
+                            tag: "memory".to_string(),
+                            text,
+                        });
+                    }
+                    return TuiCommand::Noop;
+                }
                 if trimmed == "/model" || trimmed.starts_with("/model ") {
                     let arg = trimmed.strip_prefix("/model").unwrap_or_default().trim();
                     if arg.is_empty() {
@@ -1951,6 +1985,9 @@ pub async fn run_fullscreen_tui(
     app.set_workspace_files(std::mem::take(&mut hooks.workspace_files));
     app.set_extra_slash_commands(std::mem::take(&mut hooks.extra_slash_commands));
     app.set_discovered_skills(std::mem::take(&mut hooks.discovered_skills));
+    if let Some(cb) = hooks.on_memory_view.take() {
+        app.set_memory_view(cb);
+    }
     app.set_model_catalog(
         std::mem::take(&mut hooks.available_models),
         snap.context_window,
@@ -2267,6 +2304,7 @@ fn event_thread_id(ev: &SessionEvent) -> Option<&str> {
         | SessionEvent::SteeringInjected { thread_id, .. }
         | SessionEvent::ApprovalRequested { thread_id, .. }
         | SessionEvent::UserInputRequested { thread_id, .. }
+        | SessionEvent::TurnRefused { thread_id, .. }
         | SessionEvent::DiffUpdated { thread_id, .. }
         | SessionEvent::PlanUpdated { thread_id, .. }
         | SessionEvent::ReviewCompleted { thread_id, .. }

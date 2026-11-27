@@ -1122,7 +1122,7 @@ fn parse_retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<Dur
         .map(Duration::from_secs)
 }
 
-fn is_retryable_status(status: u16) -> bool {
+pub(crate) fn is_retryable_status(status: u16) -> bool {
     matches!(status, 502 | 503 | 504 | 529 | 429)
 }
 

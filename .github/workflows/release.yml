@@ -93,6 +93,9 @@ jobs:
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             native_smoke: true
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            native_smoke: true
     defaults:
       run:
         shell: bash

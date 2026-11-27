@@ -1,0 +1,1 @@
+- 2026-11-28: golden fixture workspace for the write-file task

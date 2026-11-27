@@ -4082,6 +4082,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tekvra-protocol",
+ "tekvra-providers",
  "tempfile",
  "thiserror 2.0.21",
  "toml",
@@ -4113,6 +4114,22 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "tekvra-eval"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "tekvra-config",
+ "tekvra-core",
+ "tekvra-protocol",
+ "tekvra-providers",
+ "tekvra-storage",
+ "tekvra-tools",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -4200,6 +4217,7 @@ dependencies = [
  "ignore",
  "indexmap",
  "ipnet",
+ "jiff",
  "monty",
  "monty-types",
  "portable-pty",

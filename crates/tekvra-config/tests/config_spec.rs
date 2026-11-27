@@ -3,7 +3,7 @@
 use std::fs;
 
 use tekvra_config::{
-    CURRENT_CONFIG_VERSION, CliConfigOverrides, ConfigPaths, TrustStore, load_config,
+    CURRENT_CONFIG_VERSION, CliConfigOverrides, ConfigPaths, SpendWindow, TrustStore, load_config,
     merge_instructions_markdown,
 };
 use tekvra_protocol::{PermissionMode, RuleAction};
@@ -291,4 +291,75 @@ fn nested_agents_md_and_skills_discovery_root_to_leaf() {
     assert_eq!(resolved.skills.len(), 1);
     assert_eq!(resolved.skills[0].name, "db-migrations");
     assert_eq!(resolved.skills[0].description, "Run safe schema migrations");
+}
+
+#[test]
+fn spend_cap_defaults_unset_and_both_windows_parse() {
+    let tmp = TempDir::new().expect("tempdir");
+    let paths = make_test_paths(&tmp);
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join(".git")).expect("create .git");
+
+    let resolved =
+        load_config(paths.clone(), &repo, &CliConfigOverrides::default()).expect("defaults");
+    assert_eq!(resolved.settings.agent.spend_limit_usd, None);
+    assert_eq!(
+        resolved.settings.agent.spend_limit_window,
+        SpendWindow::Session
+    );
+
+    fs::write(
+        paths.global_config_dir.join("tekvra.toml"),
+        "version = 2\n[agent]\nspend_limit_usd = 25.0\nspend_limit_window = \"day\"\n",
+    )
+    .expect("write toml");
+    let resolved =
+        load_config(paths, &repo, &CliConfigOverrides::default()).expect("capped config");
+    assert!((resolved.settings.agent.spend_limit_usd.unwrap() - 25.0).abs() < 1e-9);
+    assert_eq!(resolved.settings.agent.spend_limit_window, SpendWindow::Day);
+}
+
+#[test]
+fn model_fallback_chain_parses_and_defaults_empty() {
+    let tmp = TempDir::new().expect("tempdir");
+    let paths = make_test_paths(&tmp);
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join(".git")).expect("create .git");
+
+    let resolved =
+        load_config(paths.clone(), &repo, &CliConfigOverrides::default()).expect("defaults");
+    assert!(resolved.settings.models.fallback.is_none());
+
+    fs::write(
+        paths.global_config_dir.join("tekvra.toml"),
+        "version = 2\n[models]\nfallback = [\"anthropic/claude-sonnet-4-5\", \"gemini/gemini-3-pro\", \"openai/gpt-5.4-codex\"]\n",
+    )
+    .expect("write toml");
+    let resolved =
+        load_config(paths, &repo, &CliConfigOverrides::default()).expect("fallback config");
+    assert_eq!(
+        resolved.settings.models.fallback,
+        Some(vec![
+            "anthropic/claude-sonnet-4-5".to_string(),
+            "gemini/gemini-3-pro".to_string(),
+            "openai/gpt-5.4-codex".to_string()
+        ])
+    );
+
+    // Chain accessor: Main carries [primary, ...fallbacks], deduped against the primary
+    // and depth-capped (FALLBACK_CHAIN_CAP = 3 incl. primary); others stay empty.
+    let router = tekvra_providers::ModelRouter::from_config(
+        &resolved,
+        tekvra_providers::ProviderRegistry::new(),
+    );
+    let main_chain = router.fallback_chain_for_job(tekvra_providers::JobRole::Main);
+    assert_eq!(main_chain[0], "openai/gpt-5.4-codex");
+    assert_eq!(main_chain[1], "anthropic/claude-sonnet-4-5");
+    assert_eq!(main_chain[2], "gemini/gemini-3-pro");
+    assert_eq!(main_chain.len(), 3, "primary dedupe + cap of 3");
+    assert!(
+        router
+            .fallback_chain_for_job(tekvra_providers::JobRole::Compact)
+            .is_empty()
+    );
 }

@@ -19,6 +19,7 @@ REQUIRED_TARGETS = (
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
 )
 
 REQUIRED_CI_JOBS = ("fmt:", "lint:", "test:", "windows:", "deny:", "ci-gate:")

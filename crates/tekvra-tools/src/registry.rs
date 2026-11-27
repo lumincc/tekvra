@@ -17,6 +17,7 @@ use crate::fs_tools::{
     file_read, file_write, view_image,
 };
 use crate::lsp_client::LspManager;
+use crate::memory::MemoryStore;
 use crate::patch::{PatchHunk, apply_patch_to_workspace, parse_patch};
 use crate::permissions::{PermissionDecision, PermissionEvaluator, ToolAction};
 use crate::pty::{PtyCommandRequest, PtySessionManager};
@@ -69,6 +70,8 @@ pub struct ToolExecutionContext {
     pub question_cb: Option<Arc<dyn QuestionCallback>>,
     /// Optional session-scoped language-server manager (`lsp_diagnostics`).
     pub lsp_manager: Option<Arc<LspManager>>,
+    /// Project memory store (`memory_save` tool; `None` when memory is unavailable).
+    pub memory_store: Option<Arc<MemoryStore>>,
     /// Latest session plan Markdown updated via `plan`.
     pub plan_markdown: Arc<Mutex<String>>,
 }
@@ -255,6 +258,17 @@ pub fn build_tool_definitions_for_model(model: &ModelCapabilities) -> Vec<ToolDe
                     "server": { "type": "string", "description": "Optional [lsp.<id>] key; auto-selected when omitted." }
                 },
                 "required": ["path"]
+            }),
+        ),
+        (
+            "memory_save",
+            "Append a durable fact to the cross-session project memory (dated entry in MEMORY.md).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string", "description": "Single fact worth remembering across sessions." }
+                },
+                "required": ["content"]
             }),
         ),
         (
@@ -730,6 +744,20 @@ impl NativeToolRegistry {
                         .join("\n");
                     Ok(ToolOutput::Text { text: body })
                 }
+            }
+            "memory_save" => {
+                let content = req_str(args, "content")?;
+                self.authorize(ctx, call_id, ToolAction::UpdateMemory)
+                    .await?;
+                let Some(store) = &ctx.memory_store else {
+                    return Err(ToolsError::invalid(
+                        "`memory_save` requires project memory (state dir unavailable)",
+                    ));
+                };
+                store.append(content)?;
+                Ok(ToolOutput::Text {
+                    text: format!("saved to {}", store.path().display()),
+                })
             }
             "code" => {
                 let snippet = req_str(args, "code")?;

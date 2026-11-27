@@ -113,3 +113,49 @@ tekvra mcp test remote_docs                  # one-shot handshake; prints discov
 ```
 
 `add`/`remove` edit `<repo>/.tekvra/tekvra.toml` (project scope, the default) or the user-global file via `toml_edit::DocumentMut`, so unrelated comments and formatting survive the mutation. `--command` (stdio) and `--url` (HTTP) are mutually exclusive; trailing arguments after `--` become the stdio argv. `test` performs a one-shot `initialize` + `tools/list` handshake against a single server and prints `name/tool` pairs (non-zero exit when the handshake fails).
+
+## Spend Cap (`agent.spend_limit_usd`)
+
+Set a hard ceiling on cumulative USD spend; the next turn after crossing it is refused with
+`TurnRefused` (the in-flight turn that crosses the cap still completes):
+
+```toml
+[agent]
+spend_limit_usd = 5.0                 # omit the key entirely to disable (default)
+spend_limit_window = "session"        # "session" (default) or "day"
+```
+
+- `session`: spend accumulates across the whole session (all turns, all models).
+- `day`: spend accumulates per UTC calendar day (the state ledger records UTC timestamps;
+  the day boundary is UTC, not local time — documented deviation for zero new dependencies).
+- Raising or removing `spend_limit_usd` unblocks a refused session immediately (checked at
+  turn start, no restart needed). Surfaces: the TUI/app-server `thread/tokenUsage/updated`
+  payload carries `remainingBudget { limitUsd, spentUsd, remainingUsd }`, and
+  `account/rateLimits` reports `spendControlReached`.
+
+## Model Fallback Chains (`models.fallback`)
+
+```toml
+[models]
+fallback = ["anthropic/claude-sonnet-4-5", "gemini/gemini-3-pro"]
+```
+
+When the primary `Main` model fails HARD — provider accounts exhausted, transport down, or a
+non-retryable HTTP status (anything outside 429/502/503/504/529) — the turn loop advances down
+the chain with a steering-note announcement (`model_fallback`) naming the failed and taken
+specs. Retryable statuses keep using the same-model retry path. The chain is depth-capped at 3
+(incl. primary), deduped against the primary, and `Main`-role only: every other job role
+(`plan`, `compact`, …) fails loudly instead of silently degrading. Usage is attributed to the
+model that actually served the turn; exhausting the whole chain fails the turn with every
+attempt named.
+
+## Project Memory (state_dir memory)
+
+Tekvra keeps a per-project scratch file at `<state_dir>/memory/<project-slug>/MEMORY.md`
+(dated `- YYYY-MM-DD:` lines, 8 KiB per entry / 256 KiB per file). It is injected as a
+`## Project memory` section after the workspace instructions (stable position → prompt-cache
+friendly). The model appends entries through the `memory_save` tool (Build/Auto/Yolo prompt,
+ReadOnly/Plan deny, `allow`/`deny` rules honored — see
+[tools-and-permissions](./tools-and-permissions.md)). Interactive surfaces: `/memory` prints
+path + content, `/memory edit` prints the path for manual editing, and `tekvra memory`
+(`--append TEXT`) reads/appends statelessly outside any session.

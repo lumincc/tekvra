@@ -80,6 +80,65 @@ pub struct RetainedOutputPage {
     pub lines: Vec<String>,
 }
 
+/// Grouping key for [`StateIndex::usage_aggregate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageGroupBy {
+    /// One row per `usage_ledger.model`.
+    Model,
+    /// One row per local calendar day (`date(recorded_at, 'unixepoch', 'localtime')`).
+    Day,
+    /// One row per `usage_ledger.session_id`.
+    Session,
+}
+
+/// One aggregated usage row: totals per group key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageRow {
+    /// Group key (model name / local date / session id).
+    pub key: String,
+    /// Uncached + cached input tokens.
+    pub input_tokens: u64,
+    /// Tokens served from prompt cache.
+    pub cached_input_tokens: u64,
+    /// Generated output tokens.
+    pub output_tokens: u64,
+    /// Reasoning tokens included in output.
+    pub reasoning_tokens: u64,
+    /// Sum of `cost_usd`.
+    pub cost_usd: f64,
+}
+
+/// One full per-turn ledger row (for CSV export).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageRecordRow {
+    /// Owning session id.
+    pub session_id: String,
+    /// Turn id within the session.
+    pub turn_id: String,
+    /// Serving model spec.
+    pub model: String,
+    /// Uncached + cached input tokens.
+    pub input_tokens: u64,
+    /// Tokens served from prompt cache.
+    pub cached_input_tokens: u64,
+    /// Generated output tokens.
+    pub output_tokens: u64,
+    /// Reasoning tokens included in output.
+    pub reasoning_tokens: u64,
+    /// Turn cost in USD.
+    pub cost_usd: f64,
+    /// Unix-seconds write timestamp.
+    pub recorded_at: i64,
+}
+
+/// Current unix time in seconds (wall clock; single source for window math).
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 /// SQLite (`WAL` + `FTS5`) index backing fast session queries, search, ledgers, and raw output logs.
 pub struct StateIndex {
     state_dir: PathBuf,
@@ -95,6 +154,26 @@ impl std::fmt::Debug for StateIndex {
 }
 
 impl StateIndex {
+    /// Runs SQLite `PRAGMA integrity_check` against `state.db`.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] when the pragma reports corruption or the query fails.
+    pub fn integrity_check(&self) -> Result<String, StorageError> {
+        let result: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(|e| StorageError::Sqlite {
+                message: e.to_string(),
+            })?;
+        if result == "ok" {
+            Ok("integrity_check: ok".to_string())
+        } else {
+            Err(StorageError::Sqlite {
+                message: format!("integrity_check: {result}"),
+            })
+        }
+    }
+
     /// Opens or initializes `<state_dir>/state.db` in WAL mode with FTS5 enabled.
     ///
     /// # Errors
@@ -151,6 +230,9 @@ impl StateIndex {
                 cost_usd REAL NOT NULL,
                 recorded_at INTEGER NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_usage_recorded
+                ON usage_ledger(recorded_at);
 
             CREATE TABLE IF NOT EXISTS permission_grants (
                 id TEXT PRIMARY KEY,
@@ -459,6 +541,140 @@ impl StateIndex {
             .map_err(|e| StorageError::Sqlite {
                 message: e.to_string(),
             })
+    }
+
+    /// Queries cumulative [`TokenUsage`] recorded since `since_epoch` (unix seconds).
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] on SQLite failure.
+    pub fn usage_totals_since(&self, since_epoch: i64) -> Result<TokenUsage, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(cached_input_tokens),0),
+                        COALESCE(SUM(output_tokens),0), COALESCE(SUM(reasoning_tokens),0),
+                        COALESCE(SUM(cost_usd),0.0)
+                 FROM usage_ledger WHERE recorded_at >= ?1",
+                params![since_epoch],
+                |row| {
+                    Ok(TokenUsage {
+                        input_tokens: row.get::<_, i64>(0)? as u64,
+                        cached_input_tokens: row.get::<_, i64>(1)? as u64,
+                        output_tokens: row.get::<_, i64>(2)? as u64,
+                        reasoning_tokens: row.get::<_, i64>(3)? as u64,
+                        cost_usd: row.get::<_, f64>(4)?,
+                    })
+                },
+            )
+            .map_err(|e| StorageError::Sqlite {
+                message: e.to_string(),
+            })
+    }
+
+    /// Aggregates [`usage_ledger`] rows over an optional window, grouped by
+    /// model / local day / session.
+    ///
+    /// `None` window means the whole ledger. Rows are ordered by descending cost.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] on SQLite failure.
+    pub fn usage_aggregate(
+        &self,
+        window_days: Option<u32>,
+        group_by: UsageGroupBy,
+    ) -> Result<Vec<UsageRow>, StorageError> {
+        let group_expr = match group_by {
+            UsageGroupBy::Model => "model",
+            UsageGroupBy::Day => "date(recorded_at, 'unixepoch', 'localtime')",
+            UsageGroupBy::Session => "session_id",
+        };
+        let sql = format!(
+            "SELECT {group_expr} AS key,
+                    COALESCE(SUM(input_tokens),0)   AS input_tokens,
+                    COALESCE(SUM(cached_input_tokens),0) AS cached_input_tokens,
+                    COALESCE(SUM(output_tokens),0)  AS output_tokens,
+                    COALESCE(SUM(reasoning_tokens),0) AS reasoning_tokens,
+                    COALESCE(SUM(cost_usd),0.0)     AS cost_usd
+             FROM usage_ledger {where_clause}
+             GROUP BY key
+             ORDER BY cost_usd DESC, key ASC",
+            where_clause = match window_days {
+                Some(days) => format!(
+                    "WHERE recorded_at >= {}",
+                    now_epoch().saturating_sub(i64::from(days) * 86_400)
+                ),
+                None => String::new(),
+            },
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| StorageError::Sqlite {
+            message: e.to_string(),
+        })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(UsageRow {
+                    key: row.get::<_, String>(0)?,
+                    input_tokens: row.get::<_, i64>(1)? as u64,
+                    cached_input_tokens: row.get::<_, i64>(2)? as u64,
+                    output_tokens: row.get::<_, i64>(3)? as u64,
+                    reasoning_tokens: row.get::<_, i64>(4)? as u64,
+                    cost_usd: row.get::<_, f64>(5)?,
+                })
+            })
+            .map_err(|e| StorageError::Sqlite {
+                message: e.to_string(),
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StorageError::Sqlite {
+                message: e.to_string(),
+            })?;
+        Ok(rows)
+    }
+
+    /// Returns full per-turn ledger rows (newest first) within an optional window.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] on SQLite failure.
+    pub fn usage_rows_since(
+        &self,
+        window_days: Option<u32>,
+    ) -> Result<Vec<UsageRecordRow>, StorageError> {
+        let sql = format!(
+            "SELECT session_id, turn_id, model, input_tokens, cached_input_tokens,
+                    output_tokens, reasoning_tokens, cost_usd, recorded_at
+             FROM usage_ledger {where_clause}
+             ORDER BY recorded_at DESC, id DESC",
+            where_clause = match window_days {
+                Some(days) => format!(
+                    "WHERE recorded_at >= {}",
+                    now_epoch().saturating_sub(i64::from(days) * 86_400)
+                ),
+                None => String::new(),
+            },
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| StorageError::Sqlite {
+            message: e.to_string(),
+        })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(UsageRecordRow {
+                    session_id: row.get(0)?,
+                    turn_id: row.get(1)?,
+                    model: row.get(2)?,
+                    input_tokens: row.get::<_, i64>(3)? as u64,
+                    cached_input_tokens: row.get::<_, i64>(4)? as u64,
+                    output_tokens: row.get::<_, i64>(5)? as u64,
+                    reasoning_tokens: row.get::<_, i64>(6)? as u64,
+                    cost_usd: row.get(7)?,
+                    recorded_at: row.get(8)?,
+                })
+            })
+            .map_err(|e| StorageError::Sqlite {
+                message: e.to_string(),
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StorageError::Sqlite {
+                message: e.to_string(),
+            })?;
+        Ok(rows)
     }
 
     /// Persists a `Project` or `Global` permission grant.

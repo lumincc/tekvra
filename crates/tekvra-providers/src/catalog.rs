@@ -472,12 +472,16 @@ impl JobRole {
     }
 }
 
+/// Maximum depth of a configured `Main` fallback chain (primary + up to 2 fallbacks).
+pub const FALLBACK_CHAIN_CAP: usize = 3;
+
 /// Resolves job-specific models without mutating prior conversation history.
 #[derive(Debug, Clone)]
 pub struct ModelRouter {
     registry: ProviderRegistry,
     default_model: String,
     job_bindings: BTreeMap<JobRole, String>,
+    main_fallbacks: Vec<String>,
 }
 
 impl ModelRouter {
@@ -501,11 +505,46 @@ impl ModelRouter {
                 job_bindings.insert(role, spec.clone());
             }
         }
+        let mut main_fallbacks = r.fallback.clone().unwrap_or_default();
+        main_fallbacks.truncate(FALLBACK_CHAIN_CAP);
         Self {
             registry,
             default_model: config.settings.model.clone(),
             job_bindings,
+            main_fallbacks,
         }
+    }
+
+    /// Ordered fallback chain for `role` (primary first): only the `Main` role carries a
+    /// configured chain; every other role fails loudly rather than silently degrading.
+    #[must_use]
+    pub fn fallback_chain_for_job(&self, role: JobRole) -> Vec<String> {
+        if role != JobRole::Main {
+            return Vec::new();
+        }
+        let primary = self
+            .job_bindings
+            .get(&JobRole::Main)
+            .unwrap_or(&self.default_model)
+            .clone();
+        let mut chain = vec![primary];
+        for spec in &self.main_fallbacks {
+            if !chain.contains(spec) {
+                chain.push(spec.clone());
+            }
+        }
+        chain
+    }
+
+    /// Resolves an arbitrary model spec (fallback chains use this to hop models).
+    ///
+    /// # Errors
+    /// Returns [`ProviderError`] if the spec references an unknown provider.
+    pub fn route_spec(
+        &self,
+        spec: &str,
+    ) -> Result<(&ProviderDefinition, ModelCapabilities), ProviderError> {
+        self.registry.resolve_model_spec(spec)
     }
 
     /// Updates the session's active `Main` model spec in memory.

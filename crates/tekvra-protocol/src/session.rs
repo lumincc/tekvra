@@ -204,6 +204,13 @@ pub enum SessionEvent {
         /// Prompt payload.
         prompt: ApprovalPrompt,
     },
+    /// A turn was refused before it started (e.g., spend cap reached). No frame was written.
+    TurnRefused {
+        /// Session/thread id.
+        thread_id: String,
+        /// Actionable refusal reason (limit, spent total, fix hint).
+        reason: String,
+    },
     /// Interactive user question input requested.
     UserInputRequested {
         /// Session/thread id.
