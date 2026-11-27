@@ -1184,7 +1184,15 @@ async fn windows_pty_capture_diagnostics() {
                 continue;
             }
         };
-        // Drain for up to 6s, recording bytes as they arrive.
+        let writer_arc = Arc::new(Mutex::new(match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(e) => {
+                println!("PROBE {}: writer ERROR {e}", probe.label);
+                continue;
+            }
+        }));
+        // Drain for up to 6s, recording bytes as they arrive; answer DSR cursor
+        // requests like the product reader does.
         let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
         let captured_reader = Arc::clone(&captured);
         let reader_task = std::thread::spawn(move || {
@@ -1192,7 +1200,16 @@ async fn windows_pty_capture_diagnostics() {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => captured_reader.lock().unwrap().extend_from_slice(&buf[..n]),
+                    Ok(n) => {
+                        if buf[..n].windows(4).any(|w| w == b"\x1b[6n") {
+                            let mut w = writer_arc
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let _ = w.write_all(b"\x1b[1;1R");
+                            let _ = w.flush();
+                        }
+                        captured_reader.lock().unwrap().extend_from_slice(&buf[..n]);
+                    }
                 }
             }
         });
@@ -1207,6 +1224,9 @@ async fn windows_pty_capture_diagnostics() {
         }
         let still_alive = exit.is_none();
         let _ = child.kill();
+        // Close the master so the reader's blocking read hits EOF instead of
+        // deadlocking the join below (killing the child does not EOF the pipe).
+        drop(pair.master);
         let _ = reader_task.join();
         let bytes = captured.lock().unwrap().clone();
         println!(

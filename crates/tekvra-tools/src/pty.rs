@@ -159,7 +159,7 @@ struct ActivePtySession {
     command: String,
     conversation_id: String,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     shared: Arc<Mutex<PtySharedBuffer>>,
     notify: Arc<Notify>,
@@ -244,9 +244,11 @@ impl PtySessionManager {
             .map_err(|e| ToolsError::Pty {
                 message: format!("failed to clone PTY reader: {e}"),
             })?;
-        let writer = pair.master.take_writer().map_err(|e| ToolsError::Pty {
-            message: format!("failed to take PTY stdin writer: {e}"),
-        })?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| {
+            ToolsError::Pty {
+                message: format!("failed to take PTY stdin writer: {e}"),
+            }
+        })?));
 
         let session_id = format!("pty_{}", Uuid::now_v7().simple());
         let shared = Arc::new(Mutex::new(PtySharedBuffer {
@@ -260,6 +262,7 @@ impl PtySessionManager {
 
         let shared_reader = Arc::clone(&shared);
         let notify_reader = Arc::clone(&notify);
+        let writer_reader = Arc::clone(&writer);
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 4096];
             loop {
@@ -274,6 +277,17 @@ impl PtySessionManager {
                         break;
                     }
                     Ok(n) => {
+                        // Windows ConPTY: conhost opens with a DSR (cursor position
+                        // report) request `ESC[6n` and blocks its first render until the
+                        // terminal side answers. Reply `ESC[1;1R` like every real
+                        // terminal emulator, or children produce no visible output.
+                        if buf[..n].windows(4).any(|w| w == b"\x1b[6n") {
+                            let mut w = writer_reader
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let _ = w.write_all(b"\x1b[1;1R");
+                            let _ = w.flush();
+                        }
                         let chunk = String::from_utf8_lossy(&buf[..n]);
                         let mut guard = shared_reader
                             .lock()
@@ -317,7 +331,7 @@ impl PtySessionManager {
             command: req.command.clone(),
             conversation_id: req.conversation_id.clone(),
             master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
+            writer,
             killer: Mutex::new(killer),
             shared: Arc::clone(&shared),
             notify: Arc::clone(&notify),
