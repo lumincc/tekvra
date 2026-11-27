@@ -203,22 +203,28 @@ async fn interactive_pty_prompt_write_stdin_and_failing_test_filter_with_tool_ou
     let state = tmp.path().join("state");
     std::fs::create_dir_all(&ws).expect("mkdir");
 
-    let ctx = make_ctx(ws, state, PermissionMode::Auto, Vec::new());
     let reg = NativeToolRegistry::new();
 
     // Windows runs payloads through PowerShell; shell startup is slower there, so use a
     // generous yield window and poll write_stdin until exit instead of a single call.
-    let (prompt_cmd, prompt_yield_ms) = if cfg!(windows) {
+    // Auto mode's safe-command allowlist is bash-oriented (`Write-Host` is unknown and
+    // prompts, but this ctx has no approver), so the Windows branch runs under Yolo —
+    // this test verifies PTY mechanics, not permission policy.
+    let (mode, prompt_cmd, prompt_yield_ms) = if cfg!(windows) {
         (
+            PermissionMode::Yolo,
             "Write-Host -NoNewline 'Enter token: '; $tok = [Console]::ReadLine(); Write-Output \"GOT:$tok\"",
             10_000_u64,
         )
     } else {
         (
+            PermissionMode::Auto,
             "printf 'Enter token: '; read tok; printf 'GOT:%s\\n' \"$tok\"",
             200_u64,
         )
     };
+
+    let ctx = make_ctx(ws, state, mode, Vec::new());
 
     // 1. Interactive process prompting for stdin without exiting in initial yield window
     let start_out = reg
