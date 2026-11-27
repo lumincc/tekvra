@@ -307,6 +307,10 @@ async fn stdio_schema_conformance_handshake_guard_fuzzy_search_and_config_warnin
 }
 
 #[tokio::test]
+// exec_command runs the payload through a POSIX shell (`/bin/bash -c`), which
+// does not exist on Windows runners; the PTY exec path is Unix-only until it
+// gains a native Windows shell backend.
+#[cfg_attr(windows, ignore = "exec_command requires a POSIX shell (/bin/bash -c)")]
 async fn websocket_bearer_auth_and_bidirectional_command_approval_and_denial() {
     let tmp = TempDir::new().expect("tempdir");
     // Turn 1: model calls `exec_command` (`python3 -c 'print(123)'` — triggers interactive `Ask` in Build mode!) -> approved -> finishes.
@@ -318,12 +322,8 @@ async fn websocket_bearer_auth_and_bidirectional_command_approval_and_denial() {
                 parts: vec![MessagePart::ToolCall {
                     call_id: "call_ws_1".to_string(),
                     name: "exec_command".to_string(),
-                    // Windows runners expose `python`, not `python3`.
-                    arguments_json: if cfg!(windows) {
-                        json!({ "command": "python -c \"print('WS_APPROVED_OK')\"" }).to_string()
-                    } else {
-                        json!({ "command": "python3 -c \"print('WS_APPROVED_OK')\"" }).to_string()
-                    },
+                    arguments_json: json!({ "command": "python3 -c \"print('WS_APPROVED_OK')\"" })
+                        .to_string(),
                 }],
             },
             stream_deltas: Vec::new(),
@@ -350,11 +350,8 @@ async fn websocket_bearer_auth_and_bidirectional_command_approval_and_denial() {
                 parts: vec![MessagePart::ToolCall {
                     call_id: "call_ws_2".to_string(),
                     name: "exec_command".to_string(),
-                    arguments_json: if cfg!(windows) {
-                        json!({ "command": "python -c \"print('MUST_NOT_RUN')\"" }).to_string()
-                    } else {
-                        json!({ "command": "python3 -c \"print('MUST_NOT_RUN')\"" }).to_string()
-                    },
+                    arguments_json: json!({ "command": "python3 -c \"print('MUST_NOT_RUN')\"" })
+                        .to_string(),
                 }],
             },
             stream_deltas: Vec::new(),
