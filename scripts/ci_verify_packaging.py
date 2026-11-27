@@ -124,6 +124,26 @@ def verify_workflows(root: Path) -> None:
     if "uses: ./.github/workflows/ci.yml" not in rel_text:
         fail("release.yml must gate releases on `./.github/workflows/ci.yml`")
 
+    channel_match = re.search(
+        r'^channel\s*=\s*"([^"]+)"',
+        (root / "rust-toolchain.toml").read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if channel_match is None:
+        fail('rust-toolchain.toml must pin a `channel = "..."` toolchain')
+    pinned_toolchain = channel_match.group(1)
+    for wf in (ci_yml, release_yml):
+        lines = wf.read_text(encoding="utf-8").splitlines()
+        for idx, line in enumerate(lines):
+            if "uses: dtolnay/rust-toolchain@master" not in line:
+                continue
+            with_block = "\n".join(lines[idx : idx + 6])
+            if f'toolchain: "{pinned_toolchain}"' not in with_block:
+                fail(
+                    f"{wf.relative_to(root)} invokes `dtolnay/rust-toolchain@master` "
+                    f"without `toolchain: \"{pinned_toolchain}\"` matching rust-toolchain.toml"
+                )
+
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()

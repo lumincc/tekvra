@@ -67,7 +67,7 @@ pulldown-cmark = "0.13"
 ratatui = "0.30"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 semver = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
