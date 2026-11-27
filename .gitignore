@@ -2,5 +2,6 @@
 /.tmp
 /.agents
 /openspec
+/AGENTS.md
 *.swp
 .DS_Store
