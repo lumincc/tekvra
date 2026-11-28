@@ -293,7 +293,7 @@ pub fn build_tool_definitions_for_model(model: &ModelCapabilities) -> Vec<ToolDe
         ),
         (
             "code",
-            "Execute Python computation and orchestrate connected MCP tools (`mcp_list()`, `await mcp_call(server, tool, params)`) in an isolated sandbox.",
+            "Execute Python computation and orchestrate connected MCP servers (`mcp_list()`, `mcp_resources()`, `mcp_prompts()`, `await mcp_call(server, tool, params)`, `await mcp_read(server, uri, max_chars)`, `await mcp_get_prompt(server, name, arguments)`, each also available as a `*_sync` call) in an isolated sandbox.",
             json!({
                 "type": "object",
                 "properties": { "code": { "type": "string" } },

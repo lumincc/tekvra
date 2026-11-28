@@ -24,7 +24,7 @@ Clients MUST send `initialize` (followed by `initialized`) before invoking domai
 - **Lifecycle**: `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/archive`, `thread/unarchive`, `thread/rollback`, `thread/compact/start` (queues `SessionCommand::Compact` on the loaded thread; forwarded compaction events report completion), `thread/name/set`
 - **Turns & Review**: `turn/start`, `turn/steer` (mapped onto non-destructive `Guide` delivery), `turn/interrupt`, `review/start`
 - **Interactive PTY**: `command/exec`, `command/exec/write`, `command/exec/resize`, `command/exec/terminate`
-- **Discovery & Config**: `model/list`, `modelProvider/list`, `skills/list`, `mcpServerStatus/list`, `config/read`, `config/value/write`, `config/batchWrite`, `account/read`, `account/login/start`, `account/logout`, `account/rateLimits/read` (live multi-account quota snapshot from the active driver: `rateLimits.primaryWindow.remainingRatio`/`usedPercent`, `spendControlReached`, and per-account `accounts[]` rows without tokens; deterministic test drivers report an empty pool), `fuzzyFileSearch`
+- **Discovery & Config**: `model/list`, `modelProvider/list`, `skills/list`, `mcpServerStatus/list` (per server: `tools` as a name-keyed map plus `resources`, `resourceTemplates`, and `prompts` arrays filled from the live catalogs — `resources[]` = `{uri, name, description, mimeType, size}`, `resourceTemplates[]` = `{uriTemplate, name, description, mimeType}`, `prompts[]` = `{name, description, arguments}`; `[]` for tools-only servers), `config/read`, `config/value/write`, `config/batchWrite`, `account/read`, `account/login/start`, `account/logout`, `account/rateLimits/read` (live multi-account quota snapshot from the active driver: `rateLimits.primaryWindow.remainingRatio`/`usedPercent`, `spendControlReached`, and per-account `accounts[]` rows without tokens; deterministic test drivers report an empty pool), `fuzzyFileSearch`
 
 ## Policy Mapping & `configWarning` Disclosure
 
@@ -57,3 +57,13 @@ On every `SessionEvent::ApprovalRequested`, the ACP bridge sends a correlated `s
 ### Structured `diff` blocks
 
 `ItemCompleted` events carrying `ToolOutput::Diff` emit `tool_call_update` notifications with `content: [{ "type": "diff", "path", "oldText", "newText" }]` (one per file, `kind: "edit"|"delete"`), driven by the `old_text`/`new_text` fields retained on `FileDiffEntry`.
+
+### MCP progress
+
+`notifications/progress` frames a server sends for an in-flight `tools/call` (matched by that call's `_meta.progressToken`) are forwarded as id-less `mcp/progress` notifications:
+
+```json
+{ "method": "mcp/progress", "params": { "threadId": "thr_…", "turnId": "turn_…", "server": "docs", "tool": "long_job", "progress": 2, "total": 3, "message": "indexing" } }
+```
+
+`progress` and `total` are numbers (`total` and `message` may be `null`). Updates are coalesced to at most one per 100 ms per call (the final value always arrives), the latest wins, and nothing is forwarded once the call or its turn completes; progress is never written to the rollout.

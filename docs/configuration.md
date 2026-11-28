@@ -108,7 +108,7 @@ websearch_base_url = "https://search.internal.corp/search"
 
 The endpoint is authorized through the `webfetch` ladder class; results are capped at 1..=10 (default 8) with duplicate-host collapsing.
 
-Enabled servers are connected at startup via `ConfiguredMcpGateway` (`initialize` -> `notifications/initialized` -> `tools/list`) and exposed inside Monty `code` (`mcp_list()` / `await mcp_call(...)`) as well as `/mcp` and `mcpServerStatus/list` without mutating top-level LLM tool schemas.
+Enabled servers are connected at startup via `ConfiguredMcpGateway` (`initialize` -> `notifications/initialized` -> `tools/list`, then `resources/list` / `resources/templates/list` / `prompts/list` for servers that advertise them) and exposed inside Monty `code` (`mcp_list()` / `await mcp_call(...)`, plus `mcp_resources()` / `mcp_prompts()` and `await mcp_read(...)` / `await mcp_get_prompt(...)`) as well as `/mcp` and `mcpServerStatus/list` without mutating top-level LLM tool schemas.
 
 ### Managing MCP Servers from the CLI (`tekvra mcp`)
 
@@ -120,10 +120,10 @@ tekvra mcp add filesystem --command npx -- -y @modelcontextprotocol/server-files
 tekvra mcp add remote_docs --url https://mcp.example.com/rpc --bearer-env DOCS_MCP_TOKEN
 tekvra mcp add fs2 --command uvx --scope user  # write to ~/.config/tekvra/tekvra.toml
 tekvra mcp remove filesystem                 # removes from the scope that defines it
-tekvra mcp test remote_docs                  # one-shot handshake; prints discovered tool names
+tekvra mcp test remote_docs                  # one-shot handshake; prints tools, then resources / prompts
 ```
 
-`add`/`remove` edit `<repo>/.tekvra/tekvra.toml` (project scope, the default) or the user-global file via `toml_edit::DocumentMut`, so unrelated comments and formatting survive the mutation. `--command` (stdio) and `--url` (HTTP) are mutually exclusive; trailing arguments after `--` become the stdio argv. `test` performs a one-shot `initialize` + `tools/list` handshake against a single server and prints `name/tool` pairs (non-zero exit when the handshake fails).
+`add`/`remove` edit `<repo>/.tekvra/tekvra.toml` (project scope, the default) or the user-global file via `toml_edit::DocumentMut`, so unrelated comments and formatting survive the mutation. `--command` (stdio) and `--url` (HTTP) are mutually exclusive; trailing arguments after `--` become the stdio argv. `test` performs a one-shot `initialize` + `tools/list` handshake (plus the resource / prompt lists when advertised) against a single server and prints `name/tool` pairs, followed by `resources:` and `prompts:` lines when the server has any (non-zero exit when the handshake fails).
 
 ## Spend Cap (`agent.spend_limit_usd`)
 

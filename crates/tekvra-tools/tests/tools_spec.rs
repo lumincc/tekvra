@@ -1679,6 +1679,7 @@ async fn mcp_server_initiated_requests_fallback_gating_and_unknown_methods() {
     gw.set_server_hooks(Arc::new(McpServerHooks {
         sampling: Some(Arc::clone(&sampling_hook) as Arc<dyn tekvra_tools::McpSamplingHook>),
         elicitation: None,
+        progress: None,
     }));
 
     // The gateway routed the server→client `sampling/createMessage` and POSTed back
@@ -1727,6 +1728,7 @@ async fn mcp_server_initiated_requests_fallback_gating_and_unknown_methods() {
     gw2.set_server_hooks(Arc::new(McpServerHooks {
         sampling: Some(Arc::clone(&sampling_hook) as Arc<dyn tekvra_tools::McpSamplingHook>),
         elicitation: None,
+        progress: None,
     }));
 
     let mut saw_sampled_ok = false;
@@ -2331,4 +2333,973 @@ async fn mcp_http_idle_timeout_is_configurable_per_server() {
         panic!("expected CodeExecution");
     };
     assert_eq!(output.trim(), "slow-done");
+}
+
+/// One request received by [`spawn_mcp_mock`].
+#[derive(Clone, Debug)]
+struct MockRequest {
+    path: String,
+    method: String,
+    params: Value,
+    id: Value,
+}
+
+/// Serves streamable-HTTP JSON-RPC on a loopback port and logs every request. `respond` returns
+/// the SSE body for a request (`None`, or a notification, answers with a bare `202`).
+async fn spawn_mcp_mock(
+    respond: impl Fn(&MockRequest) -> Option<String> + Send + Sync + 'static,
+) -> (std::net::SocketAddr, Arc<Mutex<Vec<MockRequest>>>) {
+    let log: Arc<Mutex<Vec<MockRequest>>> = Arc::default();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mcp mock");
+    let addr = listener.local_addr().expect("addr");
+    let respond = Arc::new(respond);
+    let log_srv = Arc::clone(&log);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let respond = Arc::clone(&respond);
+            let log = Arc::clone(&log_srv);
+            tokio::spawn(async move {
+                // Read the headers, then the Content-Length body.
+                let mut buf = Vec::new();
+                let mut chunk = vec![0_u8; 8192];
+                let body_start = loop {
+                    let n = stream.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let head = String::from_utf8_lossy(&buf);
+                    if let Some(pos) = head.find("\r\n\r\n") {
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= pos + 4 + len {
+                            break pos;
+                        }
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..body_start]).into_owned();
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let body = String::from_utf8_lossy(&buf[body_start + 4..]).to_string();
+                let Ok(msg) = serde_json::from_str::<Value>(body.trim()) else {
+                    return;
+                };
+                let req = MockRequest {
+                    path,
+                    method: msg
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    params: msg.get("params").cloned().unwrap_or_else(|| json!({})),
+                    id: msg.get("id").cloned().unwrap_or(Value::Null),
+                };
+                let is_notification = msg.get("id").is_none();
+                log.lock().expect("lock").push(req.clone());
+                let http = match (is_notification, respond(&req)) {
+                    (true, _) | (false, None) => {
+                        "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                    (false, Some(sse)) => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                        sse.len()
+                    ),
+                };
+                let _ = stream.write_all(http.as_bytes()).await;
+            });
+        }
+    });
+    (addr, log)
+}
+
+/// One SSE `data:` frame carrying `rpc`.
+fn sse_frame(rpc: Value) -> String {
+    format!("data: {rpc}\r\n\r\n")
+}
+
+/// One `notifications/progress` delivery observed by a hook.
+#[derive(Debug, Clone, PartialEq)]
+struct ProgressSeen {
+    server: String,
+    tool: String,
+    progress: f64,
+    total: Option<f64>,
+    message: Option<String>,
+}
+
+/// Hook recording every progress delivery in arrival order.
+#[derive(Default)]
+struct ProgressLog {
+    seen: Mutex<Vec<ProgressSeen>>,
+}
+
+impl tekvra_tools::McpProgressHook for ProgressLog {
+    fn on_progress(
+        &self,
+        server: &str,
+        tool: &str,
+        progress: f64,
+        total: Option<f64>,
+        message: Option<&str>,
+    ) {
+        self.seen.lock().expect("lock").push(ProgressSeen {
+            server: server.to_string(),
+            tool: tool.to_string(),
+            progress,
+            total,
+            message: message.map(str::to_string),
+        });
+    }
+}
+
+/// Catalog discovery: capabilities recorded at handshake gate the list requests (a server
+/// without them receives none, and a `tools/list` failure is only fatal when `tools` is
+/// advertised), lists are cursor-paginated then sorted by server and URI/name with duplicates
+/// removed, `notifications/resources/list_changed` triggers a refresh that picks up the change,
+/// and none of it touches the model-facing tool schemas.
+#[tokio::test]
+async fn mcp_catalog_discovery_is_sorted_paginated_refreshed_and_capability_gated() {
+    use indexmap::IndexMap;
+    use std::sync::atomic::AtomicBool;
+    use tekvra_config::{AgentSettings, McpServerConfig};
+    use tekvra_tools::{
+        ConfiguredMcpGateway, McpPromptArgument, McpPromptDescriptor, McpResourceDescriptor,
+        McpResourceTemplateDescriptor,
+    };
+
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).expect("mkdir ws");
+
+    let resources_v2 = Arc::new(AtomicBool::new(false));
+    let resources_v2_srv = Arc::clone(&resources_v2);
+    let (addr, log) = spawn_mcp_mock(move |req| {
+        let result = match (req.path.as_str(), req.method.as_str()) {
+            ("/docs", "initialize") => json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": { "tools": {}, "resources": { "listChanged": true }, "prompts": {} },
+                "serverInfo": { "name": "docs", "version": "1" }
+            }),
+            ("/plain", "initialize") | ("/zeta", "initialize") => json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": if req.path == "/zeta" { json!({ "resources": {} }) } else { json!({}) },
+                "serverInfo": { "name": "mock", "version": "1" }
+            }),
+            // Advertises no `tools`: rejecting `tools/list` must not fail the connection.
+            ("/zeta", "tools/list") => {
+                return Some(sse_frame(json!({
+                    "jsonrpc": "2.0", "id": req.id,
+                    "error": { "code": -32601, "message": "Method not found" }
+                })));
+            }
+            ("/docs", "tools/list") => json!({ "tools": [
+                { "name": "lookup", "description": "Lookup docs", "inputSchema": { "type": "object" } }
+            ] }),
+            ("/plain", "tools/list") => json!({ "tools": [] }),
+            ("/docs", "resources/list") => match req.params.get("cursor").and_then(Value::as_str) {
+                None => json!({ "resources": [
+                    { "uri": "file:///c.log", "name": "Changelog", "mimeType": "text/plain", "size": 3 },
+                    { "uri": "file:///a.txt", "name": "Readme", "description": "Top readme", "mimeType": "text/markdown", "size": 10 },
+                    { "uri": "file:///a.txt", "name": "Readme (duplicate)" }
+                ], "nextCursor": "c2" }),
+                Some(_) => json!({ "resources": [
+                    { "uri": "file:///b.md", "mimeType": "text/markdown",
+                      "name": if resources_v2_srv.load(Ordering::Acquire) { "Guide v2" } else { "Guide" } }
+                ] }),
+            },
+            ("/zeta", "resources/list") => {
+                json!({ "resources": [ { "uri": "file:///0.txt", "name": "Zero" } ] })
+            }
+            ("/docs", "resources/templates/list") => json!({ "resourceTemplates": [
+                { "uriTemplate": "file:///{+path}", "name": "Any file",
+                  "description": "Read any workspace file", "mimeType": "text/plain" }
+            ] }),
+            ("/docs", "prompts/list") => json!({ "prompts": [
+                { "name": "summarize", "description": "Summarize a file" },
+                { "name": "review", "description": "Review a diff",
+                  "arguments": [ { "name": "path", "description": "File to review", "required": true } ] }
+            ] }),
+            ("/docs", "tools/call") => {
+                resources_v2_srv.store(true, Ordering::Release);
+                return Some(format!(
+                    "{}{}",
+                    sse_frame(json!({ "jsonrpc": "2.0", "method": "notifications/resources/list_changed" })),
+                    sse_frame(json!({ "jsonrpc": "2.0", "id": req.id,
+                        "result": { "content": [ { "type": "text", "text": "ok" } ] } }))
+                ));
+            }
+            _ => json!({}),
+        };
+        Some(sse_frame(json!({ "jsonrpc": "2.0", "id": req.id, "result": result })))
+    })
+    .await;
+
+    let mut servers = IndexMap::new();
+    for (name, path) in [("docs", "/docs"), ("zeta", "/zeta"), ("plain", "/plain")] {
+        servers.insert(
+            name.to_string(),
+            McpServerConfig {
+                url: Some(format!("http://{addr}{path}")),
+                enabled: true,
+                ..McpServerConfig::default()
+            },
+        );
+    }
+
+    let codex_caps = ModelCapabilities::resolve("openai", "gpt-5.4-codex", None);
+    let schema_before = build_tool_definitions_for_model(&codex_caps);
+
+    let (gw, report) =
+        ConfiguredMcpGateway::connect_all(&servers, &ws, &AgentSettings::default(), false).await;
+    let mut connected = report.connected_servers.clone();
+    connected.sort();
+    assert_eq!(connected, ["docs", "plain", "zeta"]);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+    // Sorted by server then URI/name; the duplicate `file:///a.txt` is listed once.
+    let resources = gw.list_resources();
+    let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
+    assert_eq!(
+        uris,
+        [
+            "file:///a.txt",
+            "file:///b.md",
+            "file:///c.log",
+            "file:///0.txt"
+        ]
+    );
+    assert_eq!(
+        resources[0],
+        McpResourceDescriptor {
+            server: "docs".to_string(),
+            uri: "file:///a.txt".to_string(),
+            name: "Readme".to_string(),
+            description: Some("Top readme".to_string()),
+            mime_type: Some("text/markdown".to_string()),
+        }
+    );
+    assert_eq!(resources[3].server, "zeta");
+    assert_eq!(
+        gw.list_resource_templates(),
+        vec![McpResourceTemplateDescriptor {
+            server: "docs".to_string(),
+            uri_template: "file:///{+path}".to_string(),
+            name: "Any file".to_string(),
+            description: Some("Read any workspace file".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        }]
+    );
+    let prompts = gw.list_prompts();
+    let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["review", "summarize"]);
+    assert_eq!(
+        prompts[0],
+        McpPromptDescriptor {
+            server: "docs".to_string(),
+            name: "review".to_string(),
+            description: Some("Review a diff".to_string()),
+            arguments: vec![McpPromptArgument {
+                name: "path".to_string(),
+                description: Some("File to review".to_string()),
+                required: Some(true),
+            }],
+        }
+    );
+    assert!(prompts[1].arguments.is_empty());
+
+    // Only servers that advertise a capability receive its list requests; `docs` paginated.
+    let requests = log.lock().expect("lock").clone();
+    let methods = |path: &str| -> Vec<String> {
+        requests
+            .iter()
+            .filter(|r| r.path == path)
+            .map(|r| r.method.clone())
+            .collect()
+    };
+    assert_eq!(
+        methods("/plain"),
+        ["initialize", "notifications/initialized", "tools/list"]
+    );
+    assert_eq!(
+        methods("/zeta"),
+        [
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "resources/list",
+            "resources/templates/list"
+        ]
+    );
+    let docs_lists = || {
+        methods("/docs")
+            .into_iter()
+            .filter(|m| m.ends_with("/list"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        docs_lists(),
+        [
+            "tools/list",
+            "resources/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list"
+        ]
+    );
+
+    // `notifications/resources/list_changed` (delivered on the `tools/call` stream) refreshes
+    // the whole catalog before the call returns.
+    let out = gw
+        .call_tool("docs", "lookup", json!({}))
+        .await
+        .expect("call");
+    assert_eq!(out["content"][0]["text"], "ok");
+    let refreshed_resources = gw.list_resources();
+    let names: Vec<&str> = refreshed_resources
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
+    assert_eq!(names, ["Readme", "Guide v2", "Changelog", "Zero"]);
+
+    // An explicit refresh re-queries every advertised list of that server only.
+    let before = log.lock().expect("lock").len();
+    let tools = gw
+        .refresh_server_catalog("docs")
+        .await
+        .expect("refresh docs");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].tool, "lookup");
+    let requests = log.lock().expect("lock").clone();
+    let refreshed: Vec<String> = requests[before..]
+        .iter()
+        .map(|r| format!("{} {}", r.path, r.method))
+        .collect();
+    assert_eq!(
+        refreshed,
+        [
+            "/docs tools/list",
+            "/docs resources/list",
+            "/docs resources/list",
+            "/docs resources/templates/list",
+            "/docs prompts/list"
+        ]
+    );
+    assert_eq!(
+        schema_before,
+        build_tool_definitions_for_model(&codex_caps),
+        "resource/prompt catalogs must never mutate top-level LLM tool schemas"
+    );
+
+    // Capability gating for the sandbox functions: unknown server, unadvertised capability.
+    let err = gw
+        .check_support("plain", "resources/read")
+        .expect_err("plain advertises no resources");
+    assert!(
+        err.to_string().contains(
+            "`plain` does not advertise the `resources` capability (needed for `resources/read`)"
+        ),
+        "{err}"
+    );
+    assert!(gw.check_support("zeta", "prompts/get").is_err());
+    assert!(gw.check_support("plain", "tools/call").is_ok());
+    let err = gw
+        .check_support("nope", "tools/call")
+        .expect_err("unknown server");
+    assert!(
+        err.to_string()
+            .contains("MCP server `nope` is not connected"),
+        "{err}"
+    );
+}
+
+/// Static gateway advertising one resource, one template, and one prompt next to `docs/lookup`.
+#[derive(Default)]
+struct CatalogMcp {
+    reads: AtomicUsize,
+    prompt_gets: AtomicUsize,
+}
+
+#[async_trait]
+impl McpGateway for CatalogMcp {
+    fn list_tools(&self) -> Vec<McpToolDescriptor> {
+        vec![McpToolDescriptor {
+            server: "docs".to_string(),
+            tool: "lookup".to_string(),
+            description: "Lookup docs".to_string(),
+            input_schema: json!({"type": "object"}),
+        }]
+    }
+
+    fn list_resources(&self) -> Vec<tekvra_tools::McpResourceDescriptor> {
+        vec![tekvra_tools::McpResourceDescriptor {
+            server: "docs".to_string(),
+            uri: "file:///README.md".to_string(),
+            name: "README".to_string(),
+            description: Some("Project readme".to_string()),
+            mime_type: Some("text/markdown".to_string()),
+        }]
+    }
+
+    fn list_resource_templates(&self) -> Vec<tekvra_tools::McpResourceTemplateDescriptor> {
+        vec![tekvra_tools::McpResourceTemplateDescriptor {
+            server: "docs".to_string(),
+            uri_template: "file:///{+path}".to_string(),
+            name: "Any file".to_string(),
+            description: None,
+            mime_type: None,
+        }]
+    }
+
+    fn list_prompts(&self) -> Vec<tekvra_tools::McpPromptDescriptor> {
+        vec![tekvra_tools::McpPromptDescriptor {
+            server: "docs".to_string(),
+            name: "review".to_string(),
+            description: Some("Review a diff".to_string()),
+            arguments: vec![tekvra_tools::McpPromptArgument {
+                name: "path".to_string(),
+                description: Some("File to review".to_string()),
+                required: Some(true),
+            }],
+        }]
+    }
+
+    fn check_support(&self, server: &str, operation: &str) -> Result<(), tekvra_tools::ToolsError> {
+        if server != "docs" {
+            return Err(tekvra_tools::ToolsError::invalid(format!(
+                "MCP server `{server}` is not connected"
+            )));
+        }
+        if !matches!(operation, "tools/call" | "resources/read" | "prompts/get") {
+            return Err(tekvra_tools::ToolsError::invalid(format!(
+                "MCP server `{server}` does not advertise the `{operation}` capability"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn read_resource(
+        &self,
+        _server: &str,
+        uri: &str,
+    ) -> Result<Value, tekvra_tools::ToolsError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "contents": [
+            { "uri": uri, "mimeType": "text/markdown", "text": "x".repeat(5_000) }
+        ] }))
+    }
+
+    async fn get_prompt(
+        &self,
+        _server: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, tekvra_tools::ToolsError> {
+        self.prompt_gets.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({
+            "description": "Review prompt",
+            "messages": [
+                { "role": "user", "content": { "type": "text", "text": format!("Review {name}") } }
+            ],
+            "arguments": arguments
+        }))
+    }
+
+    async fn call_tool(
+        &self,
+        _server: &str,
+        _tool: &str,
+        arguments: Value,
+    ) -> Result<Value, tekvra_tools::ToolsError> {
+        Ok(json!({ "echo": arguments }))
+    }
+}
+
+/// `mcp_resources()` / `mcp_prompts()` return the cached catalogs as lists of dicts inside
+/// `code` (empty without catalogs), and the static `code` description names them.
+#[tokio::test]
+async fn mcp_resources_and_mcp_prompts_expose_cached_catalogs_in_sandbox() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("repo");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&ws).expect("mkdir");
+    let reg = NativeToolRegistry::new();
+
+    let mut ctx = make_ctx(ws.clone(), state.clone(), PermissionMode::Auto, Vec::new());
+    ctx.mcp_gateway = Some(Arc::new(CatalogMcp::default()));
+    let out = reg
+        .execute(
+            &ctx,
+            "cat1",
+            "code",
+            &json!({ "code": "
+resources = mcp_resources()
+prompts = mcp_prompts()
+for r in resources:
+    print(r['server'], r['uri'], r['name'], r['description'], r['mime_type'])
+for p in prompts:
+    a = p['arguments'][0]
+    print(p['server'], p['name'], p['description'], a['name'], a['description'], a['required'])
+" }),
+        )
+        .await
+        .expect("catalog functions");
+    let ToolOutput::CodeExecution { output, .. } = out else {
+        panic!("expected CodeExecution");
+    };
+    assert_eq!(
+        output.trim(),
+        "docs file:///README.md README Project readme text/markdown\n\
+         docs review Review a diff path File to review True"
+    );
+
+    // No catalogs (default methods) and no gateway at all both yield empty lists.
+    let gateways: [Option<Arc<dyn McpGateway>>; 2] = [Some(Arc::new(MockMcp::default())), None];
+    for gateway in gateways {
+        ctx.mcp_gateway = gateway;
+        let out = reg
+            .execute(
+                &ctx,
+                "cat2",
+                "code",
+                &json!({ "code": "print(mcp_resources(), mcp_prompts())" }),
+            )
+            .await
+            .expect("empty catalogs");
+        let ToolOutput::CodeExecution { output, .. } = out else {
+            panic!("expected CodeExecution");
+        };
+        assert_eq!(output.trim(), "[] []");
+    }
+
+    let code_def = build_tool_definitions_for_model(&ModelCapabilities::resolve(
+        "openai",
+        "gpt-5.4-codex",
+        None,
+    ))
+    .into_iter()
+    .find(|def| def.name == "code")
+    .expect("code tool definition");
+    for named in [
+        "mcp_list",
+        "mcp_resources",
+        "mcp_prompts",
+        "mcp_call",
+        "mcp_read",
+        "mcp_get_prompt",
+    ] {
+        assert!(
+            code_def.description.contains(named),
+            "{}",
+            code_def.description
+        );
+    }
+    assert!(
+        !code_def.description.contains("docs"),
+        "{}",
+        code_def.description
+    );
+}
+
+struct DenyingCallback;
+
+#[async_trait]
+impl tekvra_tools::ApprovalCallback for DenyingCallback {
+    async fn request_approval(
+        &self,
+        _prompt: tekvra_protocol::ApprovalPrompt,
+    ) -> ApprovalResolution {
+        ApprovalResolution::Deny {
+            reason: Some("no".to_string()),
+        }
+    }
+}
+
+/// `mcp_read` / `mcp_get_prompt` authorize as `resources/read` / `prompts/get` before any
+/// request leaves, bound their results, and fail validation (unknown server, unadvertised
+/// capability, bad `max_chars`) without an approval prompt or a gateway call.
+#[tokio::test]
+async fn mcp_read_and_mcp_get_prompt_authorize_bound_and_validate() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("repo");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&ws).expect("mkdir");
+    let reg = NativeToolRegistry::new();
+    let snippet = json!({ "code": "
+r = await mcp_read('docs', 'file:///README.md', 2000)
+print(len(r['contents'][0]['text']), r.get('truncated'))
+full = await mcp_read('docs', 'file:///README.md')
+print(len(full['contents'][0]['text']), 'truncated' in full)
+p = await mcp_get_prompt('docs', 'review', {'path': 'src/main.rs'})
+print(p['messages'][0]['content']['text'], p['arguments']['path'])
+try:
+    mcp_read_sync('nope', 'file:///x')
+    print('unexpected success')
+except RuntimeError as e:
+    print(e)
+" });
+
+    // 1. Build mode without an approval callback fails closed.
+    let ctx_no_cb = make_ctx(ws.clone(), state.clone(), PermissionMode::Build, Vec::new());
+    let err = reg
+        .execute(&ctx_no_cb, "r0", "code", &snippet)
+        .await
+        .expect_err("prompt without approval callback must deny");
+    assert!(err.to_string().contains("approval required"), "{err}");
+
+    // 2. Interactive approval: one prompt per read / get, each under its authorization name.
+    let mut ctx = make_ctx(ws.clone(), state.clone(), PermissionMode::Build, Vec::new());
+    let catalog = Arc::new(CatalogMcp::default());
+    ctx.mcp_gateway = Some(catalog.clone());
+    let approving = Arc::new(ApprovingCallback {
+        prompts: Mutex::new(Vec::new()),
+    });
+    ctx.approval_cb = Some(approving.clone());
+    let out = reg
+        .execute(&ctx, "r1", "code", &snippet)
+        .await
+        .expect("approved mcp_read / mcp_get_prompt");
+    let ToolOutput::CodeExecution { output, mcp_calls } = out else {
+        panic!("expected CodeExecution");
+    };
+    assert_eq!(mcp_calls, 3);
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines.len(), 4, "{output}");
+    assert_eq!(lines[0], "2000 True");
+    assert_eq!(lines[1], "5000 False");
+    assert_eq!(lines[2], "Review review src/main.rs");
+    assert!(lines[3].contains("`nope` is not connected"), "{}", lines[3]);
+    // One prompt per authorization name: the project-lifetime grant for `docs/resources/read`
+    // covers the second read, while `docs/prompts/get` still prompts.
+    assert_eq!(
+        *approving.prompts.lock().expect("lock"),
+        [
+            "mcp: docs/resources/read".to_string(),
+            "mcp: docs/prompts/get".to_string(),
+        ]
+    );
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(catalog.prompt_gets.load(Ordering::SeqCst), 1);
+
+    // 2b. A bad `max_chars` fails the cell as a validation error before any prompt or call.
+    let prompts_before = approving.prompts.lock().expect("lock").len();
+    let err = reg
+        .execute(
+            &ctx,
+            "r1b",
+            "code",
+            &json!({ "code": "await mcp_read_sync('docs', 'file:///README.md', 0)" }),
+        )
+        .await
+        .expect_err("bad max_chars");
+    assert!(
+        matches!(err, tekvra_tools::ToolsError::InvalidInput { .. })
+            && err
+                .to_string()
+                .contains("requires a positive integer `max_chars`"),
+        "{err:?}"
+    );
+    assert_eq!(
+        approving.prompts.lock().expect("lock").len(),
+        prompts_before
+    );
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 2);
+
+    // 3. Denying the prompt refuses the read before it reaches the gateway; a fresh context
+    //    holds none of the grants above.
+    let reads_before = catalog.reads.load(Ordering::SeqCst);
+    let mut ctx = make_ctx(
+        ws.clone(),
+        tmp.path().join("state-deny"),
+        PermissionMode::Build,
+        Vec::new(),
+    );
+    ctx.mcp_gateway = Some(catalog.clone());
+    ctx.approval_cb = Some(Arc::new(DenyingCallback));
+    let err = reg
+        .execute(
+            &ctx,
+            "r2",
+            "code",
+            &json!({ "code": "await mcp_read('docs', 'file:///README.md')" }),
+        )
+        .await
+        .expect_err("denied read");
+    assert!(
+        matches!(err, tekvra_tools::ToolsError::PermissionDenied { .. }),
+        "{err:?}"
+    );
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), reads_before);
+
+    // 4. A `deny` rule covering `docs` refuses `mcp_get_prompt`; the gateway sees no request.
+    let rules = vec![PermissionRule {
+        tool: "mcp".to_string(),
+        pattern: "docs/*".to_string(),
+        action: RuleAction::Deny,
+    }];
+    let mut ctx = make_ctx(ws, state, PermissionMode::Auto, rules);
+    ctx.mcp_gateway = Some(catalog.clone());
+    let err = reg
+        .execute(
+            &ctx,
+            "r3",
+            "code",
+            &json!({ "code": "await mcp_get_prompt_sync('docs', 'review', {})" }),
+        )
+        .await
+        .expect_err("denied prompt");
+    assert!(
+        err.to_string()
+            .contains("MCP call `docs/prompts/get` blocked by explicit `deny` rule"),
+        "{err}"
+    );
+    assert_eq!(catalog.prompt_gets.load(Ordering::SeqCst), 1);
+}
+
+/// `notifications/progress` frames carry the `_meta.progressToken` of their `tools/call` and
+/// reach the hook (coalesced, in order, with server and tool) while the call still returns its
+/// result; unknown tokens are dropped without a reply. Streamable HTTP and stdio both apply.
+#[tokio::test]
+async fn notifications_progress_reach_the_hook_for_in_flight_calls_only() {
+    use indexmap::IndexMap;
+    use tekvra_config::{AgentSettings, McpServerConfig};
+    use tekvra_tools::{ConfiguredMcpGateway, McpServerHooks};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).expect("mkdir ws");
+    let progress = Arc::new(ProgressLog::default());
+    let (addr, log) = spawn_mcp_mock(move |req| {
+        let result = match req.method.as_str() {
+            "initialize" => json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "prog", "version": "1" }
+            }),
+            "tools/list" => json!({ "tools": [
+                { "name": "long_job", "description": "d", "inputSchema": { "type": "object" } }
+            ] }),
+            "tools/call" => {
+                let token = req.params["_meta"]["progressToken"].clone();
+                let frame = |params: Value| {
+                    sse_frame(json!({ "jsonrpc": "2.0", "method": "notifications/progress", "params": params }))
+                };
+                return Some(format!(
+                    "{}{}{}{}{}",
+                    frame(json!({ "progressToken": token, "progress": 1, "total": 3 })),
+                    frame(json!({ "progressToken": token, "progress": 2, "total": 3, "message": "indexing" })),
+                    // Unknown (never issued) and non-numeric tokens are dropped.
+                    frame(json!({ "progressToken": 4_242_424, "progress": 3, "total": 3 })),
+                    frame(json!({ "progressToken": "not-ours", "progress": 3, "total": 3 })),
+                    sse_frame(json!({ "jsonrpc": "2.0", "id": req.id,
+                        "result": { "content": [ { "type": "text", "text": "done" } ] } }))
+                ));
+            }
+            _ => json!({}),
+        };
+        Some(sse_frame(json!({ "jsonrpc": "2.0", "id": req.id, "result": result })))
+    })
+    .await;
+
+    let mut servers = IndexMap::new();
+    servers.insert(
+        "http_srv".to_string(),
+        McpServerConfig {
+            url: Some(format!("http://{addr}/mcp")),
+            enabled: true,
+            ..McpServerConfig::default()
+        },
+    );
+
+    // Stdio mock streaming the same two frames before the result, on the request's token.
+    let script = tmp.path().join("progress_stdio_mcp.py");
+    std::fs::write(
+        &script,
+        r#"import json, sys
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    msg = json.loads(raw)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if mid is None:
+        continue
+    if method == "initialize":
+        res = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "prog-stdio", "version": "1"}}
+    elif method == "tools/list":
+        res = {"tools": [{"name": "long_job", "description": "d", "inputSchema": {"type": "object"}}]}
+    elif method == "tools/call":
+        token = msg["params"]["_meta"]["progressToken"]
+        send({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progressToken": token, "progress": 1, "total": 3}})
+        send({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progressToken": token, "progress": 2, "total": 3, "message": "indexing"}})
+        res = {"content": [{"type": "text", "text": "done"}]}
+    else:
+        res = {}
+    send({"jsonrpc": "2.0", "id": mid, "result": res})
+"#,
+    )
+    .expect("write progress stdio script");
+    servers.insert(
+        "stdio_srv".to_string(),
+        McpServerConfig {
+            command: Some("python3".to_string()),
+            args: vec![script.to_string_lossy().into_owned()],
+            enabled: true,
+            ..McpServerConfig::default()
+        },
+    );
+
+    let (gw, report) =
+        ConfiguredMcpGateway::connect_all(&servers, &ws, &AgentSettings::default(), false).await;
+    let mut connected = report.connected_servers.clone();
+    connected.sort();
+    assert_eq!(connected, ["http_srv", "stdio_srv"]);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    gw.set_server_hooks(Arc::new(McpServerHooks {
+        sampling: None,
+        elicitation: None,
+        progress: Some(Arc::clone(&progress) as Arc<dyn tekvra_tools::McpProgressHook>),
+    }));
+
+    for server in ["http_srv", "stdio_srv"] {
+        let out = gw
+            .call_tool(server, "long_job", json!({}))
+            .await
+            .expect("progress-bearing call returns its result");
+        assert_eq!(out["content"][0]["text"], "done", "{server}");
+    }
+
+    // The second frame of each call is coalesced (held >= 100 ms after the first): poll for it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while progress.seen.lock().expect("lock").len() < 4 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let mut seen = progress.seen.lock().expect("lock").clone();
+    seen.sort_by(|a, b| a.server.cmp(&b.server));
+    assert_eq!(
+        seen,
+        [
+            ProgressSeen {
+                server: "http_srv".to_string(),
+                tool: "long_job".to_string(),
+                progress: 1.0,
+                total: Some(3.0),
+                message: None
+            },
+            ProgressSeen {
+                server: "http_srv".to_string(),
+                tool: "long_job".to_string(),
+                progress: 2.0,
+                total: Some(3.0),
+                message: Some("indexing".to_string())
+            },
+            ProgressSeen {
+                server: "stdio_srv".to_string(),
+                tool: "long_job".to_string(),
+                progress: 1.0,
+                total: Some(3.0),
+                message: None
+            },
+            ProgressSeen {
+                server: "stdio_srv".to_string(),
+                tool: "long_job".to_string(),
+                progress: 2.0,
+                total: Some(3.0),
+                message: Some("indexing".to_string())
+            },
+        ]
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        progress.seen.lock().expect("lock").len(),
+        4,
+        "unknown tokens must not reach the hook"
+    );
+
+    // Every `tools/call` carried a numeric progress token; the gateway never answered a
+    // progress notification (all outbound frames are requests or client notifications).
+    let requests = log.lock().expect("lock").clone();
+    let calls: Vec<&MockRequest> = requests
+        .iter()
+        .filter(|r| r.method == "tools/call")
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].params["_meta"]["progressToken"].is_u64(),
+        "{}",
+        calls[0].params
+    );
+    assert!(requests.iter().all(|r| !r.method.is_empty()));
+}
+
+/// Gateway advertising nothing (no tools, no catalogs).
+struct EmptyMcp;
+
+#[async_trait]
+impl McpGateway for EmptyMcp {
+    fn list_tools(&self) -> Vec<McpToolDescriptor> {
+        Vec::new()
+    }
+
+    async fn call_tool(
+        &self,
+        _server: &str,
+        _tool: &str,
+        _arguments: Value,
+    ) -> Result<Value, tekvra_tools::ToolsError> {
+        unreachable!("no tools to call")
+    }
+}
+
+/// `/mcp` text and `tekvra mcp test` catalog lines: tools first, then resources (URIs, then
+/// templates), then prompts, per server in name order; servers without catalogs add nothing.
+#[test]
+fn mcp_status_text_lists_tools_then_catalogs_only_when_present() {
+    use tekvra_tools::{format_mcp_status, mcp_catalog_lines};
+
+    let docs = CatalogMcp::default();
+    assert_eq!(
+        format_mcp_status(&docs),
+        "Connected MCP tools (1): docs/lookup\n\
+         docs resources: file:///README.md, file:///{+path}\n\
+         docs prompts: review"
+    );
+    assert_eq!(
+        mcp_catalog_lines(&docs),
+        [
+            (
+                "docs".to_string(),
+                "resources: file:///README.md, file:///{+path}".to_string()
+            ),
+            ("docs".to_string(), "prompts: review".to_string()),
+        ]
+    );
+
+    // Tools-only gateways render exactly as before the catalogs existed.
+    let tools_only = MockMcp::default();
+    assert_eq!(
+        format_mcp_status(&tools_only),
+        "Connected MCP tools (2): docs/lookup, docs/forbidden"
+    );
+    assert!(mcp_catalog_lines(&tools_only).is_empty());
+    assert_eq!(
+        format_mcp_status(&EmptyMcp),
+        "MCP gateway connected (0 tools advertised)."
+    );
 }

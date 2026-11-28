@@ -21,8 +21,8 @@ use tekvra_storage::{
     RolloutHeader, RolloutLog, RolloutRecord, SessionSummary, StateIndex, WorkspaceSnapshotStore,
 };
 use tekvra_tools::{
-    ApprovalCallback, LspManager, McpElicitationHook, McpGateway, McpSamplingHook, McpServerHooks,
-    MontyCodeSandbox, NativeToolRegistry, PermissionEvaluator, PtyCompletionNotice,
+    ApprovalCallback, LspManager, McpElicitationHook, McpGateway, McpProgressHook, McpSamplingHook,
+    McpServerHooks, MontyCodeSandbox, NativeToolRegistry, PermissionEvaluator, PtyCompletionNotice,
     PtySessionManager, QuestionCallback, SafeWebFetcher, ToolExecutionContext, WorkspacePathLocks,
     build_tool_definitions_for_model,
 };
@@ -302,6 +302,10 @@ struct SessionMcpServerHooks {
     state_index: Arc<Mutex<StateIndex>>,
     session_id: String,
     questions: Arc<dyn QuestionCallback>,
+    /// Source of the current turn id for progress events.
+    bridge: Arc<InteractiveBridge>,
+    /// Fan-out for `McpProgress` events.
+    event_tx: broadcast::Sender<SessionEvent>,
 }
 
 #[async_trait]
@@ -512,6 +516,37 @@ impl McpElicitationHook for SessionMcpServerHooks {
             return decline();
         }
         Ok(json!({ "action": "accept", "content": content }))
+    }
+}
+
+impl McpProgressHook for SessionMcpServerHooks {
+    fn on_progress(
+        &self,
+        server: &str,
+        tool: &str,
+        progress: f64,
+        total: Option<f64>,
+        message: Option<&str>,
+    ) {
+        let turn_id = self
+            .bridge
+            .turn_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // No running turn: late (coalesced) deliveries for a finished turn are dropped.
+        if turn_id.is_empty() {
+            return;
+        }
+        let _ = self.event_tx.send(SessionEvent::McpProgress {
+            thread_id: self.session_id.clone(),
+            turn_id,
+            server: server.to_string(),
+            tool: tool.to_string(),
+            progress,
+            total,
+            message: message.map(str::to_string),
+        });
     }
 }
 
@@ -875,6 +910,8 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
                 state_index: Arc::clone(&actor.state_index),
                 session_id: actor.session_id.clone(),
                 questions: Arc::clone(&actor.bridge) as Arc<dyn QuestionCallback>,
+                bridge: Arc::clone(&actor.bridge),
+                event_tx: actor.event_tx.clone(),
             });
             let hooks = McpServerHooks {
                 // Sampling additionally requires the global experimental flag.
@@ -885,6 +922,7 @@ pub fn spawn_session(bootstrap: SessionBootstrap) -> Result<SessionHandle, CoreE
                     .mcp_sampling
                     .then(|| Arc::clone(&hooks_impl) as Arc<dyn McpSamplingHook>),
                 elicitation: Some(Arc::clone(&hooks_impl) as Arc<dyn McpElicitationHook>),
+                progress: Some(Arc::clone(&hooks_impl) as Arc<dyn McpProgressHook>),
             };
             gateway.set_server_hooks(Arc::new(hooks));
         }
@@ -1949,6 +1987,13 @@ impl SessionActor {
             self.spawn_auto_title_once();
         }
 
+        // Progress is only meaningful inside a turn; coalesced deliveries may flush up to
+        // 100 ms after a call returns, so retire the turn before announcing its completion.
+        *self
+            .bridge
+            .turn_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = String::new();
         let _ = self.event_tx.send(SessionEvent::TurnCompleted {
             thread_id: self.session_id.clone(),
             turn_id,

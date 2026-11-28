@@ -16,7 +16,10 @@ use tekvra_providers::{
     ProviderRegistry, StreamDelta,
 };
 use tekvra_storage::{StateIndex, WorkspaceSnapshotStore};
-use tekvra_tools::{McpGateway, McpToolDescriptor, ToolsError};
+use tekvra_tools::{
+    McpGateway, McpPromptArgument, McpPromptDescriptor, McpResourceDescriptor,
+    McpResourceTemplateDescriptor, McpServerHooks, McpToolDescriptor, ToolsError,
+};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -37,6 +40,39 @@ impl McpGateway for StaticMcpGateway {
         }]
     }
 
+    fn list_resources(&self) -> Vec<McpResourceDescriptor> {
+        vec![McpResourceDescriptor {
+            server: "repo_docs".to_string(),
+            uri: "file:///README.md".to_string(),
+            name: "README".to_string(),
+            description: Some("Project readme".to_string()),
+            mime_type: Some("text/markdown".to_string()),
+        }]
+    }
+
+    fn list_resource_templates(&self) -> Vec<McpResourceTemplateDescriptor> {
+        vec![McpResourceTemplateDescriptor {
+            server: "repo_docs".to_string(),
+            uri_template: "file:///{+path}".to_string(),
+            name: "Workspace file".to_string(),
+            description: None,
+            mime_type: None,
+        }]
+    }
+
+    fn list_prompts(&self) -> Vec<McpPromptDescriptor> {
+        vec![McpPromptDescriptor {
+            server: "repo_docs".to_string(),
+            name: "review".to_string(),
+            description: Some("Review a diff".to_string()),
+            arguments: vec![McpPromptArgument {
+                name: "path".to_string(),
+                description: Some("File to review".to_string()),
+                required: Some(true),
+            }],
+        }]
+    }
+
     async fn call_tool(
         &self,
         _server: &str,
@@ -49,12 +85,27 @@ impl McpGateway for StaticMcpGateway {
 
 struct ScriptedAppDriver {
     responses: Mutex<VecDeque<CompletionResponse>>,
+    /// Optional turn gate: `complete` signals `entered`, then waits for a permit.
+    gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
 }
 
 impl ScriptedAppDriver {
     fn new(list: Vec<CompletionResponse>) -> Self {
         Self {
             responses: Mutex::new(list.into()),
+            gate: None,
+        }
+    }
+
+    /// Driver whose every `complete` call parks until the test adds a permit.
+    fn gated(
+        list: Vec<CompletionResponse>,
+        entered: Arc<tokio::sync::Notify>,
+        permits: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        Self {
+            responses: Mutex::new(list.into()),
+            gate: Some((entered, permits)),
         }
     }
 }
@@ -67,6 +118,10 @@ impl ProviderDriver for ScriptedAppDriver {
         _model: &ModelCapabilities,
         _request: &CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
+        if let Some((entered, permits)) = &self.gate {
+            entered.notify_one();
+            permits.acquire().await.expect("gate closed").forget();
+        }
         let mut q = self
             .responses
             .lock()
@@ -93,6 +148,18 @@ impl ProviderDriver for ScriptedAppDriver {
 }
 
 fn build_app_state(tmp: &TempDir, scripted: Vec<CompletionResponse>) -> (AppServerState, PathBuf) {
+    build_app_state_with(
+        tmp,
+        Arc::new(ScriptedAppDriver::new(scripted)),
+        Arc::new(StaticMcpGateway),
+    )
+}
+
+fn build_app_state_with(
+    tmp: &TempDir,
+    driver: Arc<dyn ProviderDriver>,
+    mcp_gateway: Arc<dyn McpGateway>,
+) -> (AppServerState, PathBuf) {
     let ws = tmp.path().join("repo");
     let cfg_dir = tmp.path().join("cfg");
     let state_dir = tmp.path().join("state");
@@ -121,7 +188,6 @@ fn build_app_state(tmp: &TempDir, scripted: Vec<CompletionResponse>) -> (AppServ
     let router = ModelRouter::from_config(&resolved, registry.clone());
     let state_index = Arc::new(Mutex::new(StateIndex::open(&state_dir).expect("state db")));
     let snapshots = WorkspaceSnapshotStore::new(&state_dir);
-    let driver: Arc<dyn ProviderDriver> = Arc::new(ScriptedAppDriver::new(scripted));
 
     let state = AppServerState::new(AppServerStateInit {
         config: resolved,
@@ -130,7 +196,7 @@ fn build_app_state(tmp: &TempDir, scripted: Vec<CompletionResponse>) -> (AppServ
         driver,
         state_index,
         snapshots,
-        mcp_gateway: Some(Arc::new(StaticMcpGateway)),
+        mcp_gateway: Some(mcp_gateway),
         plugin_executor: None,
         extra_plugin_tools: Vec::new(),
     });
@@ -270,6 +336,35 @@ async fn stdio_schema_conformance_handshake_guard_fuzzy_search_and_config_warnin
     assert_eq!(
         mcp_data[0]["tools"]["search_symbols"]["name"],
         "search_symbols"
+    );
+    // ...and its resource / template / prompt catalogs as arrays, in that order.
+    let repo_docs = &mcp_data[0];
+    assert_eq!(
+        repo_docs["resources"],
+        json!([{
+            "uri": "file:///README.md",
+            "name": "README",
+            "description": "Project readme",
+            "mimeType": "text/markdown",
+            "size": null
+        }])
+    );
+    assert_eq!(
+        repo_docs["resourceTemplates"],
+        json!([{
+            "uriTemplate": "file:///{+path}",
+            "name": "Workspace file",
+            "description": null,
+            "mimeType": null
+        }])
+    );
+    assert_eq!(
+        repo_docs["prompts"],
+        json!([{
+            "name": "review",
+            "description": "Review a diff",
+            "arguments": [{ "name": "path", "description": "File to review", "required": true }]
+        }])
     );
 
     // 5. Validate against generated Codex v1 & v2 JSON Schemas if present!
@@ -678,5 +773,188 @@ async fn thread_compact_start_queues_compaction_and_rate_limits_read_reports_poo
     assert!(
         missing.get("error").is_some(),
         "unknown thread must error: {missing}"
+    );
+}
+
+/// Gateway capturing the hooks a session attaches; advertises one tool and no catalogs.
+struct HookedMcpGateway {
+    hooks: Arc<Mutex<Option<Arc<McpServerHooks>>>>,
+}
+
+#[async_trait]
+impl McpGateway for HookedMcpGateway {
+    fn list_tools(&self) -> Vec<McpToolDescriptor> {
+        vec![McpToolDescriptor {
+            server: "docs".to_string(),
+            tool: "long_job".to_string(),
+            description: "Long running job".to_string(),
+            input_schema: json!({ "type": "object" }),
+        }]
+    }
+
+    async fn call_tool(
+        &self,
+        _server: &str,
+        _tool: &str,
+        _arguments: Value,
+    ) -> Result<Value, ToolsError> {
+        Ok(json!({ "content": [] }))
+    }
+
+    fn set_server_hooks(&self, hooks: Arc<McpServerHooks>) {
+        *self.hooks.lock().expect("lock") = Some(hooks);
+    }
+}
+
+/// `SessionEvent::McpProgress` during a running turn is forwarded as an `mcp/progress`
+/// notification with every parameter; nothing is forwarded after the turn completes, the
+/// rollout holds no progress, and `mcpServerStatus/list` reports empty catalog maps for a
+/// tools-only server.
+#[tokio::test]
+async fn mcp_progress_notification_reaches_clients_and_status_lists_empty_catalogs() {
+    use tokio::sync::{Notify, Semaphore};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let hooks: Arc<Mutex<Option<Arc<McpServerHooks>>>> = Arc::default();
+    let gateway: Arc<dyn McpGateway> = Arc::new(HookedMcpGateway {
+        hooks: Arc::clone(&hooks),
+    });
+    // The turn parks inside the driver until released, so progress is emitted mid-turn.
+    let entered = Arc::new(Notify::new());
+    let permits = Arc::new(Semaphore::new(0));
+    let driver: Arc<dyn ProviderDriver> = Arc::new(ScriptedAppDriver::gated(
+        Vec::new(),
+        Arc::clone(&entered),
+        Arc::clone(&permits),
+    ));
+    let (state, _ws) = build_app_state_with(&tmp, driver, gateway);
+
+    let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+    let (srv_r, srv_w) = tokio::io::split(server_stream);
+    tokio::spawn(async move {
+        let _ = serve_read_write(srv_r, srv_w, state).await;
+    });
+    let (cli_r, mut cli_w) = tokio::io::split(client_stream);
+    let mut lines = BufReader::new(cli_r).lines();
+    macro_rules! send {
+        ($json:expr) => {
+            cli_w
+                .write_all(format!("{}\n", $json).as_bytes())
+                .await
+                .expect("send")
+        };
+    }
+    macro_rules! next {
+        () => {{
+            let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+                .await
+                .expect("frame timeout")
+                .expect("io")
+                .expect("frame");
+            serde_json::from_str::<Value>(&line).expect("json")
+        }};
+    }
+
+    send!(
+        json!({ "id": 1, "method": "initialize", "params": { "clientInfo": { "name": "test", "version": "0" } } })
+    );
+    let _: Value = next!();
+    send!(json!({ "method": "initialized" }));
+    send!(json!({ "id": 2, "method": "thread/start", "params": {} }));
+    let thread_id = loop {
+        let msg = next!();
+        if msg["id"] == json!(2) {
+            break msg["result"]["thread"]["id"]
+                .as_str()
+                .expect("thread id")
+                .to_string();
+        }
+    };
+
+    // Turn in flight: wait until the session parked in the driver and attached its hooks.
+    send!(
+        json!({ "id": 3, "method": "turn/start", "params": { "threadId": thread_id, "input": [{ "type": "text", "text": "wait" }] } })
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+        .await
+        .expect("turn reached the driver");
+    let session_hooks = loop {
+        let attached = hooks.lock().expect("lock").clone();
+        if attached.is_some() {
+            break attached.expect("hooks");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    let progress_hook = session_hooks
+        .progress
+        .as_ref()
+        .expect("session attaches its progress hook");
+    progress_hook.on_progress("docs", "long_job", 2.0, Some(3.0), Some("indexing"));
+
+    let mut progress = None;
+    loop {
+        let msg = next!();
+        // Other notifications and the `turn/start` response pass through.
+        if msg["method"] == json!("mcp/progress") {
+            assert!(progress.is_none(), "one notification expected: {msg}");
+            assert!(msg.get("id").is_none(), "notifications carry no id: {msg}");
+            progress = Some(msg["params"].clone());
+            break;
+        }
+    }
+    let progress = progress.expect("mcp/progress");
+    assert_eq!(progress["threadId"], json!(thread_id));
+    assert!(progress["turnId"].as_str().is_some_and(|t| !t.is_empty()));
+    assert_eq!(progress["server"], "docs");
+    assert_eq!(progress["tool"], "long_job");
+    assert_eq!(progress["progress"], 2.0);
+    assert_eq!(progress["total"], 3.0);
+    assert_eq!(progress["message"], "indexing");
+
+    // Release the turn; the notification carried the id of the turn that then completed.
+    permits.add_permits(1);
+    let completed = loop {
+        let msg = next!();
+        if msg["method"] == json!("turn/completed") {
+            break msg["params"].clone();
+        }
+    };
+    assert_eq!(completed["turn"]["id"], progress["turnId"]);
+    assert_eq!(completed["turn"]["status"], "completed");
+
+    // The turn is retired: later progress is dropped, and the status stays tools-only.
+    progress_hook.on_progress("docs", "long_job", 3.0, Some(3.0), Some("late"));
+    send!(json!({ "id": 4, "method": "mcpServerStatus/list", "params": {} }));
+    let mut saw_late_progress = false;
+    let status = loop {
+        let msg = next!();
+        if msg["method"] == json!("mcp/progress") {
+            saw_late_progress = true;
+        }
+        if msg["id"] == json!(4) {
+            break msg["result"].clone();
+        }
+    };
+    assert!(
+        !saw_late_progress,
+        "progress after TurnCompleted must not be forwarded"
+    );
+    let servers = status["data"].as_array().expect("server list");
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0]["name"], "docs");
+    assert_eq!(servers[0]["tools"]["long_job"]["name"], "long_job");
+    assert_eq!(servers[0]["resources"], json!([]));
+    assert_eq!(servers[0]["resourceTemplates"], json!([]));
+    assert_eq!(servers[0]["prompts"], json!([]));
+
+    // Progress is live-only: never written to the rollout.
+    let records =
+        tekvra_storage::RolloutLog::read_records_readonly(&tmp.path().join("state"), &thread_id)
+            .expect("read rollout");
+    assert!(
+        records
+            .iter()
+            .all(|rec| !format!("{rec:?}").contains("indexing")),
+        "progress leaked into the rollout"
     );
 }

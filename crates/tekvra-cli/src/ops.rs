@@ -16,7 +16,7 @@ use tekvra_config::{
 };
 use tekvra_protocol::InputImage;
 use tekvra_storage::{StateIndex, UsageGroupBy, UsageRow};
-use tekvra_tools::{ConfiguredMcpGateway, McpGateway};
+use tekvra_tools::{ConfiguredMcpGateway, McpGateway, mcp_catalog_lines};
 
 /// Maximum accepted image attachment size per file (10 MiB).
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
@@ -740,11 +740,16 @@ async fn mcp_test(resolved: &ResolvedConfig, name: &str) -> Result<()> {
     let tools = gw.list_tools();
     if tools.is_empty() {
         println!("{name}: connected, 0 tools advertised");
-        return Ok(());
+    } else {
+        println!("{name}: connected, {} tool(s):", tools.len());
+        for tool in tools {
+            println!("  {}/{}", tool.server, tool.tool);
+        }
     }
-    println!("{name}: connected, {} tool(s):", tools.len());
-    for tool in tools {
-        println!("  {}/{}", tool.server, tool.tool);
+    for (server, line) in mcp_catalog_lines(gw.as_ref()) {
+        if server == name {
+            println!("  {line}");
+        }
     }
     Ok(())
 }

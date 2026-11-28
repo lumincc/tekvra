@@ -968,3 +968,71 @@ fn sync_plugin_registrations_refreshes_commands_and_keymaps_after_reload() {
         other => panic!("expected plugin command, got {other:?}"),
     }
 }
+
+#[test]
+fn mcp_progress_status_line_is_latest_wins_cleared_on_completion_and_mcp_banner_is_multiline() {
+    use tekvra_tui::format_mcp_progress;
+
+    const THREAD: &str = "thr_ui_mcp_01";
+    let mut app = TuiApp::new(THREAD, "openai/gpt-5.4-codex", PermissionMode::Build);
+    let progress =
+        |value: f64, total: Option<f64>, message: Option<&str>| SessionEvent::McpProgress {
+            thread_id: THREAD.to_string(),
+            turn_id: "turn_mcp_01".to_string(),
+            server: "docs".to_string(),
+            tool: "long_job".to_string(),
+            progress: value,
+            total,
+            message: message.map(str::to_string),
+        };
+
+    // Latest wins, rendered in the status bar.
+    app.apply_session_event(progress(1.0, Some(3.0), None));
+    assert_eq!(app.mcp_progress.as_deref(), Some("mcp docs/long_job: 1/3"));
+    app.apply_session_event(progress(2.0, Some(3.0), Some("indexing")));
+    assert_eq!(
+        app.mcp_progress.as_deref(),
+        Some("mcp docs/long_job: 2/3 indexing")
+    );
+    let screen = render_screen_text(&app, 120, 30);
+    assert!(
+        screen.contains("mcp docs/long_job: 2/3 indexing"),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("1/3"),
+        "stale progress must be replaced: {screen}"
+    );
+
+    // Completion clears the line; fractional values keep their decimals, optional parts drop.
+    app.apply_session_event(SessionEvent::TurnCompleted {
+        thread_id: THREAD.to_string(),
+        turn_id: "turn_mcp_01".to_string(),
+        status: "completed".to_string(),
+        error: None,
+    });
+    assert_eq!(app.mcp_progress, None);
+    let screen = render_screen_text(&app, 120, 30);
+    assert!(!screen.contains("mcp docs/long_job"), "{screen}");
+    assert_eq!(
+        format_mcp_progress("docs", "long_job", 0.5, None, Some("")),
+        "mcp docs/long_job: 0.5"
+    );
+
+    // `/mcp` catalogs render on their own lines under the tool summary.
+    app.apply_mcp_status(
+        "Connected MCP tools (1): docs/lookup\n\
+         docs resources: file:///README.md, file:///{+path}\n\
+         docs prompts: review",
+    );
+    let screen = render_screen_text(&app, 120, 30);
+    assert!(
+        screen.contains("Connected MCP tools (1): docs/lookup"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("docs resources: file:///README.md, file:///{+path}"),
+        "{screen}"
+    );
+    assert!(screen.contains("docs prompts: review"), "{screen}");
+}

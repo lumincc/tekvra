@@ -29,7 +29,9 @@ use tekvra_providers::{
     generate_pkce_pair, poll_device_code_token, refresh_oauth_account, request_device_code,
 };
 use tekvra_storage::{RolloutLog, RolloutRecord, StateIndex, WorkspaceSnapshotStore, rollout_path};
-use tekvra_tools::{ConfiguredMcpGateway, McpGateway, is_sensitive_credential_path};
+use tekvra_tools::{
+    ConfiguredMcpGateway, McpGateway, format_mcp_status, is_sensitive_credential_path,
+};
 use tekvra_tui::TuiRuntimeHooks;
 use uuid::Uuid;
 
@@ -1073,19 +1075,7 @@ async fn launch_interactive_tui(
             let Some(gw) = &mcp_for_tui else {
                 return "No MCP servers connected.".to_string();
             };
-            let tools = gw.list_tools();
-            if tools.is_empty() {
-                return "MCP gateway connected (0 tools advertised).".to_string();
-            }
-            let summary: Vec<String> = tools
-                .iter()
-                .map(|d| format!("{}/{}", d.server, d.tool))
-                .collect();
-            format!(
-                "Connected MCP tools ({}): {}",
-                tools.len(),
-                summary.join(", ")
-            )
+            format_mcp_status(gw.as_ref())
         })),
         on_run_review: Some(Box::new(move |target| {
             let cwd_cl = review_cwd.clone();

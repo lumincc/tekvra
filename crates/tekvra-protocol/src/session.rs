@@ -276,6 +276,23 @@ pub enum SessionEvent {
         /// Optional details.
         details: Option<String>,
     },
+    /// Live progress of an in-flight MCP `tools/call` (never persisted, never enters the prompt).
+    McpProgress {
+        /// Session/thread id.
+        thread_id: String,
+        /// Turn id.
+        turn_id: String,
+        /// MCP server name.
+        server: String,
+        /// Tool name.
+        tool: String,
+        /// Progress value.
+        progress: f64,
+        /// Total when known.
+        total: Option<f64>,
+        /// Optional human-readable status.
+        message: Option<String>,
+    },
     /// Turn finished (`completed`, `interrupted`, `failed`).
     TurnCompleted {
         /// Session/thread id.

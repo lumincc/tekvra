@@ -18,8 +18,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -31,10 +31,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex, oneshot};
+use tokio::time::Instant;
 
 use crate::ToolsError;
 use crate::pty::build_sanitized_shell_env;
-use crate::web_and_code::{McpGateway, McpServerHooks, McpToolDescriptor};
+use crate::web_and_code::{
+    McpGateway, McpPromptArgument, McpPromptDescriptor, McpResourceDescriptor,
+    McpResourceTemplateDescriptor, McpServerHooks, McpToolDescriptor,
+};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -43,6 +47,11 @@ const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 /// Per-chunk idle bound while draining an SSE body.
 const HTTP_IDLE_CHUNK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Page cap for cursor-paginated catalog lists (`nextCursor`).
+const MAX_CATALOG_PAGES: usize = 16;
+/// Item cap per catalog list.
+const MAX_CATALOG_ITEMS: usize = 1000;
 
 /// Summary of startup MCP server discovery.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -56,17 +65,36 @@ pub struct McpStartupReport {
 type PendingMap = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 
 /// Shared inbound-frame router for one transport: resolves pending calls, marks the catalog
-/// dirty on `notifications/tools/list_changed`, and fans out server→client requests.
+/// dirty on `*/*_list_changed` notifications, forwards `notifications/progress` for in-flight
+/// `tools/call`s, and fans out server→client requests.
 struct InboundRouter {
     pending: PendingMap,
     server_requests_tx: mpsc::UnboundedSender<Value>,
     catalog_dirty: Arc<AtomicBool>,
+    /// Progress token → tool name of each in-flight `tools/call`.
+    tracked_calls: TrackedCalls,
+    progress_tx: mpsc::UnboundedSender<ProgressUpdate>,
 }
 
 impl InboundRouter {
     fn route(&self, msg: &Value) {
-        if is_tools_list_changed_notification(msg) {
+        if is_catalog_changed_notification(msg) {
             self.catalog_dirty.store(true, Ordering::Release);
+        }
+        if is_progress_notification(msg) {
+            // Progress is a notification: never answered, never treated as a server request.
+            // Frames whose token is unknown (late, string, or not ours) are dropped.
+            if let Some(update) = parse_progress_notification(msg)
+                && let Some(tool) = self.tool_for_token(update.token)
+            {
+                let _ = self.progress_tx.send(ProgressUpdate {
+                    tool,
+                    progress: update.progress,
+                    total: update.total,
+                    message: update.message,
+                });
+            }
+            return;
         }
         let has_method = msg.get("method").is_some();
         let is_response = msg.get("result").is_some() || msg.get("error").is_some();
@@ -118,6 +146,167 @@ impl InboundRouter {
                 "error": { "code": -32000_i64, "message": reason }
             }));
         }
+        drop(guard);
+        self.tracked_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Registers `tool` as the in-flight call identified by progress token `token`; the
+    /// returned guard forgets the token when dropped, on every exit path of the call.
+    fn track_call(self: &Arc<Self>, token: u64, tool: &str) -> TrackedCall {
+        self.tracked_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(token, tool.to_string());
+        TrackedCall {
+            router: Arc::clone(self),
+            token,
+        }
+    }
+
+    fn forget_call(&self, token: u64) {
+        self.tracked_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&token);
+    }
+
+    fn tool_for_token(&self, token: u64) -> Option<String> {
+        self.tracked_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&token)
+            .cloned()
+    }
+}
+
+/// Progress token → tool name of each in-flight `tools/call`. Tokens are JSON-RPC ids skipped
+/// when the call's own id was allocated, so they never collide with a response id.
+type TrackedCalls = Arc<std::sync::Mutex<HashMap<u64, String>>>;
+
+/// RAII registration of one in-flight `tools/call` progress token (see `InboundRouter::track_call`).
+struct TrackedCall {
+    router: Arc<InboundRouter>,
+    token: u64,
+}
+
+impl Drop for TrackedCall {
+    fn drop(&mut self) {
+        self.router.forget_call(self.token);
+    }
+}
+
+/// One progress update, already correlated to an in-flight call's tool name.
+struct ProgressUpdate {
+    tool: String,
+    progress: f64,
+    total: Option<f64>,
+    message: Option<String>,
+}
+
+/// One `notifications/progress` frame as sent by the server.
+struct ParsedProgress {
+    token: u64,
+    progress: f64,
+    total: Option<f64>,
+    message: Option<String>,
+}
+
+/// Minimum interval between two hook deliveries for the same in-flight call.
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+fn is_progress_notification(msg: &Value) -> bool {
+    matches!(
+        msg.get("method").and_then(Value::as_str),
+        Some("notifications/progress" | "progress")
+    )
+}
+
+/// Parses a `notifications/progress` frame; `None` when the token is not a number we issued or
+/// `progress` is missing/not a number.
+fn parse_progress_notification(msg: &Value) -> Option<ParsedProgress> {
+    let params = msg.get("params")?;
+    Some(ParsedProgress {
+        token: params.get("progressToken").and_then(Value::as_u64)?,
+        progress: params.get("progress").and_then(Value::as_f64)?,
+        total: params.get("total").and_then(Value::as_f64),
+        message: params
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// Per-transport forwarder for one server: coalesces progress updates to at most one hook
+/// delivery per call per [`PROGRESS_MIN_INTERVAL`] while always delivering the latest value.
+async fn forward_progress(
+    mut rx: mpsc::UnboundedReceiver<ProgressUpdate>,
+    server_name: String,
+    hooks: SharedMcpHooks,
+) {
+    let mut held: HashMap<String, ProgressUpdate> = HashMap::new();
+    let mut last_sent: HashMap<String, Instant> = HashMap::new();
+    let mut flush_at: Option<Instant> = None;
+    loop {
+        tokio::select! {
+            update = rx.recv() => {
+                let Some(update) = update else { break };
+                let now = Instant::now();
+                if due(now, last_sent.get(&update.tool)) {
+                    deliver_progress(&server_name, &hooks, &update);
+                    last_sent.insert(update.tool.clone(), now);
+                } else {
+                    held.insert(update.tool.clone(), update);
+                    flush_at = next_flush(&held, &last_sent);
+                }
+            }
+            _ = tokio::time::sleep_until(flush_at.unwrap_or_else(Instant::now)), if flush_at.is_some() => {
+                let now = Instant::now();
+                let ready: Vec<String> = held
+                    .keys()
+                    .filter(|tool| due(now, last_sent.get(*tool)))
+                    .cloned()
+                    .collect();
+                for tool in ready {
+                    if let Some(update) = held.remove(&tool) {
+                        deliver_progress(&server_name, &hooks, &update);
+                        last_sent.insert(tool, now);
+                    }
+                }
+                flush_at = next_flush(&held, &last_sent);
+            }
+        }
+    }
+}
+
+/// Whether a call last delivered at `last` (if ever) may be delivered again at `now`.
+fn due(now: Instant, last: Option<&Instant>) -> bool {
+    last.is_none_or(|last| now.duration_since(*last) >= PROGRESS_MIN_INTERVAL)
+}
+
+/// Earliest instant at which some held update becomes deliverable.
+fn next_flush(
+    held: &HashMap<String, ProgressUpdate>,
+    last_sent: &HashMap<String, Instant>,
+) -> Option<Instant> {
+    held.keys()
+        .filter_map(|tool| last_sent.get(tool))
+        .map(|last| *last + PROGRESS_MIN_INTERVAL)
+        .min()
+}
+
+fn deliver_progress(server_name: &str, hooks: &SharedMcpHooks, update: &ProgressUpdate) {
+    let hooks = snapshot_hooks(hooks);
+    if let Some(hook) = hooks.as_ref().and_then(|hooks| hooks.progress.as_deref()) {
+        hook.on_progress(
+            server_name,
+            &update.tool,
+            update.progress,
+            update.total,
+            update.message.as_deref(),
+        );
     }
 }
 
@@ -192,6 +381,8 @@ enum McpClientTransport {
         session: Box<StdioSession>,
         router: Arc<InboundRouter>,
         catalog_dirty: Arc<AtomicBool>,
+        /// Catalog filled at handshake and replaced on refresh.
+        catalog: Arc<std::sync::Mutex<ServerCatalog>>,
         next_id: AtomicU64,
         call_timeout: Duration,
     },
@@ -201,6 +392,7 @@ enum McpClientTransport {
         bearer_token: Option<String>,
         router: Arc<InboundRouter>,
         catalog_dirty: Arc<AtomicBool>,
+        catalog: Arc<std::sync::Mutex<ServerCatalog>>,
         next_id: AtomicU64,
         call_timeout: Duration,
         /// Per-server overrides of [`HTTP_HEADER_TIMEOUT`].
@@ -366,9 +558,44 @@ impl McpClientTransport {
         }
     }
 
-    async fn connect_stdio(
-        params: StdioConnectParams<'_>,
-    ) -> Result<(Self, Vec<McpToolDescriptor>), ToolsError> {
+    fn router(&self) -> &Arc<InboundRouter> {
+        match self {
+            Self::Stdio { router, .. } | Self::Http { router, .. } => router,
+        }
+    }
+
+    /// Allocates a fresh progress token (a skipped JSON-RPC id, never reused for a response).
+    fn allocate_progress_token(&self) -> u64 {
+        match self {
+            Self::Stdio { next_id, .. } | Self::Http { next_id, .. } => {
+                next_id.fetch_add(1, Ordering::Relaxed)
+            }
+        }
+    }
+
+    fn capabilities(&self) -> ServerCapabilities {
+        self.catalog()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .capabilities
+    }
+
+    /// Clones one list out of the shared catalog.
+    fn catalog_list<T: Clone>(&self, pick: impl FnOnce(&ServerCatalog) -> &[T]) -> Vec<T> {
+        let guard = self
+            .catalog()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pick(&guard).to_vec()
+    }
+
+    fn catalog(&self) -> &Arc<std::sync::Mutex<ServerCatalog>> {
+        match self {
+            Self::Stdio { catalog, .. } | Self::Http { catalog, .. } => catalog,
+        }
+    }
+
+    async fn connect_stdio(params: StdioConnectParams<'_>) -> Result<Self, ToolsError> {
         let StdioConnectParams {
             server_name,
             executable,
@@ -411,12 +638,20 @@ impl McpClientTransport {
 
         let stdin = Arc::new(Mutex::new(stdin));
         let (server_requests_tx, server_requests_rx) = mpsc::unbounded_channel();
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
         let catalog_dirty = Arc::new(AtomicBool::new(false));
         let router = Arc::new(InboundRouter {
             pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             server_requests_tx,
             catalog_dirty: Arc::clone(&catalog_dirty),
+            tracked_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            progress_tx,
         });
+        tokio::spawn(forward_progress(
+            progress_rx,
+            server_name.to_string(),
+            Arc::clone(&hooks),
+        ));
 
         // Dedicated reader task: owns stdout, routes every frame, fails parked calls on EOF.
         let reader_router = Arc::clone(&router);
@@ -468,19 +703,19 @@ impl McpClientTransport {
                 _reader: reader,
             }),
             router,
+            catalog: Arc::new(std::sync::Mutex::new(ServerCatalog::default())),
             catalog_dirty,
             next_id: AtomicU64::new(1),
             call_timeout,
         };
 
-        let tools =
-            tokio::time::timeout(handshake_timeout, transport.handshake_and_list(server_name))
-                .await
-                .map_err(|_| ToolsError::CodeSandbox {
-                    message: format!("stdio MCP server `{server_name}` timed out during handshake"),
-                })??;
+        tokio::time::timeout(handshake_timeout, transport.handshake_and_list(server_name))
+            .await
+            .map_err(|_| ToolsError::CodeSandbox {
+                message: format!("stdio MCP server `{server_name}` timed out during handshake"),
+            })??;
 
-        Ok((transport, tools))
+        Ok(transport)
     }
 
     #[allow(clippy::too_many_arguments)] // one-shot internal connector; each param is distinct state
@@ -495,7 +730,7 @@ impl McpClientTransport {
         call_timeout: Duration,
         header_timeout: Duration,
         idle_timeout: Duration,
-    ) -> Result<(Self, Vec<McpToolDescriptor>), ToolsError> {
+    ) -> Result<Self, ToolsError> {
         let parsed = url::Url::parse(raw_url).map_err(|e| ToolsError::CodeSandbox {
             message: format!("invalid HTTP MCP URL `{raw_url}` for `{server_name}`: {e}"),
         })?;
@@ -512,12 +747,20 @@ impl McpClientTransport {
         })?;
 
         let (server_requests_tx, mut server_requests_rx) = mpsc::unbounded_channel();
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
         let catalog_dirty = Arc::new(AtomicBool::new(false));
         let router = Arc::new(InboundRouter {
             pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             server_requests_tx,
             catalog_dirty: Arc::clone(&catalog_dirty),
+            tracked_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            progress_tx,
         });
+        tokio::spawn(forward_progress(
+            progress_rx,
+            server_name.to_string(),
+            Arc::clone(&hooks),
+        ));
 
         // HTTP server→client requests are answered over POST to the endpoint.
         let handler_client = client.clone();
@@ -563,6 +806,7 @@ impl McpClientTransport {
             url: raw_url.to_string(),
             bearer_token,
             router,
+            catalog: Arc::new(std::sync::Mutex::new(ServerCatalog::default())),
             catalog_dirty,
             next_id: AtomicU64::new(1),
             call_timeout,
@@ -571,21 +815,17 @@ impl McpClientTransport {
             session: transport_session,
         };
 
-        let tools =
-            tokio::time::timeout(handshake_timeout, transport.handshake_and_list(server_name))
-                .await
-                .map_err(|_| ToolsError::CodeSandbox {
-                    message: format!("HTTP MCP server `{server_name}` timed out during handshake"),
-                })??;
+        tokio::time::timeout(handshake_timeout, transport.handshake_and_list(server_name))
+            .await
+            .map_err(|_| ToolsError::CodeSandbox {
+                message: format!("HTTP MCP server `{server_name}` timed out during handshake"),
+            })??;
 
-        Ok((transport, tools))
+        Ok(transport)
     }
 
-    async fn handshake_and_list(
-        &self,
-        server_name: &str,
-    ) -> Result<Vec<McpToolDescriptor>, ToolsError> {
-        let _init_res = self
+    async fn handshake_and_list(&self, server_name: &str) -> Result<(), ToolsError> {
+        let init_res = self
             .request(
                 server_name,
                 "initialize",
@@ -599,9 +839,71 @@ impl McpClientTransport {
                 }),
             )
             .await?;
+        let capabilities = ServerCapabilities::from_initialize(&init_res);
 
         self.notify("notifications/initialized", json!({})).await?;
-        self.list_tools_rpc(server_name).await
+        self.fill_catalog(server_name, capabilities).await
+    }
+
+    /// Re-queries every catalog the server advertised at handshake and replaces the shared one.
+    async fn refresh_catalog(&self, server_name: &str) -> Result<(), ToolsError> {
+        let capabilities = self.capabilities();
+        self.fill_catalog(server_name, capabilities).await
+    }
+
+    /// Fetches `tools/list` (fatal only when the server advertises `tools`) plus the
+    /// resource/prompt catalogs the server advertises (list failures only warn), then swaps
+    /// the shared catalog in one write.
+    async fn fill_catalog(
+        &self,
+        server_name: &str,
+        capabilities: ServerCapabilities,
+    ) -> Result<(), ToolsError> {
+        let mut catalog = ServerCatalog {
+            capabilities,
+            tools: if capabilities.tools {
+                self.list_tools_rpc(server_name).await?
+            } else {
+                // A server that advertises no tools may reject `tools/list`; that is not fatal.
+                self.list_tools_rpc(server_name).await.unwrap_or_default()
+            },
+            ..ServerCatalog::default()
+        };
+        if capabilities.resources {
+            match self
+                .list_pages(server_name, "resources/list", "resources")
+                .await
+            {
+                Ok(items) => catalog.resources = parse_resource_descriptors(server_name, &items),
+                Err(err) => eprintln!("tekvra-mcp: `{server_name}` resources/list failed: {err}"),
+            }
+            match self
+                .list_pages(server_name, "resources/templates/list", "resourceTemplates")
+                .await
+            {
+                Ok(items) => {
+                    catalog.resource_templates =
+                        parse_resource_template_descriptors(server_name, &items);
+                }
+                Err(err) => {
+                    eprintln!("tekvra-mcp: `{server_name}` resources/templates/list failed: {err}");
+                }
+            }
+        }
+        if capabilities.prompts {
+            match self
+                .list_pages(server_name, "prompts/list", "prompts")
+                .await
+            {
+                Ok(items) => catalog.prompts = parse_prompt_descriptors(server_name, &items),
+                Err(err) => eprintln!("tekvra-mcp: `{server_name}` prompts/list failed: {err}"),
+            }
+        }
+        *self
+            .catalog()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = catalog;
+        Ok(())
     }
 
     async fn list_tools_rpc(
@@ -610,6 +912,41 @@ impl McpClientTransport {
     ) -> Result<Vec<McpToolDescriptor>, ToolsError> {
         let list_res = self.request(server_name, "tools/list", json!({})).await?;
         Ok(parse_tool_descriptors(server_name, &list_res))
+    }
+
+    /// Collects every page of a list method (`nextCursor` cursor pagination), bounded by
+    /// [`MAX_CATALOG_PAGES`] pages and [`MAX_CATALOG_ITEMS`] items.
+    async fn list_pages(
+        &self,
+        server_name: &str,
+        method: &str,
+        key: &str,
+    ) -> Result<Vec<Value>, ToolsError> {
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_CATALOG_PAGES {
+            let params = match &cursor {
+                Some(cursor) => json!({ "cursor": cursor }),
+                None => json!({}),
+            };
+            let page = self.request(server_name, method, params).await?;
+            if let Some(page_items) = page.get(key).and_then(Value::as_array) {
+                items.extend(page_items.iter().cloned());
+            }
+            if items.len() >= MAX_CATALOG_ITEMS {
+                items.truncate(MAX_CATALOG_ITEMS);
+                break;
+            }
+            cursor = page
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|cursor| !cursor.is_empty())
+                .map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(items)
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<(), ToolsError> {
@@ -935,10 +1272,20 @@ impl SseFrameParser {
     }
 }
 
-fn is_tools_list_changed_notification(msg: &Value) -> bool {
+/// `notifications/*/list_changed` from a server: its catalog must be re-queried before next use.
+fn is_catalog_changed_notification(msg: &Value) -> bool {
     matches!(
         msg.get("method").and_then(Value::as_str),
-        Some("notifications/tools/list_changed" | "tools/list_changed")
+        Some(
+            "notifications/tools/list_changed"
+                | "tools/list_changed"
+                | "notifications/resources/list_changed"
+                | "resources/list_changed"
+                | "notifications/resources/templates/list_changed"
+                | "resources/templates/list_changed"
+                | "notifications/prompts/list_changed"
+                | "prompts/list_changed"
+        )
     )
 }
 
@@ -990,10 +1337,148 @@ fn parse_tool_descriptors(server_name: &str, result: &Value) -> Vec<McpToolDescr
     out
 }
 
+/// Catalogs a server advertised, filled at handshake and replaced on refresh.
+#[derive(Debug, Default, Clone)]
+struct ServerCatalog {
+    capabilities: ServerCapabilities,
+    tools: Vec<McpToolDescriptor>,
+    resources: Vec<McpResourceDescriptor>,
+    resource_templates: Vec<McpResourceTemplateDescriptor>,
+    prompts: Vec<McpPromptDescriptor>,
+}
+
+/// Capabilities a server announced in its `initialize` result.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ServerCapabilities {
+    tools: bool,
+    resources: bool,
+    prompts: bool,
+}
+
+impl ServerCapabilities {
+    fn from_initialize(init_result: &Value) -> Self {
+        let has = |key: &str| {
+            init_result
+                .get("capabilities")
+                .and_then(|caps| caps.get(key))
+                .is_some_and(|cap| !cap.is_null() && cap.as_bool() != Some(false))
+        };
+        Self {
+            tools: has("tools"),
+            resources: has("resources"),
+            prompts: has("prompts"),
+        }
+    }
+
+    /// Whether the server advertised the capability `operation` needs.
+    fn supports(self, operation: &str) -> bool {
+        match operation {
+            "tools/call" => true,
+            "resources/read" => self.resources,
+            "prompts/get" => self.prompts,
+            _ => false,
+        }
+    }
+}
+
+fn capability_name(operation: &str) -> &'static str {
+    match operation {
+        "resources/read" => "resources",
+        "prompts/get" => "prompts",
+        _ => "tools",
+    }
+}
+
+fn optional_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn parse_resource_descriptors(server_name: &str, items: &[Value]) -> Vec<McpResourceDescriptor> {
+    let mut out: Vec<_> = items
+        .iter()
+        .filter_map(|item| {
+            let uri = item.get("uri").and_then(Value::as_str)?;
+            Some(McpResourceDescriptor {
+                server: server_name.to_string(),
+                uri: uri.to_string(),
+                name: item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(uri)
+                    .to_string(),
+                description: optional_string(item, "description"),
+                mime_type: optional_string(item, "mimeType"),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.uri.cmp(&b.uri));
+    out.dedup_by(|a, b| a.uri == b.uri);
+    out
+}
+
+fn parse_resource_template_descriptors(
+    server_name: &str,
+    items: &[Value],
+) -> Vec<McpResourceTemplateDescriptor> {
+    let mut out: Vec<_> = items
+        .iter()
+        .filter_map(|item| {
+            let uri_template = item.get("uriTemplate").and_then(Value::as_str)?;
+            Some(McpResourceTemplateDescriptor {
+                server: server_name.to_string(),
+                uri_template: uri_template.to_string(),
+                name: item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(uri_template)
+                    .to_string(),
+                description: optional_string(item, "description"),
+                mime_type: optional_string(item, "mimeType"),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
+    out.dedup_by(|a, b| a.uri_template == b.uri_template);
+    out
+}
+
+fn parse_prompt_descriptors(server_name: &str, items: &[Value]) -> Vec<McpPromptDescriptor> {
+    let mut out: Vec<_> = items
+        .iter()
+        .filter_map(|item| {
+            let name = item.get("name").and_then(Value::as_str)?;
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_array)
+                .map(|args| {
+                    args.iter()
+                        .filter_map(|arg| {
+                            let name = arg.get("name").and_then(Value::as_str)?;
+                            Some(McpPromptArgument {
+                                name: name.to_string(),
+                                description: optional_string(arg, "description"),
+                                required: arg.get("required").and_then(Value::as_bool),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(McpPromptDescriptor {
+                server: server_name.to_string(),
+                name: name.to_string(),
+                description: optional_string(item, "description"),
+                arguments,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.dedup_by(|a, b| a.name == b.name);
+    out
+}
+
 /// Multi-server MCP client gateway bridging child `stdio` processes and Streamable HTTP endpoints.
 pub struct ConfiguredMcpGateway {
     transports: BTreeMap<String, Arc<McpClientTransport>>,
-    cached_tools: RwLock<Vec<McpToolDescriptor>>,
     /// Late-bound server→client hooks shared by every transport handler task.
     hooks: SharedMcpHooks,
 }
@@ -1027,7 +1512,6 @@ impl ConfiguredMcpGateway {
         experimental_mcp_sampling: bool,
     ) -> (Arc<Self>, McpStartupReport) {
         let mut transports = BTreeMap::new();
-        let mut all_tools = Vec::new();
         let mut report = McpStartupReport::default();
         let hooks: SharedMcpHooks = Arc::new(std::sync::Mutex::new(None));
 
@@ -1097,9 +1581,8 @@ impl ConfiguredMcpGateway {
             };
 
             match outcome {
-                Ok((transport, tools)) => {
+                Ok(transport) => {
                     report.connected_servers.push(name.clone());
-                    all_tools.extend(tools);
                     transports.insert(name.clone(), Arc::new(transport));
                 }
                 Err(err) => {
@@ -1110,47 +1593,61 @@ impl ConfiguredMcpGateway {
             }
         }
 
-        let gateway = Arc::new(Self {
-            transports,
-            cached_tools: RwLock::new(all_tools),
-            hooks,
-        });
+        let gateway = Arc::new(Self { transports, hooks });
         (gateway, report)
     }
 
-    /// Re-queries `tools/list` on `server_name` and atomically updates its cached tool descriptors.
+    /// Re-queries every catalog of `server_name` (`tools/list` plus the resource/prompt lists it
+    /// advertises) and atomically replaces its shared catalog; other servers are untouched.
     ///
     /// # Errors
-    /// Returns [`ToolsError`] if `server_name` is disconnected or `tools/list` fails.
+    /// Returns [`ToolsError`] if `server_name` is disconnected, the refresh times out, or
+    /// `tools/list` fails.
     pub async fn refresh_server_catalog(
         &self,
         server_name: &str,
     ) -> Result<Vec<McpToolDescriptor>, ToolsError> {
-        let transport =
-            self.transports
-                .get(server_name)
-                .cloned()
-                .ok_or_else(|| ToolsError::CodeSandbox {
-                    message: format!("MCP server `{server_name}` is not connected"),
-                })?;
-
-        let fresh = tokio::time::timeout(
+        let transport = self.transport(server_name)?;
+        tokio::time::timeout(
             transport.call_timeout(),
-            transport.list_tools_rpc(server_name),
+            transport.refresh_catalog(server_name),
         )
         .await
         .map_err(|_| ToolsError::CodeSandbox {
             message: format!("MCP `{server_name}` `tools/list` refresh timed out"),
         })??;
+        Ok(self.list_tools())
+    }
 
-        let mut guard = self
-            .cached_tools
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.retain(|d| d.server != server_name);
-        guard.extend(fresh);
-        guard.sort_by(|a, b| a.server.cmp(&b.server).then_with(|| a.tool.cmp(&b.tool)));
-        Ok(guard.clone())
+    fn transport(&self, server: &str) -> Result<Arc<McpClientTransport>, ToolsError> {
+        self.transports
+            .get(server)
+            .cloned()
+            .ok_or_else(|| ToolsError::CodeSandbox {
+                message: format!("MCP server `{server}` is not connected"),
+            })
+    }
+
+    /// One bounded request on `transport` (`resources/read` / `prompts/get`).
+    async fn bounded_request(
+        &self,
+        transport: &Arc<McpClientTransport>,
+        server: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, ToolsError> {
+        let result = tokio::time::timeout(
+            transport.call_timeout(),
+            transport.request(server, method, params),
+        )
+        .await
+        .map_err(|_| ToolsError::CodeSandbox {
+            message: format!("MCP `{server}` `{method}` timed out"),
+        })??;
+        if transport.take_catalog_dirty() {
+            let _ = self.refresh_server_catalog(server).await;
+        }
+        Ok(result)
     }
 
     /// Returns `true` when no MCP servers are currently connected.
@@ -1169,14 +1666,48 @@ impl ConfiguredMcpGateway {
 #[async_trait]
 impl McpGateway for ConfiguredMcpGateway {
     fn list_tools(&self) -> Vec<McpToolDescriptor> {
-        self.cached_tools
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.transports
+            .values()
+            .flat_map(|transport| transport.catalog_list(|catalog| &catalog.tools))
+            .collect()
     }
 
-    /// Attaches server→client hooks (`sampling/createMessage`, `elicitation/create`) that
-    /// transport handler tasks consult for every subsequent server-initiated request.
+    fn list_resources(&self) -> Vec<McpResourceDescriptor> {
+        self.transports
+            .values()
+            .flat_map(|transport| transport.catalog_list(|catalog| &catalog.resources))
+            .collect()
+    }
+
+    fn list_resource_templates(&self) -> Vec<McpResourceTemplateDescriptor> {
+        self.transports
+            .values()
+            .flat_map(|transport| transport.catalog_list(|catalog| &catalog.resource_templates))
+            .collect()
+    }
+
+    fn list_prompts(&self) -> Vec<McpPromptDescriptor> {
+        self.transports
+            .values()
+            .flat_map(|transport| transport.catalog_list(|catalog| &catalog.prompts))
+            .collect()
+    }
+
+    fn check_support(&self, server: &str, operation: &str) -> Result<(), ToolsError> {
+        let transport = self.transports.get(server).ok_or_else(|| {
+            ToolsError::invalid(format!("MCP server `{server}` is not connected"))
+        })?;
+        if transport.capabilities().supports(operation) {
+            return Ok(());
+        }
+        Err(ToolsError::invalid(format!(
+            "MCP server `{server}` does not advertise the `{}` capability (needed for `{operation}`)",
+            capability_name(operation)
+        )))
+    }
+
+    /// Attaches server→client hooks (`sampling/createMessage`, `elicitation/create`, progress)
+    /// that transport handler tasks consult for every subsequent server-initiated request.
     fn set_server_hooks(&self, hooks: Arc<McpServerHooks>) {
         *self
             .hooks
@@ -1190,14 +1721,9 @@ impl McpGateway for ConfiguredMcpGateway {
         tool: &str,
         arguments: Value,
     ) -> Result<Value, ToolsError> {
-        let transport =
-            self.transports
-                .get(server)
-                .cloned()
-                .ok_or_else(|| ToolsError::CodeSandbox {
-                    message: format!("MCP server `{server}` is not connected"),
-                })?;
-
+        let transport = self.transport(server)?;
+        let token = transport.allocate_progress_token();
+        let _tracked = transport.router().track_call(token, tool);
         let result = tokio::time::timeout(
             transport.call_timeout(),
             transport.request(
@@ -1206,6 +1732,7 @@ impl McpGateway for ConfiguredMcpGateway {
                 json!({
                     "name": tool,
                     "arguments": arguments,
+                    "_meta": { "progressToken": token },
                 }),
             ),
         )
@@ -1213,6 +1740,7 @@ impl McpGateway for ConfiguredMcpGateway {
         .map_err(|_| ToolsError::CodeSandbox {
             message: format!("MCP tool call `{server}/{tool}` timed out"),
         })??;
+        drop(_tracked);
 
         if transport.take_catalog_dirty() {
             let _ = self.refresh_server_catalog(server).await;
@@ -1225,5 +1753,27 @@ impl McpGateway for ConfiguredMcpGateway {
         }
 
         Ok(result)
+    }
+
+    async fn read_resource(&self, server: &str, uri: &str) -> Result<Value, ToolsError> {
+        let transport = self.transport(server)?;
+        self.bounded_request(&transport, server, "resources/read", json!({ "uri": uri }))
+            .await
+    }
+
+    async fn get_prompt(
+        &self,
+        server: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, ToolsError> {
+        let transport = self.transport(server)?;
+        self.bounded_request(
+            &transport,
+            server,
+            "prompts/get",
+            json!({ "name": name, "arguments": arguments }),
+        )
+        .await
     }
 }

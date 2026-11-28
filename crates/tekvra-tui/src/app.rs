@@ -235,6 +235,9 @@ pub struct TuiApp {
     pub usage: TokenUsage,
     /// Whether a turn is actively running.
     pub turn_running: bool,
+    /// Latest MCP progress of the running turn (`mcp server/tool: progress[/total][ message]`);
+    /// each `McpProgress` event replaces it and `TurnCompleted` clears it.
+    pub mcp_progress: Option<String>,
     /// Currently viewed transcript (`None` = Main Session, `Some(task_id)` = Subagent transcript).
     pub viewing_subagent: Option<String>,
     /// Main session transcript entries.
@@ -284,6 +287,7 @@ impl TuiApp {
             active_goal: None,
             usage: TokenUsage::default(),
             turn_running: false,
+            mcp_progress: None,
             viewing_subagent: None,
             main_transcript: Vec::new(),
             subagent_transcripts: BTreeMap::new(),
@@ -503,6 +507,18 @@ impl TuiApp {
         }
     }
 
+    /// Replaces the MCP progress status line from one `McpProgress` event (latest wins).
+    pub fn apply_mcp_progress(
+        &mut self,
+        server: &str,
+        tool: &str,
+        progress: f64,
+        total: Option<f64>,
+        message: Option<&str>,
+    ) {
+        self.mcp_progress = Some(format_mcp_progress(server, tool, progress, total, message));
+    }
+
     /// Appends a formatted MCP server/tool status banner to the main transcript.
     pub fn apply_mcp_status(&mut self, status_text: impl Into<String>) {
         self.main_transcript.push(TranscriptEntry::SystemBanner {
@@ -675,6 +691,17 @@ impl TuiApp {
             }
             SessionEvent::TurnCompleted { .. } if !is_subagent => {
                 self.turn_running = false;
+                self.mcp_progress = None;
+            }
+            SessionEvent::McpProgress {
+                server,
+                tool,
+                progress,
+                total,
+                message,
+                ..
+            } if !is_subagent => {
+                self.apply_mcp_progress(&server, &tool, progress, total, message.as_deref());
             }
             _ => {}
         }
@@ -1462,7 +1489,7 @@ impl TuiApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
+                Constraint::Length(1 + u16::from(self.mcp_progress.is_some())),
                 Constraint::Min(5),
                 Constraint::Length(composer_lines),
             ])
@@ -1526,7 +1553,25 @@ impl TuiApp {
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
-        frame.render_widget(bar, area);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(area);
+        frame.render_widget(bar, rows[0]);
+        if let Some(text) = &self.mcp_progress
+            && let Some(progress_area) = rows.get(1)
+        {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" {text}"),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))),
+                *progress_area,
+            );
+        }
     }
 
     fn render_transcript(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -1564,10 +1609,21 @@ impl TuiApp {
                     all_lines.extend(render_tool_card(card, is_sel));
                 }
                 TranscriptEntry::SystemBanner { tag, text } => {
-                    all_lines.push(Line::from(Span::styled(
-                        format!("  ⚡ [{tag}] {text}"),
-                        Style::default().fg(Color::Yellow),
-                    )));
+                    // Multi-line text (e.g. `/mcp` catalogs): continuation lines align under
+                    // the first one instead of embedding raw newlines in a single line.
+                    let first = format!("  ⚡ [{tag}] ");
+                    let indent = " ".repeat(tag.chars().count() + 8);
+                    for (index, line) in text.split('\n').enumerate() {
+                        let prefix = if index == 0 {
+                            first.as_str()
+                        } else {
+                            indent.as_str()
+                        };
+                        all_lines.push(Line::from(Span::styled(
+                            format!("{prefix}{line}"),
+                            Style::default().fg(Color::Yellow),
+                        )));
+                    }
                 }
             }
             all_lines.push(Line::from(Span::raw(String::new())));
@@ -2398,8 +2454,38 @@ fn event_thread_id(ev: &SessionEvent) -> Option<&str> {
         | SessionEvent::ReviewCompleted { thread_id, .. }
         | SessionEvent::TokenUsageUpdated { thread_id, .. }
         | SessionEvent::CompactionCompleted { thread_id, .. }
+        | SessionEvent::McpProgress { thread_id, .. }
         | SessionEvent::TurnCompleted { thread_id, .. } => Some(thread_id.as_str()),
         SessionEvent::ConfigWarning { .. } => None,
+    }
+}
+
+/// Formats the MCP progress status line: `mcp server/tool: progress[/total][ message]`.
+pub fn format_mcp_progress(
+    server: &str,
+    tool: &str,
+    progress: f64,
+    total: Option<f64>,
+    message: Option<&str>,
+) -> String {
+    let mut text = format!("mcp {server}/{tool}: {}", fmt_progress_number(progress));
+    if let Some(total) = total {
+        text.push('/');
+        text.push_str(&fmt_progress_number(total));
+    }
+    if let Some(message) = message.filter(|message| !message.is_empty()) {
+        text.push(' ');
+        text.push_str(message);
+    }
+    text
+}
+
+/// Renders a progress value without a decimal part when it is integral (`1`, not `1.0`).
+fn fmt_progress_number(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 1e15 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
     }
 }
 

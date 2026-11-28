@@ -753,22 +753,38 @@ async fn cli_mcp_add_list_remove_preserves_toml_comments() {
 async fn cli_mcp_test_performs_oneshot_handshake_against_http_mock() {
     use std::net::SocketAddr;
 
-    async fn mcp_dispatch(axum::Json(body): axum::Json<Value>) -> axum::response::Response {
+    /// Answers one JSON-RPC request; `full` servers also advertise resources and prompts.
+    fn mcp_dispatch(full: bool, axum::Json(body): axum::Json<Value>) -> axum::response::Response {
         let method = body
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
         let id = body.get("id").cloned().unwrap_or(Value::Null);
-        let result = match method {
-            "initialize" => json!({
-                "protocolVersion": "2024-11-05",
+        let result = match (method, full) {
+            ("initialize", true) => json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": { "resources": {}, "prompts": {} },
+                "serverInfo": { "name": "mock-mcp", "version": "0.0.1" }
+            }),
+            ("initialize", false) => json!({
+                "protocolVersion": "2025-06-18",
                 "capabilities": {},
                 "serverInfo": { "name": "mock-mcp", "version": "0.0.1" }
             }),
-            "tools/list" => json!({
+            ("tools/list", _) => json!({
                 "tools": [
                     { "name": "echo", "description": "Echo a message", "inputSchema": { "type": "object" } },
                     { "name": "ping", "description": "Ping", "inputSchema": { "type": "object" } }
+                ]
+            }),
+            ("resources/list", true) => json!({
+                "resources": [
+                    { "uri": "file:///README.md", "name": "README", "description": "Project readme", "mimeType": "text/markdown" }
+                ]
+            }),
+            ("prompts/list", true) => json!({
+                "prompts": [
+                    { "name": "review", "description": "Review a diff", "arguments": [{ "name": "path", "required": true }] }
                 ]
             }),
             _ => json!({}),
@@ -780,7 +796,31 @@ async fn cli_mcp_test_performs_oneshot_handshake_against_http_mock() {
             .expect("response")
     }
 
-    let app: Router<()> = Router::new().route("/mcp", axum::routing::post(mcp_dispatch));
+    async fn mcp_test(
+        ws: &std::path::Path,
+        cfg_dir: &std::path::Path,
+        state_dir: &std::path::Path,
+        server: &str,
+    ) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_tekvra"))
+            .args(["mcp", "test", server])
+            .current_dir(ws)
+            .env("TEKVRA_CONFIG_DIR", cfg_dir)
+            .env("TEKVRA_STATE_DIR", state_dir)
+            .output()
+            .await
+            .expect("run mcp test")
+    }
+
+    let app: Router<()> = Router::new()
+        .route(
+            "/mcp",
+            axum::routing::post(|body: axum::Json<Value>| async move { mcp_dispatch(true, body) }),
+        )
+        .route(
+            "/plain",
+            axum::routing::post(|body: axum::Json<Value>| async move { mcp_dispatch(false, body) }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -799,7 +839,10 @@ async fn cli_mcp_test_performs_oneshot_handshake_against_http_mock() {
     std::fs::create_dir_all(ws.join(".tekvra")).expect("mkdir .tekvra");
     std::fs::write(
         ws.join(".tekvra").join("tekvra.toml"),
-        format!("version = 2\n\n[mcp_servers.mock]\nurl = \"http://{addr}/mcp\"\nenabled = true\n"),
+        format!(
+            "version = 2\n\n[mcp_servers.mock]\nurl = \"http://{addr}/mcp\"\nenabled = true\n\n\
+             [mcp_servers.plain]\nurl = \"http://{addr}/plain\"\nenabled = true\n"
+        ),
     )
     .expect("write toml");
 
@@ -815,23 +858,32 @@ async fn cli_mcp_test_performs_oneshot_handshake_against_http_mock() {
         .expect("trust allow");
     assert_eq!(pre.status.code(), Some(0));
 
-    let out = Command::new(env!("CARGO_BIN_EXE_tekvra"))
-        .args(["mcp", "test", "mock"])
-        .current_dir(&ws)
-        .env("TEKVRA_CONFIG_DIR", &cfg_dir)
-        .env("TEKVRA_STATE_DIR", &state_dir)
-        .output()
-        .await
-        .expect("run mcp test");
+    // A server advertising resources and prompts prints them after its tools.
+    let out = mcp_test(&ws, &cfg_dir, &state_dir, "mock").await;
     assert_eq!(
         out.status.code(),
         Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("connected, 2 tool(s)"), "{stdout}");
-    assert!(stdout.contains("mock/echo") && stdout.contains("mock/ping"));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "mock: connected, 2 tool(s):\n  mock/echo\n  mock/ping\n  \
+         resources: file:///README.md\n  prompts: review\n"
+    );
+
+    // A tools-only server renders exactly as before the catalogs existed.
+    let out = mcp_test(&ws, &cfg_dir, &state_dir, "plain").await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "plain: connected, 2 tool(s):\n  plain/echo\n  plain/ping\n"
+    );
 }
 
 #[test]

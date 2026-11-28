@@ -214,6 +214,47 @@ for raw in sys.stdin:
     .expect("write hook stdio script");
 }
 
+/// Stdio MCP mock: `tools/call` streams fifty rapid `notifications/progress` frames on the
+/// request's `_meta.progressToken`, waits for the coalesced final value to flush, then returns.
+fn write_progress_stdio_script(path: &std::path::Path) {
+    std::fs::write(
+        path,
+        r#"import json, sys, time
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    msg = json.loads(raw)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if mid is None:
+        continue
+    if method == "initialize":
+        res = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "progress-demo", "version": "1.0"}}
+    elif method == "tools/list":
+        res = {"tools": [{"name": "long_job", "description": "Streams progress", "inputSchema": {"type": "object"}}]}
+    elif method == "tools/call":
+        token = msg["params"]["_meta"]["progressToken"]
+        for step in range(1, 51):
+            params = {"progressToken": token, "progress": step, "total": 50}
+            if step == 50:
+                params["message"] = "indexing done"
+            send({"jsonrpc": "2.0", "method": "notifications/progress", "params": params})
+        time.sleep(0.4)
+        res = {"content": [{"type": "text", "text": "job done"}]}
+    else:
+        res = {}
+    send({"jsonrpc": "2.0", "id": mid, "result": res})
+"#,
+    )
+    .expect("write progress stdio script");
+}
+
 async fn await_event(
     rx: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
     want: fn(&SessionEvent) -> bool,
@@ -385,6 +426,165 @@ async fn sampling_and_elicitation_round_trip_through_session_hooks() {
         totals.cost_usd > 0.0031,
         "sampling usage must be recorded in the ledger, got {}",
         totals.cost_usd
+    );
+    drop(handle);
+}
+
+/// One `McpProgress` event as received by a `subscribe()` client.
+#[derive(Debug, PartialEq)]
+struct SeenProgress {
+    thread_id: String,
+    turn_id: String,
+    server: String,
+    tool: String,
+    progress: f64,
+    total: Option<f64>,
+    message: Option<String>,
+}
+
+/// `notifications/progress` for an in-flight `tools/call` becomes `SessionEvent::McpProgress`
+/// with the running turn's ids: the burst is coalesced (first and final values both arrive,
+/// in order), nothing surfaces after `TurnCompleted`, and the rollout never records it.
+#[tokio::test]
+async fn mcp_progress_events_reach_subscribers_without_entering_the_rollout() {
+    let tmp = TempDir::new().expect("tempdir");
+    let driver = TurnScriptDriver::new(vec![
+        tool_call_resp(
+            "call_progress_1",
+            "code",
+            json!({ "code": "r = await mcp_call('hook_srv', 'long_job', {})\nprint(r['content'][0]['text'])" }),
+        ),
+        text_resp("job finished"),
+    ]);
+    let mut bootstrap = setup_bootstrap(&tmp, Arc::clone(&driver) as Arc<dyn ProviderDriver>);
+    let state_dir = bootstrap.state_dir.clone();
+
+    let script_path = tmp.path().join("progress_stdio_mcp.py");
+    write_progress_stdio_script(&script_path);
+    let mut servers: indexmap::IndexMap<String, McpServerConfig> = indexmap::IndexMap::new();
+    servers.insert(
+        "hook_srv".to_string(),
+        McpServerConfig {
+            command: Some("python3".to_string()),
+            args: vec![script_path.to_string_lossy().into_owned()],
+            enabled: true,
+            ..McpServerConfig::default()
+        },
+    );
+    let (gateway, report) = tekvra_tools::ConfiguredMcpGateway::connect_all(
+        &servers,
+        &bootstrap.workspace_root,
+        &bootstrap.config.settings.agent,
+        false,
+    )
+    .await;
+    assert_eq!(report.connected_servers, vec!["hook_srv"]);
+    bootstrap.mcp_gateway = Some(gateway);
+
+    let handle = spawn_session(bootstrap).expect("spawn session");
+    let mut rx = handle.subscribe();
+    let session_id = handle.session_id().to_string();
+    handle
+        .send(SessionCommand::SubmitInput {
+            prompt: "run the long job".to_string(),
+            delivery: InputDeliveryMode::Next,
+            images: Vec::new(),
+        })
+        .await
+        .expect("submit");
+
+    let mut progress = Vec::new();
+    let completed = loop {
+        match rx.recv().await {
+            Ok(SessionEvent::ApprovalRequested { prompt, .. }) => {
+                // The `code`-sandbox `mcp_call` is authorized through the interactive ladder.
+                handle
+                    .send(SessionCommand::ResolveApproval {
+                        approval_id: prompt.approval_id,
+                        resolution: ApprovalResolution::Approve {
+                            scope: None,
+                            lifetime: GrantLifetime::Once,
+                            confirmed_broad: false,
+                        },
+                    })
+                    .await
+                    .expect("approve mcp tool call");
+            }
+            Ok(SessionEvent::McpProgress {
+                thread_id,
+                turn_id,
+                server,
+                tool,
+                progress: value,
+                total,
+                message,
+            }) => progress.push(SeenProgress {
+                thread_id,
+                turn_id,
+                server,
+                tool,
+                progress: value,
+                total,
+                message,
+            }),
+            Ok(SessionEvent::TurnCompleted {
+                turn_id, status, ..
+            }) => {
+                break (turn_id, status);
+            }
+            Ok(_) => {}
+            Err(e) => panic!("event stream closed: {e}"),
+        }
+    };
+    let (turn_id, status) = completed;
+    assert_eq!(status, "completed");
+    assert!(turn_id.starts_with("turn_"), "{turn_id}");
+    assert!(
+        progress.len() >= 2,
+        "coalescing must keep the first and the final update: {progress:?}"
+    );
+    let expected = |value, total, message: Option<&str>| SeenProgress {
+        thread_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        server: "hook_srv".to_string(),
+        tool: "long_job".to_string(),
+        progress: value,
+        total,
+        message: message.map(str::to_string),
+    };
+    assert_eq!(progress[0], expected(1.0, Some(50.0), None));
+    assert_eq!(
+        progress.last(),
+        Some(&expected(50.0, Some(50.0), Some("indexing done")))
+    );
+    assert!(
+        progress.windows(2).all(|w| w[0].progress <= w[1].progress),
+        "progress must not go backwards: {progress:?}"
+    );
+
+    // The turn is retired at completion: no late (coalesced) progress may surface afterwards.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    while let Ok(ev) = rx.try_recv() {
+        assert!(
+            !matches!(ev, SessionEvent::McpProgress { .. }),
+            "late progress after TurnCompleted: {ev:?}"
+        );
+    }
+
+    // Progress is live-only: the rollout holds the tool card, never a progress entry.
+    let records = tekvra_storage::RolloutLog::read_records_readonly(&state_dir, &session_id)
+        .expect("read rollout");
+    assert!(
+        records
+            .iter()
+            .any(|rec| matches!(rec, tekvra_storage::RolloutRecord::ToolCard { .. })),
+        "expected the tool card in the rollout"
+    );
+    assert!(
+        records
+            .iter()
+            .all(|rec| !format!("{rec:?}").contains("indexing done")),
+        "progress leaked into the rollout"
     );
     drop(handle);
 }

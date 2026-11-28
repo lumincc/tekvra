@@ -14,7 +14,7 @@ use thiserror::Error;
 pub use app::{
     ActiveOverlay, BoxReviewFuture, PluginCommandHandler, SwitchSessionHandler,
     SwitchSessionOutcome, TranscriptEntry, TuiApp, TuiCommand, TuiRuntimeHooks,
-    extract_last_fenced_code_block, run_fullscreen_tui,
+    extract_last_fenced_code_block, format_mcp_progress, run_fullscreen_tui,
 };
 pub use cards::{ToolCardState, render_tool_card};
 pub use highlight::{CodeHighlighter, highlight_unified_diff};

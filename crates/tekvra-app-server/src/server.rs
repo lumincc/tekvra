@@ -1171,11 +1171,36 @@ impl JsonRpcConnection {
             .mcp_gateway
             .as_ref()
             .map_or_else(Vec::new, |gw| gw.list_tools());
+        let live_resources = self
+            .state
+            .mcp_gateway
+            .as_ref()
+            .map_or_else(Vec::new, |gw| gw.list_resources());
+        let live_templates = self
+            .state
+            .mcp_gateway
+            .as_ref()
+            .map_or_else(Vec::new, |gw| gw.list_resource_templates());
+        let live_prompts = self
+            .state
+            .mcp_gateway
+            .as_ref()
+            .map_or_else(Vec::new, |gw| gw.list_prompts());
 
         let mut server_names: Vec<String> = cfg.settings.mcp_servers.keys().cloned().collect();
         for desc in &live_tools {
             if !server_names.contains(&desc.server) {
                 server_names.push(desc.server.clone());
+            }
+        }
+        for server in live_resources
+            .iter()
+            .map(|desc| &desc.server)
+            .chain(live_templates.iter().map(|desc| &desc.server))
+            .chain(live_prompts.iter().map(|desc| &desc.server))
+        {
+            if !server_names.contains(server) {
+                server_names.push(server.clone());
             }
         }
 
@@ -1192,12 +1217,51 @@ impl JsonRpcConnection {
                     }),
                 );
             }
+            // Arrays of the Codex `Resource` / `ResourceTemplate` shapes (sorted by the
+            // gateway), plus the additive `prompts` array of the same kind.
+            let resources: Vec<Value> = live_resources
+                .iter()
+                .filter(|desc| desc.server == name)
+                .map(|desc| {
+                    json!({
+                        "uri": desc.uri,
+                        "name": desc.name,
+                        "description": desc.description,
+                        "mimeType": desc.mime_type,
+                        "size": Value::Null,
+                    })
+                })
+                .collect();
+            let resource_templates: Vec<Value> = live_templates
+                .iter()
+                .filter(|desc| desc.server == name)
+                .map(|desc| {
+                    json!({
+                        "uriTemplate": desc.uri_template,
+                        "name": desc.name,
+                        "description": desc.description,
+                        "mimeType": desc.mime_type,
+                    })
+                })
+                .collect();
+            let prompts: Vec<Value> = live_prompts
+                .iter()
+                .filter(|desc| desc.server == name)
+                .map(|desc| {
+                    json!({
+                        "name": desc.name,
+                        "description": desc.description,
+                        "arguments": desc.arguments,
+                    })
+                })
+                .collect();
             data.push(json!({
                 "name": name,
                 "authStatus": "unsupported",
                 "tools": Value::Object(tools_map),
-                "resources": [],
-                "resourceTemplates": [],
+                "resources": resources,
+                "resourceTemplates": resource_templates,
+                "prompts": prompts,
             }));
         }
         Ok(json!({ "data": data }))
@@ -1811,6 +1875,30 @@ impl JsonRpcConnection {
                                     "status": status,
                                     "error": error.map(|m| json!({ "message": m })),
                                 }
+                            }),
+                        );
+                    }
+                    SessionEvent::McpProgress {
+                        thread_id,
+                        turn_id,
+                        server,
+                        tool,
+                        progress,
+                        total,
+                        message,
+                    } => {
+                        // Live progress only: forwarded to clients, never written to the rollout.
+                        emit_notif_raw(
+                            &out_tx,
+                            "mcp/progress",
+                            json!({
+                                "threadId": thread_id,
+                                "turnId": turn_id,
+                                "server": server,
+                                "tool": tool,
+                                "progress": progress,
+                                "total": total,
+                                "message": message,
                             }),
                         );
                     }

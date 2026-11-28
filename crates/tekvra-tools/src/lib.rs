@@ -45,8 +45,10 @@ pub use registry::{
     ToolExecutionContext, build_tool_definitions_for_model, run_permission_ladder,
 };
 pub use web_and_code::{
-    McpCallAuthorizer, McpElicitationHook, McpGateway, McpSamplingHook, McpServerHooks,
-    McpToolDescriptor, MontyCodeSandbox, SafeWebFetcher,
+    McpCallAuthorizer, McpElicitationHook, McpGateway, McpProgressHook, McpPromptArgument,
+    McpPromptDescriptor, McpResourceDescriptor, McpResourceTemplateDescriptor, McpSamplingHook,
+    McpServerHooks, McpToolDescriptor, MontyCodeSandbox, SafeWebFetcher, format_mcp_status,
+    mcp_catalog_lines,
 };
 pub use web_search::{DEFAULT_WEBSEARCH_BASE_URL, WebSearcher};
 
