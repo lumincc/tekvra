@@ -58,7 +58,8 @@ const MAX_CATALOG_ITEMS: usize = 1000;
 pub struct McpStartupReport {
     /// Names of MCP servers that completed handshake and tool discovery.
     pub connected_servers: Vec<String>,
-    /// Non-fatal connection warnings for servers that could not be reached.
+    /// Non-fatal connection warnings: servers that could not be reached, or that connected
+    /// with a resource / prompt list that failed.
     pub warnings: Vec<String>,
 }
 
@@ -595,6 +596,15 @@ impl McpClientTransport {
         }
     }
 
+    /// Non-fatal catalog list failures recorded by the latest fill.
+    fn catalog_warnings(&self) -> Vec<String> {
+        self.catalog()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .warnings
+            .clone()
+    }
+
     async fn connect_stdio(params: StdioConnectParams<'_>) -> Result<Self, ToolsError> {
         let StdioConnectParams {
             server_name,
@@ -845,15 +855,20 @@ impl McpClientTransport {
         self.fill_catalog(server_name, capabilities).await
     }
 
-    /// Re-queries every catalog the server advertised at handshake and replaces the shared one.
+    /// Re-queries every catalog the server advertised at handshake and replaces the shared one;
+    /// non-fatal list failures go to stderr (startup reports them instead).
     async fn refresh_catalog(&self, server_name: &str) -> Result<(), ToolsError> {
         let capabilities = self.capabilities();
-        self.fill_catalog(server_name, capabilities).await
+        self.fill_catalog(server_name, capabilities).await?;
+        for warning in self.catalog_warnings() {
+            eprintln!("tekvra-mcp: {warning}");
+        }
+        Ok(())
     }
 
     /// Fetches `tools/list` (fatal only when the server advertises `tools`) plus the
-    /// resource/prompt catalogs the server advertises (list failures only warn), then swaps
-    /// the shared catalog in one write.
+    /// resource/prompt catalogs the server advertises (list failures are recorded in the
+    /// catalog's `warnings`), then swaps the shared catalog in one write.
     async fn fill_catalog(
         &self,
         server_name: &str,
@@ -875,7 +890,9 @@ impl McpClientTransport {
                 .await
             {
                 Ok(items) => catalog.resources = parse_resource_descriptors(server_name, &items),
-                Err(err) => eprintln!("tekvra-mcp: `{server_name}` resources/list failed: {err}"),
+                Err(err) => catalog
+                    .warnings
+                    .push(format!("MCP `{server_name}` resources/list failed: {err}")),
             }
             match self
                 .list_pages(server_name, "resources/templates/list", "resourceTemplates")
@@ -885,9 +902,9 @@ impl McpClientTransport {
                     catalog.resource_templates =
                         parse_resource_template_descriptors(server_name, &items);
                 }
-                Err(err) => {
-                    eprintln!("tekvra-mcp: `{server_name}` resources/templates/list failed: {err}");
-                }
+                Err(err) => catalog.warnings.push(format!(
+                    "MCP `{server_name}` resources/templates/list failed: {err}"
+                )),
             }
         }
         if capabilities.prompts {
@@ -896,7 +913,9 @@ impl McpClientTransport {
                 .await
             {
                 Ok(items) => catalog.prompts = parse_prompt_descriptors(server_name, &items),
-                Err(err) => eprintln!("tekvra-mcp: `{server_name}` prompts/list failed: {err}"),
+                Err(err) => catalog
+                    .warnings
+                    .push(format!("MCP `{server_name}` prompts/list failed: {err}")),
             }
         }
         *self
@@ -1345,6 +1364,8 @@ struct ServerCatalog {
     resources: Vec<McpResourceDescriptor>,
     resource_templates: Vec<McpResourceTemplateDescriptor>,
     prompts: Vec<McpPromptDescriptor>,
+    /// Non-fatal resource / prompt list failures of the fill that produced this catalog.
+    warnings: Vec<String>,
 }
 
 /// Capabilities a server announced in its `initialize` result.
@@ -1583,6 +1604,7 @@ impl ConfiguredMcpGateway {
             match outcome {
                 Ok(transport) => {
                     report.connected_servers.push(name.clone());
+                    report.warnings.extend(transport.catalog_warnings());
                     transports.insert(name.clone(), Arc::new(transport));
                 }
                 Err(err) => {

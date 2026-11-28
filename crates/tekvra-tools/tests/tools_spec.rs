@@ -2469,7 +2469,8 @@ impl tekvra_tools::McpProgressHook for ProgressLog {
 /// without them receives none, and a `tools/list` failure is only fatal when `tools` is
 /// advertised), lists are cursor-paginated then sorted by server and URI/name with duplicates
 /// removed, `notifications/resources/list_changed` triggers a refresh that picks up the change,
-/// and none of it touches the model-facing tool schemas.
+/// a failing `prompts/list` leaves the server connected with a startup warning, and none of it
+/// touches the model-facing tool schemas.
 #[tokio::test]
 async fn mcp_catalog_discovery_is_sorted_paginated_refreshed_and_capability_gated() {
     use indexmap::IndexMap;
@@ -2495,7 +2496,7 @@ async fn mcp_catalog_discovery_is_sorted_paginated_refreshed_and_capability_gate
             }),
             ("/plain", "initialize") | ("/zeta", "initialize") => json!({
                 "protocolVersion": "2025-06-18",
-                "capabilities": if req.path == "/zeta" { json!({ "resources": {} }) } else { json!({}) },
+                "capabilities": if req.path == "/zeta" { json!({ "resources": {}, "prompts": {} }) } else { json!({}) },
                 "serverInfo": { "name": "mock", "version": "1" }
             }),
             // Advertises no `tools`: rejecting `tools/list` must not fail the connection.
@@ -2503,6 +2504,13 @@ async fn mcp_catalog_discovery_is_sorted_paginated_refreshed_and_capability_gate
                 return Some(sse_frame(json!({
                     "jsonrpc": "2.0", "id": req.id,
                     "error": { "code": -32601, "message": "Method not found" }
+                })));
+            }
+            // Advertises `prompts` but fails the list: connected with a warning, no prompts.
+            ("/zeta", "prompts/list") => {
+                return Some(sse_frame(json!({
+                    "jsonrpc": "2.0", "id": req.id,
+                    "error": { "code": -32603, "message": "prompt catalog unavailable" }
                 })));
             }
             ("/docs", "tools/list") => json!({ "tools": [
@@ -2567,7 +2575,12 @@ async fn mcp_catalog_discovery_is_sorted_paginated_refreshed_and_capability_gate
     let mut connected = report.connected_servers.clone();
     connected.sort();
     assert_eq!(connected, ["docs", "plain", "zeta"]);
-    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].contains("`zeta`") && report.warnings[0].contains("prompts/list"),
+        "{}",
+        report.warnings[0]
+    );
 
     // Sorted by server then URI/name; the duplicate `file:///a.txt` is listed once.
     let resources = gw.list_resources();
@@ -2640,7 +2653,8 @@ async fn mcp_catalog_discovery_is_sorted_paginated_refreshed_and_capability_gate
             "notifications/initialized",
             "tools/list",
             "resources/list",
-            "resources/templates/list"
+            "resources/templates/list",
+            "prompts/list"
         ]
     );
     let docs_lists = || {
@@ -2713,7 +2727,9 @@ async fn mcp_catalog_discovery_is_sorted_paginated_refreshed_and_capability_gate
         ),
         "{err}"
     );
-    assert!(gw.check_support("zeta", "prompts/get").is_err());
+    // `zeta` advertises `prompts` even though its list failed; `plain` advertises nothing.
+    assert!(gw.check_support("zeta", "prompts/get").is_ok());
+    assert!(gw.check_support("plain", "prompts/get").is_err());
     assert!(gw.check_support("plain", "tools/call").is_ok());
     let err = gw
         .check_support("nope", "tools/call")
