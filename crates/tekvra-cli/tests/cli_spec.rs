@@ -83,6 +83,8 @@ async fn spawn_mock_openai_bodies(bodies: VecDeque<Value>) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_exec_output_schema_validation_and_no_plugins_flag() {
     let base_url = spawn_mock_openai_server(vec![
+        // 0. Plain reply for the run with the broken `init.lua` (load isolation keeps startup alive)
+        "POISON_ISOLATED_EXEC_SUCCESS",
         // 1. Valid JSON matching schema
         r#"{"summary":"All 21 OpenSpec tasks verified","passed":true}"#,
         // 2. Invalid JSON violating schema (`passed` is string instead of boolean!)
@@ -136,7 +138,8 @@ async fn cli_exec_output_schema_validation_and_no_plugins_flag() {
 
     let bin = env!("CARGO_BIN_EXE_tekvra");
 
-    // 0. Sanity check: WITHOUT `--no-plugins`, `init.lua` runs and aborts startup!
+    // 0. Sanity check: WITHOUT `--no-plugins`, `init.lua` runs and fails, but the failure is
+    //    isolated to that plugin (its notice goes to stderr) and the exec still completes.
     let poison_out = Command::new(bin)
         .current_dir(&ws)
         .env("TEKVRA_CONFIG_DIR", &cfg_dir)
@@ -147,9 +150,21 @@ async fn cli_exec_output_schema_validation_and_no_plugins_flag() {
         .output()
         .await
         .expect("run poison check");
+    let poison_stdout = String::from_utf8_lossy(&poison_out.stdout);
+    let poison_stderr = String::from_utf8_lossy(&poison_out.stderr);
     assert!(
-        !poison_out.status.success(),
-        "expected poison init.lua to fail when --no-plugins is NOT passed"
+        poison_out.status.success(),
+        "expected the broken init.lua to be isolated, stdout={poison_stdout}, stderr={poison_stderr}"
+    );
+    assert!(
+        poison_stderr.contains("Failed to load plugin")
+            && poison_stderr.contains("POISON_INIT_LUA_WAS_EXECUTED"),
+        "expected the plugin failure notice on stderr, stdout={poison_stdout}, stderr={poison_stderr}"
+    );
+    assert!(
+        poison_stdout.contains("POISON_ISOLATED_EXEC_SUCCESS")
+            && !poison_stdout.contains("POISON_INIT_LUA_WAS_EXECUTED"),
+        "stdout={poison_stdout}"
     );
 
     // 1. `tekvra --no-plugins exec --output-schema <schema.json>` with valid response -> exit 0!
