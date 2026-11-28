@@ -4146,6 +4146,7 @@ dependencies = [
  "tekvra-core",
  "tekvra-protocol",
  "tekvra-providers",
+ "tekvra-tools",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

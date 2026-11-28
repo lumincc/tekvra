@@ -170,7 +170,18 @@ impl PluginPermissions {
         }
     }
 
-    /// Verifies `net` permission for `raw_url`.
+    /// Whether the `net` grant covers `host` (exact, case-insensitive match or `*`).
+    #[must_use]
+    pub fn net_host_granted(&self, host: &str) -> bool {
+        match &self.net {
+            CapabilitySpec::Bool(granted) => *granted,
+            CapabilitySpec::List(list) => list
+                .iter()
+                .any(|h| h == "*" || h.eq_ignore_ascii_case(host)),
+        }
+    }
+
+    /// Verifies `net` permission for `raw_url` (the host of the requested URL).
     ///
     /// # Errors
     /// Returns an `mlua::Error` if `net` was not granted for the target host.
@@ -178,20 +189,35 @@ impl PluginPermissions {
         let parsed = url::Url::parse(raw_url)
             .map_err(|e| mlua::Error::RuntimeError(format!("invalid URL `{raw_url}`: {e}")))?;
         let host = parsed.host_str().unwrap_or_default();
-        let allowed = match &self.net {
-            CapabilitySpec::Bool(b) => *b,
-            CapabilitySpec::List(list) => list
-                .iter()
-                .any(|h| h == "*" || h.eq_ignore_ascii_case(host)),
-        };
-        if allowed {
+        if self.net_host_granted(host) {
             Ok(())
         } else {
             Err(mlua::Error::RuntimeError(format!(
-                "permission denied: plugin `{}` lacks `net` capability for host `{host}` in plugin.toml",
-                self.plugin_name
+                "permission denied: {}",
+                self.net_denial(host, "host")
             )))
         }
+    }
+
+    /// Verifies `net` permission for one redirect hop, so a grant for one host never
+    /// authorizes a redirect to another.
+    ///
+    /// # Errors
+    /// Returns the denial message (without a `permission denied:` prefix) if the hop host
+    /// was not granted.
+    pub fn check_redirect_host(&self, host: &str) -> Result<(), String> {
+        if self.net_host_granted(host) {
+            Ok(())
+        } else {
+            Err(self.net_denial(host, "redirect host"))
+        }
+    }
+
+    fn net_denial(&self, host: &str, kind: &str) -> String {
+        format!(
+            "plugin `{}` lacks `net` capability for {kind} `{host}` in plugin.toml",
+            self.plugin_name
+        )
     }
 
     /// Verifies `env` permission for `var_name`.

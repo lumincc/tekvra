@@ -46,12 +46,30 @@ env = ["CI"]
 | `net` | `tekvra.net.get(url)` | `false` |
 | `env` | `tekvra.env.get(var)` | `false` |
 
+### `net` semantics
+
+`tekvra.net.get(url)` performs a real HTTP(S) GET through the same SSRF-safe fetcher as the built-in `webfetch` tool and returns the text `HTTP <status> <final-url>\n\n<body>`:
+
+- The URL host must be granted (exact, case-insensitive match, or `*`); anything else raises a Lua error `permission denied: plugin `<name>` lacks `net` capability for host `<host>` in plugin.toml`.
+- **Every redirect hop is checked against the same grant**: a grant for `crates.io` never authorizes a redirect to another host (error wording uses `redirect host`).
+- Private, loopback, and link-local targets stay blocked regardless of grants; `agent.webfetch_allow_private_hosts` does **not** apply to plugins.
+- One call has a 15 s total budget (DNS, redirects, body) and the body is capped at 64 KiB, ending with `...[net.get: body truncated at 64 KiB]` when cut.
+
 ## Host Registration Surface (`tekvra.*`)
 
 - `tekvra.api.register_tool({ name, description, parameters, handler })`
 - `tekvra.api.register_command({ name, description, handler })`
-- `tekvra.api.register_hook(event, handler)` — lifecycle hooks; unknown event names are rejected at registration.
-- `tekvra.keymap.set(mode, lhs, description)`
+- `tekvra.api.register_hook(event, handler)` — lifecycle hooks; unknown event names are rejected at registration, failing that plugin's load only (see [Load Isolation](#load-isolation)).
+- `tekvra.keymap.set(mode, lhs, command)` — binds a TUI key chord to a slash command (see [Keymaps](#keymaps)).
+
+### Keymaps
+
+`tekvra.keymap.set(mode, lhs, command)` is validated at load time, so an invalid binding fails only that plugin with a notice naming the reason:
+
+- `mode`: `"n"` (composer empty), `"i"` (draft being edited), or `"*"` (both).
+- `lhs`: one `<...>` chord — `<C-g>`, `<A-m>` / `<M-m>`, `<C-A-x>`, `<F1>`–`<F12>`, `<C-F5>`. Case-insensitive; matching ignores `Shift`. Rejected: `Shift` chords, bare keys (`<a>`), named non-function keys (`Tab`/`Esc`/`Enter`/arrows are built-in), multi-key sequences, and the reserved `<C-c>` (interrupt/quit), `<C-x>` (tasks overlay), `<C-j>` (newline).
+- `command`: must start with `/` and may carry arguments (`"/review"`, `"/hello world"`). Pressing the chord dispatches the command exactly as if it were typed, without touching the composer draft; open overlays keep their keys; later registrations win.
+- `/help` lists active bindings as `Plugin keys: <C-g> → /review (n)`.
 
 ## Lifecycle Hooks
 
@@ -86,4 +104,8 @@ end)
 
 - `--no-plugins`: Disables all Luau plugin loading for the current invocation even when `experimental.lua_plugins = true`.
 - `--no-jit`: Switches Luau from native JIT compilation to the bytecode interpreter with full debug symbols (`debug_level = 2`).
-- `/reload`: Safely releases all `RegistryKey` handles, runs Luau GC cleanup, drops the previous VM, and reloads all plugins in place.
+- `/reload`: Safely releases all `RegistryKey` handles, runs Luau GC cleanup, drops the previous VM, and reloads all plugins in place, refreshing plugin slash-command completions and keymaps. Per-plugin failures are reported as notices instead of aborting the reload.
+
+## Load Isolation
+
+Plugins load one by one. When a plugin fails (invalid `plugin.toml`, a rejected registration such as an unknown hook event or an invalid keymap, or an `init.lua` error), only that plugin is skipped: every registration it made so far (tools, commands, keymaps, hooks) is rolled back and released, the other plugins keep working, and the report carries a notice `Failed to load plugin `<name>`: <reason> (its registrations were discarded)` — printed at startup and after `/reload`.

@@ -16,6 +16,7 @@ tekvra-protocol = { workspace = true }
 tekvra-config = { workspace = true }
 tekvra-providers = { workspace = true }
 tekvra-core = { workspace = true }
+tekvra-tools = { workspace = true }
 
 async-trait = { workspace = true }
 globset = { workspace = true }

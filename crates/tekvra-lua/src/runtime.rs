@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use mlua::chunk::Compiler;
@@ -14,8 +15,9 @@ use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Table, Value as LuaValue, Vm
 use serde_json::{Value as JsonValue, json};
 use tekvra_config::ResolvedConfig;
 use tekvra_core::{HookEvent, HookEventPayload, HookOutcome, PluginToolExecutor};
-use tekvra_protocol::ToolOutput;
+use tekvra_protocol::{KeymapSpec, ToolOutput};
 use tekvra_providers::ToolDefinition;
+use tekvra_tools::{SafeWebFetcher, ToolsError};
 
 use crate::LuaHostError;
 use crate::manifest::PluginPermissions;
@@ -25,13 +27,36 @@ use crate::manifest::PluginPermissions;
 /// call with an error once exhausted, bounding runaway plugins.
 const HOOK_INSTRUCTION_BUDGET: u64 = 5_000_000;
 
+/// Wall-clock budget for one `tekvra.net.get` call, including DNS, redirects, and body.
+const PLUGIN_NET_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Maximum body size returned by `tekvra.net.get` before truncation.
+const PLUGIN_NET_MAX_BODY_BYTES: usize = 64 * 1024;
+
+const PLUGIN_NET_TRUNCATION_MARKER: &str = "\n...[net.get: body truncated at 64 KiB]";
+
+/// VM-wide registries shared by every plugin. Each entry carries the index of the plugin that
+/// registered it so a plugin that fails to load can be rolled back without touching the others.
+type SharedTools = Arc<Mutex<BTreeMap<String, RegisteredLuaTool>>>;
+type SharedCommands = Arc<Mutex<BTreeMap<String, RegisteredLuaCommand>>>;
+type SharedKeymaps = Arc<Mutex<Vec<(usize, KeymapSpec)>>>;
+type SharedHooks = Arc<Mutex<BTreeMap<&'static str, Vec<(usize, RegistryKey)>>>>;
+
+fn registry_lock<T>(slot: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// CLI/runtime flags controlling [`PluginHost`] initialization.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LuaHostOptions {
     /// Suppresses all Lua plugin loading for this process (`--no-plugins`), even if `experimental.lua_plugins = true`.
     pub no_plugins: bool,
     /// Disables Luau native JIT codegen and enables full line/stack debug info (`--no-jit`).
     pub no_jit: bool,
+    /// Extra hosts/CIDRs/IPs exempt from SSRF filtering for `tekvra.net.get` (same syntax as
+    /// `agent.webfetch_allow_private_hosts`). The CLI passes none; tests use it to reach loopback servers.
+    pub net_ssrf_allowlist: Vec<String>,
 }
 
 /// Custom slash command registered via `tekvra.api.register_command`.
@@ -43,15 +68,12 @@ pub struct LuaCommandSpec {
     pub description: String,
 }
 
-/// Custom keybinding registered via `tekvra.keymap.set`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LuaKeymapSpec {
-    /// Mode (`"n"`, `"i"`, `"*"`).
-    pub mode: String,
-    /// Key chord string (e.g., `"<C-g>"`).
-    pub lhs: String,
-    /// Action description or command string.
-    pub description: String,
+/// Slash command registered by one plugin through `tekvra.api.register_command`.
+struct RegisteredLuaCommand {
+    spec: LuaCommandSpec,
+    handler_key: RegistryKey,
+    /// Index of the registering plugin (see the `Shared*` registry aliases).
+    plugin_idx: usize,
 }
 
 /// Summary returned on startup or `/reload`.
@@ -70,6 +92,8 @@ pub struct PluginLoadReport {
 struct RegisteredLuaTool {
     definition: ToolDefinition,
     handler_key: RegistryKey,
+    /// Index of the registering plugin (see the `Shared*` registry aliases).
+    plugin_idx: usize,
 }
 
 struct ActiveVmState {
@@ -77,10 +101,10 @@ struct ActiveVmState {
     /// `lua.remove_registry_value(...)` BEFORE `lua` is dropped so Luau's `lua_close` never sees
     /// dangling registry references or GC-order panics!
     tools: BTreeMap<String, RegisteredLuaTool>,
-    commands: BTreeMap<String, (LuaCommandSpec, RegistryKey)>,
-    keymaps: Vec<LuaKeymapSpec>,
+    commands: BTreeMap<String, RegisteredLuaCommand>,
+    keymaps: Vec<(usize, KeymapSpec)>,
     /// Lifecycle hook handler registry keys, keyed by [`HookEvent::as_str`].
-    hooks: BTreeMap<&'static str, Vec<RegistryKey>>,
+    hooks: BTreeMap<&'static str, Vec<(usize, RegistryKey)>>,
     /// Remaining instruction budget consumed by the VM interrupt callback.
     hook_budget: Arc<AtomicU64>,
     jit_enabled: bool,
@@ -92,11 +116,11 @@ impl Drop for ActiveVmState {
         for (_, tool) in std::mem::take(&mut self.tools) {
             let _ = self.lua.remove_registry_value(tool.handler_key);
         }
-        for (_, (_, key)) in std::mem::take(&mut self.commands) {
-            let _ = self.lua.remove_registry_value(key);
+        for (_, cmd) in std::mem::take(&mut self.commands) {
+            let _ = self.lua.remove_registry_value(cmd.handler_key);
         }
         for (_, keys) in std::mem::take(&mut self.hooks) {
-            for key in keys {
+            for (_, key) in keys {
                 let _ = self.lua.remove_registry_value(key);
             }
         }
@@ -109,6 +133,8 @@ impl Drop for ActiveVmState {
 pub struct PluginHost {
     config: Arc<Mutex<ResolvedConfig>>,
     options: LuaHostOptions,
+    /// SSRF-safe fetcher backing `tekvra.net.get` (strict policy unless the options allowlist says otherwise).
+    net_fetcher: SafeWebFetcher,
     vm: Arc<Mutex<Option<ActiveVmState>>>,
 }
 
@@ -117,14 +143,17 @@ impl PluginHost {
     /// When disabled (the default!), **zero** `mlua::Lua` VM is allocated!
     ///
     /// # Errors
-    /// Returns [`LuaHostError`] if `experimental.lua_plugins` is active and a plugin fails to load.
+    /// Returns [`LuaHostError`] only when the Luau VM itself cannot be built; individual plugin
+    /// failures are reported as notices.
     pub fn initialize(
         config: ResolvedConfig,
         options: LuaHostOptions,
     ) -> Result<(Self, PluginLoadReport), LuaHostError> {
+        let net_fetcher = SafeWebFetcher::new(&options.net_ssrf_allowlist);
         let host = Self {
             config: Arc::new(Mutex::new(config)),
             options,
+            net_fetcher,
             vm: Arc::new(Mutex::new(None)),
         };
         let report = host.reload()?;
@@ -173,7 +202,11 @@ impl PluginHost {
         let Some(state) = guard.as_ref() else {
             return Vec::new();
         };
-        state.commands.values().map(|(s, _)| s.clone()).collect()
+        state
+            .commands
+            .values()
+            .map(|cmd| cmd.spec.clone())
+            .collect()
     }
 
     /// Returns `true` if an active Luau plugin registered a slash command named `name`.
@@ -190,12 +223,14 @@ impl PluginHost {
 
     /// Lists keymaps registered by active Luau plugins.
     #[must_use]
-    pub fn registered_keymaps(&self) -> Vec<LuaKeymapSpec> {
+    pub fn registered_keymaps(&self) -> Vec<KeymapSpec> {
         let guard = self
             .vm
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.as_ref().map_or_else(Vec::new, |s| s.keymaps.clone())
+        guard.as_ref().map_or_else(Vec::new, |s| {
+            s.keymaps.iter().map(|(_, spec)| spec.clone()).collect()
+        })
     }
 
     /// Invokes a plugin-registered slash command by name.
@@ -212,12 +247,12 @@ impl PluginHost {
                 "lua plugins are disabled".to_string(),
             )));
         };
-        let Some((_, key)) = state.commands.get(name) else {
+        let Some(cmd) = state.commands.get(name) else {
             return Err(LuaHostError::Lua(mlua::Error::RuntimeError(format!(
                 "unknown plugin command `{name}`"
             ))));
         };
-        let func: Function = state.lua.registry_value(key)?;
+        let func: Function = state.lua.registry_value(&cmd.handler_key)?;
         let out: LuaValue = func.call(args)?;
         Ok(match out {
             LuaValue::String(s) => s.to_str()?.to_string(),
@@ -230,7 +265,8 @@ impl PluginHost {
     /// previous VM deterministically first.
     ///
     /// # Errors
-    /// Returns [`LuaHostError`] if plugin manifest parsing or Luau execution fails.
+    /// Returns [`LuaHostError`] only when the Luau VM itself cannot be built; individual plugin
+    /// failures are reported as notices.
     pub fn reload(&self) -> Result<PluginLoadReport, LuaHostError> {
         let cfg = self
             .config
@@ -292,45 +328,63 @@ impl PluginHost {
             });
         }
 
-        let shared_tools: Arc<Mutex<BTreeMap<String, RegisteredLuaTool>>> =
-            Arc::new(Mutex::new(BTreeMap::new()));
-        let shared_cmds: Arc<Mutex<BTreeMap<String, (LuaCommandSpec, RegistryKey)>>> =
-            Arc::new(Mutex::new(BTreeMap::new()));
-        let shared_keys: Arc<Mutex<Vec<LuaKeymapSpec>>> = Arc::new(Mutex::new(Vec::new()));
-        let shared_hooks: Arc<Mutex<BTreeMap<&'static str, Vec<RegistryKey>>>> =
-            Arc::new(Mutex::new(BTreeMap::new()));
+        let shared_tools: SharedTools = Arc::new(Mutex::new(BTreeMap::new()));
+        let shared_cmds: SharedCommands = Arc::new(Mutex::new(BTreeMap::new()));
+        let shared_keys: SharedKeymaps = Arc::new(Mutex::new(Vec::new()));
+        let shared_hooks: SharedHooks = Arc::new(Mutex::new(BTreeMap::new()));
 
-        let discovered = discover_plugin_targets(&cfg);
-        for target in discovered {
-            let perms = PluginPermissions::load_for_dir(
-                &target.name,
-                &target.plugin_dir,
-                &cfg.project_root,
-            )?;
-            let tekvra_tbl = build_plugin_tekvra_table(
-                &lua,
-                &compiler,
-                &target.plugin_dir,
-                perms,
-                Arc::clone(&shared_tools),
-                Arc::clone(&shared_cmds),
-                Arc::clone(&shared_keys),
-                Arc::clone(&shared_hooks),
-            )?;
-
-            let env = create_plugin_env(&lua, &compiler, &target.plugin_dir, tekvra_tbl)?;
-            let code =
-                fs::read_to_string(&target.entry_file).map_err(|source| LuaHostError::Io {
-                    path: target.entry_file.clone(),
-                    source,
-                })?;
-            lua.load(&code)
-                .set_name(format!("@{}", target.entry_file.display()))
-                .set_compiler(compiler.clone())
-                .set_environment(env)
-                .exec()?;
-
-            report.loaded_plugins.push(target.name);
+        for (plugin_idx, target) in discover_plugin_targets(&cfg).into_iter().enumerate() {
+            // Each plugin loads in isolation: any failure (manifest, host table, `init.lua`)
+            // rolls back only that plugin's registrations and surfaces as a notice, so one
+            // broken plugin never takes the others down.
+            let loaded = (|| -> Result<(), LuaHostError> {
+                let perms = PluginPermissions::load_for_dir(
+                    &target.name,
+                    &target.plugin_dir,
+                    &cfg.project_root,
+                )?;
+                let tekvra_tbl = build_plugin_tekvra_table(
+                    &lua,
+                    &compiler,
+                    &target.plugin_dir,
+                    plugin_idx,
+                    perms,
+                    self.net_fetcher.clone(),
+                    Arc::clone(&shared_tools),
+                    Arc::clone(&shared_cmds),
+                    Arc::clone(&shared_keys),
+                    Arc::clone(&shared_hooks),
+                )?;
+                let env = create_plugin_env(&lua, &compiler, &target.plugin_dir, tekvra_tbl)?;
+                let code =
+                    fs::read_to_string(&target.entry_file).map_err(|source| LuaHostError::Io {
+                        path: target.entry_file.clone(),
+                        source,
+                    })?;
+                lua.load(&code)
+                    .set_name(format!("@{}", target.entry_file.display()))
+                    .set_compiler(compiler.clone())
+                    .set_environment(env)
+                    .exec()?;
+                Ok(())
+            })();
+            match loaded {
+                Ok(()) => report.loaded_plugins.push(target.name),
+                Err(err) => {
+                    rollback_plugin_registrations(
+                        &lua,
+                        plugin_idx,
+                        &shared_tools,
+                        &shared_cmds,
+                        &shared_keys,
+                        &shared_hooks,
+                    );
+                    report.notices.push(format!(
+                        "Failed to load plugin `{}`: {err} (its registrations were discarded)",
+                        target.name
+                    ));
+                }
+            }
         }
 
         let tools = std::mem::take(
@@ -456,7 +510,7 @@ impl PluginToolExecutor for PluginHost {
                 .hooks
                 .get(event.as_str())
                 .and_then(|keys| keys.get(idx))
-                .map(|key| state.lua.registry_value(key))
+                .map(|(_, key)| state.lua.registry_value(key))
             {
                 Some(Ok(f)) => f,
                 Some(Err(err)) => {
@@ -627,17 +681,126 @@ fn create_plugin_env(
     Ok(env)
 }
 
+/// Runs one `tekvra.net.get` fetch on a dedicated thread with a private current-thread runtime:
+/// plugin callbacks are synchronous and may run on a Tokio worker thread, where `block_on` is
+/// forbidden. Returns the fetcher's text form with the body capped, or the error message.
+fn net_get_blocking(
+    fetcher: &SafeWebFetcher,
+    url: &str,
+    hop_check: &(dyn Fn(&str) -> Result<(), ToolsError> + Send + Sync),
+) -> Result<String, String> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .map_err(|e| format!("net.get failed to start its runtime: {e}"))?;
+                let fetch = fetcher.fetch_with_hop_check(url, hop_check);
+                // The timer needs a runtime clock: build it inside `block_on`.
+                match rt.block_on(async { tokio::time::timeout(PLUGIN_NET_TIMEOUT, fetch).await }) {
+                    Err(_elapsed) => Err(format!(
+                        "net.get timed out after {}s",
+                        PLUGIN_NET_TIMEOUT.as_secs()
+                    )),
+                    Ok(Err(err)) => Err(err.to_string()),
+                    Ok(Ok(output)) => Ok(cap_net_body(output.to_model_text())),
+                }
+            })
+            .join()
+            .map_err(|_| "net.get worker thread panicked".to_string())?
+    })
+}
+
+/// Caps the `<body>` half of the fetcher's `"HTTP <status> <url>\n\n<body>"` text at
+/// [`PLUGIN_NET_MAX_BODY_BYTES`], leaving the status line intact.
+fn cap_net_body(text: String) -> String {
+    if text.len() <= PLUGIN_NET_MAX_BODY_BYTES {
+        return text;
+    }
+    match text.split_once("\n\n") {
+        Some((head, body)) => format!("{head}\n\n{}", truncate_net_text(body)),
+        None => truncate_net_text(&text),
+    }
+}
+
+fn truncate_net_text(text: &str) -> String {
+    if text.len() <= PLUGIN_NET_MAX_BODY_BYTES {
+        return text.to_string();
+    }
+    let mut cut = PLUGIN_NET_MAX_BODY_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{PLUGIN_NET_TRUNCATION_MARKER}", &text[..cut])
+}
+
+/// Removes every registration made by plugin `plugin_idx` from the shared registries and
+/// releases its `RegistryKey`s, so a plugin that failed to load leaves nothing behind.
+fn rollback_plugin_registrations(
+    lua: &Lua,
+    plugin_idx: usize,
+    tools: &SharedTools,
+    commands: &SharedCommands,
+    keymaps: &SharedKeymaps,
+    hooks: &SharedHooks,
+) {
+    {
+        let mut tools = registry_lock(tools);
+        let names: Vec<String> = tools
+            .iter()
+            .filter(|(_, tool)| tool.plugin_idx == plugin_idx)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in names {
+            if let Some(tool) = tools.remove(&name) {
+                let _ = lua.remove_registry_value(tool.handler_key);
+            }
+        }
+    }
+    {
+        let mut commands = registry_lock(commands);
+        let names: Vec<String> = commands
+            .iter()
+            .filter(|(_, cmd)| cmd.plugin_idx == plugin_idx)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in names {
+            if let Some(cmd) = commands.remove(&name) {
+                let _ = lua.remove_registry_value(cmd.handler_key);
+            }
+        }
+    }
+    registry_lock(keymaps).retain(|(idx, _)| *idx != plugin_idx);
+    let mut hooks = registry_lock(hooks);
+    for keys in hooks.values_mut() {
+        let mut i = 0;
+        while i < keys.len() {
+            if keys[i].0 == plugin_idx {
+                let (_, key) = keys.swap_remove(i);
+                let _ = lua.remove_registry_value(key);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    hooks.retain(|_, keys| !keys.is_empty());
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 fn build_plugin_tekvra_table(
     lua: &Lua,
     _compiler: &Compiler,
     _plugin_dir: &Path,
+    plugin_idx: usize,
     perms: PluginPermissions,
-    tools: Arc<Mutex<BTreeMap<String, RegisteredLuaTool>>>,
-    commands: Arc<Mutex<BTreeMap<String, (LuaCommandSpec, RegistryKey)>>>,
-    keymaps: Arc<Mutex<Vec<LuaKeymapSpec>>>,
-    hooks: Arc<Mutex<BTreeMap<&'static str, Vec<RegistryKey>>>>,
+    net_fetcher: SafeWebFetcher,
+    tools: SharedTools,
+    commands: SharedCommands,
+    keymaps: SharedKeymaps,
+    hooks: SharedHooks,
 ) -> mlua::Result<Table> {
     let tekvra = lua.create_table()?;
 
@@ -672,6 +835,7 @@ fn build_plugin_tekvra_table(
                             parameters,
                         },
                         handler_key: key,
+                        plugin_idx,
                     },
                 );
                 Ok(())
@@ -690,10 +854,17 @@ fn build_plugin_tekvra_table(
                 let mut map = cmds_ref
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some((_, prev_key)) = map.remove(&name) {
-                    let _ = lua_ctx.remove_registry_value(prev_key);
+                if let Some(prev) = map.remove(&name) {
+                    let _ = lua_ctx.remove_registry_value(prev.handler_key);
                 }
-                map.insert(name.clone(), (LuaCommandSpec { name, description }, key));
+                map.insert(
+                    name.clone(),
+                    RegisteredLuaCommand {
+                        spec: LuaCommandSpec { name, description },
+                        handler_key: key,
+                        plugin_idx,
+                    },
+                );
                 Ok(())
             })?,
         )?;
@@ -716,28 +887,27 @@ fn build_plugin_tekvra_table(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .entry(hook_event.as_str())
                     .or_default()
-                    .push(key);
+                    .push((plugin_idx, key));
                 Ok(())
             })?,
         )?;
     }
     tekvra.set("api", api)?;
 
-    // 2. `tekvra.keymap.set(mode, lhs, desc)`
+    // 2. `tekvra.keymap.set(mode, lhs, command)` — validated here so a bad binding fails that
+    //    plugin's load instead of silently registering something the TUI can never match.
     let keymap = lua.create_table()?;
     {
         let keys_ref = Arc::clone(&keymaps);
         keymap.set(
             "set",
-            lua.create_function(move |_, (mode, lhs, desc): (String, String, String)| {
+            lua.create_function(move |_, (mode, lhs, command): (String, String, String)| {
+                let spec =
+                    KeymapSpec::parse(&mode, &lhs, &command).map_err(mlua::Error::RuntimeError)?;
                 keys_ref
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(LuaKeymapSpec {
-                        mode,
-                        lhs,
-                        description: desc,
-                    });
+                    .push((plugin_idx, spec));
                 Ok(())
             })?,
         )?;
@@ -831,7 +1001,8 @@ fn build_plugin_tekvra_table(
     }
     tekvra.set("run", run_tbl)?;
 
-    // 6. `tekvra.net.check_url(url)` / `tekvra.net.get(url)` gated by `plugin.toml` `net`!
+    // 6. `tekvra.net.get(url)` gated by `plugin.toml` `net`: a real HTTP(S) GET through the
+    //    SSRF-safe fetcher, with the grant re-checked on every redirect hop.
     let net_tbl = lua.create_table()?;
     {
         let p = perms;
@@ -839,7 +1010,11 @@ fn build_plugin_tekvra_table(
             "get",
             lua.create_function(move |_, url_str: String| {
                 p.check_net(&url_str)?;
-                Ok(format!("authorized:{url_str}"))
+                net_get_blocking(&net_fetcher, &url_str, &|host| {
+                    p.check_redirect_host(host)
+                        .map_err(|message| ToolsError::PermissionDenied { message })
+                })
+                .map_err(mlua::Error::RuntimeError)
             })?,
         )?;
     }

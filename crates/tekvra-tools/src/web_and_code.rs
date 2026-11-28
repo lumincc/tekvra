@@ -96,6 +96,20 @@ impl SafeWebFetcher {
     /// # Errors
     /// Returns [`ToolsError::WebFetch`] if any target or redirect resolves to a blocked private/loopback/metadata IP.
     pub async fn fetch(&self, raw_url: &str) -> Result<ToolOutput, ToolsError> {
+        self.fetch_with_hop_check(raw_url, &|_| Ok(())).await
+    }
+
+    /// Fetches `raw_url` exactly like [`fetch`](Self::fetch), additionally invoking `check`
+    /// with the host of every hop (the requested URL and each redirect target) before DNS
+    /// resolution, so callers can enforce their own per-host policy on top of the SSRF checks.
+    ///
+    /// # Errors
+    /// Returns the error produced by `check` for a denied hop, or [`ToolsError::WebFetch`] as for [`fetch`](Self::fetch).
+    pub async fn fetch_with_hop_check(
+        &self,
+        raw_url: &str,
+        check: &(dyn Fn(&str) -> Result<(), ToolsError> + Send + Sync),
+    ) -> Result<ToolOutput, ToolsError> {
         let mut current = url::Url::parse(raw_url).map_err(|e| ToolsError::WebFetch {
             message: format!("invalid URL `{raw_url}`: {e}"),
         })?;
@@ -113,6 +127,7 @@ impl SafeWebFetcher {
                     message: format!("URL `{current}` is missing a host"),
                 })?
                 .to_string();
+            check(&host)?;
             let port = current.port_or_known_default().unwrap_or(80);
 
             let resolved_addrs = self.resolve_and_validate(&host, port).await?;

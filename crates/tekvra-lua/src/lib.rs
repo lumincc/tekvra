@@ -10,7 +10,8 @@ pub mod runtime;
 use thiserror::Error;
 
 pub use manifest::{CapabilitySpec, PluginManifest, PluginPermissions};
-pub use runtime::{LuaCommandSpec, LuaHostOptions, LuaKeymapSpec, PluginHost, PluginLoadReport};
+pub use runtime::{LuaCommandSpec, LuaHostOptions, PluginHost, PluginLoadReport};
+pub use tekvra_protocol::KeymapSpec;
 
 /// Errors produced by `tekvra-lua`.
 #[derive(Debug, Error)]

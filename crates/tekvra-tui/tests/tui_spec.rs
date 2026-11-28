@@ -3,6 +3,9 @@
 //! - Raw vs Filtered terminal `ToolOutput` toggling
 //! - Scope-ladder selection & secondary broad-grant confirmation
 //! - `/tasks` (`Ctrl-X`) subagent switcher & live steering
+//! - Plugin keymaps (`tekvra.keymap.set`): chord dispatch without touching the composer draft
+
+use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
@@ -10,9 +13,12 @@ use ratatui::backend::TestBackend;
 use tekvra_core::SubagentEntry;
 use tekvra_protocol::{
     ApprovalPrompt, ApprovalResolution, ApprovalScope, GrantLifetime, InputDeliveryMode,
-    PermissionMode, ScopeLadderOption, SessionCommand, SessionEvent, ToolOutput,
+    KeymapSpec, PermissionMode, ScopeLadderOption, SessionCommand, SessionEvent, ToolOutput,
 };
-use tekvra_tui::{ActiveOverlay, CodeHighlighter, SearchOverlayState, TuiApp, TuiCommand};
+use tekvra_tui::{
+    ActiveOverlay, CodeHighlighter, SearchOverlayState, TranscriptEntry, TuiApp, TuiCommand,
+    TuiRuntimeHooks,
+};
 
 fn render_screen_text(app: &TuiApp, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
@@ -770,4 +776,195 @@ fn question_modal_answers_prompts_and_search_enter_jumps_to_session() {
             fork: false,
         }
     );
+}
+
+fn ctrl(ch: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+}
+
+fn type_text(app: &mut TuiApp, text: &str) {
+    for ch in text.chars() {
+        let _ = app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+}
+
+fn submit_text(app: &mut TuiApp, text: &str, modifiers: KeyModifiers) -> TuiCommand {
+    type_text(app, text);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, modifiers))
+}
+
+fn last_banner(app: &TuiApp) -> Option<&str> {
+    app.main_transcript
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            TranscriptEntry::SystemBanner { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+}
+
+#[test]
+fn plugin_keymap_chord_dispatches_its_command_without_touching_the_draft() {
+    let mut app = TuiApp::new(
+        "thr_ui_km_01",
+        "openai/gpt-5.4-codex",
+        PermissionMode::Build,
+    );
+    app.set_plugin_keymaps(vec![
+        KeymapSpec::parse("n", "<C-g>", "/mcp").expect("spec"),
+        KeymapSpec::parse("i", "<A-F4>", "/tasks").expect("spec"),
+    ]);
+
+    // Normal-mode bindings only fire while the composer is empty.
+    type_text(&mut app, "draft");
+    assert!(matches!(app.handle_key(ctrl('g')), TuiCommand::Noop));
+    assert_eq!(app.input_buffer, "draft");
+
+    // Insert-mode bindings fire while editing and leave the draft intact.
+    let alt_f4 = KeyEvent::new(KeyCode::F(4), KeyModifiers::ALT);
+    assert!(matches!(
+        app.handle_key(alt_f4),
+        TuiCommand::OpenTasksOverlay
+    ));
+    assert_eq!(app.input_buffer, "draft");
+
+    // Matching ignores Shift and letter case.
+    app.input_buffer.clear();
+    app.cursor_byte_pos = 0;
+    let shifted = KeyEvent::new(
+        KeyCode::Char('G'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    assert!(matches!(app.handle_key(shifted), TuiCommand::ShowMcpStatus));
+    assert!(app.input_buffer.is_empty());
+}
+
+#[test]
+fn plugin_keymap_latest_registration_wins_and_clears_the_completion_popup() {
+    let mut app = TuiApp::new(
+        "thr_ui_km_02",
+        "openai/gpt-5.4-codex",
+        PermissionMode::Build,
+    );
+    app.set_plugin_keymaps(vec![
+        KeymapSpec::parse("*", "<C-g>", "/mcp").expect("spec"),
+        KeymapSpec::parse("*", "<C-g>", "/tasks").expect("spec"),
+    ]);
+
+    type_text(&mut app, "/mo");
+    assert!(app.completion.is_some(), "slash completion popup expected");
+    assert!(matches!(
+        app.handle_key(ctrl('g')),
+        TuiCommand::OpenTasksOverlay
+    ));
+    assert!(app.completion.is_none());
+    assert_eq!(app.input_buffer, "/mo");
+
+    // A bound command with arguments reaches the plugin host with its arguments intact.
+    app.set_plugin_keymaps(vec![
+        KeymapSpec::parse("*", "<F9>", "/ping 42").expect("spec"),
+    ]);
+    match app.handle_key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE)) {
+        TuiCommand::InvokePluginCommand { name, args } => {
+            assert_eq!((name.as_str(), args.as_str()), ("ping", "42"));
+        }
+        other => panic!("expected plugin command, got {other:?}"),
+    }
+    assert_eq!(app.input_buffer, "/mo");
+}
+
+#[test]
+fn help_lists_plugin_keys_only_when_registered() {
+    let mut app = TuiApp::new(
+        "thr_ui_km_03",
+        "openai/gpt-5.4-codex",
+        PermissionMode::Build,
+    );
+    let _ = submit_text(&mut app, "/help", KeyModifiers::NONE);
+    assert!(
+        !last_banner(&app)
+            .expect("help banner")
+            .contains("Plugin keys")
+    );
+
+    app.set_plugin_keymaps(vec![
+        KeymapSpec::parse("n", "<C-g>", "/review").expect("spec"),
+        KeymapSpec::parse("*", "<F9>", "/mcp status").expect("spec"),
+    ]);
+    let _ = submit_text(&mut app, "/help", KeyModifiers::NONE);
+    let help = last_banner(&app).expect("help banner");
+    assert!(
+        help.contains("Plugin keys: <C-g> → /review (n), <F9> → /mcp status (*)"),
+        "{help}"
+    );
+}
+
+#[test]
+fn enter_delivery_modes_survive_the_slash_dispatch_extraction() {
+    let mut app = TuiApp::new(
+        "thr_ui_km_04",
+        "openai/gpt-5.4-codex",
+        PermissionMode::Build,
+    );
+    app.turn_running = true;
+    for (modifiers, expected) in [
+        (KeyModifiers::ALT, InputDeliveryMode::Replace),
+        (KeyModifiers::NONE, InputDeliveryMode::Guide),
+    ] {
+        match submit_text(&mut app, "steer me", modifiers) {
+            TuiCommand::Session(SessionCommand::SubmitInput {
+                delivery, prompt, ..
+            }) => {
+                assert_eq!(delivery, expected);
+                assert_eq!(prompt, "steer me");
+            }
+            other => panic!("expected submit, got {other:?}"),
+        }
+        assert!(app.input_buffer.is_empty());
+    }
+    app.turn_running = false;
+    match submit_text(&mut app, "fresh prompt", KeyModifiers::NONE) {
+        TuiCommand::Session(SessionCommand::SubmitInput { delivery, .. }) => {
+            assert_eq!(delivery, InputDeliveryMode::Next);
+        }
+        other => panic!("expected submit, got {other:?}"),
+    }
+}
+
+#[test]
+fn sync_plugin_registrations_refreshes_commands_and_keymaps_after_reload() {
+    type Registry = (Vec<(String, String)>, Vec<KeymapSpec>);
+    let registry: Arc<Mutex<Registry>> = Arc::default();
+    let for_cmds = Arc::clone(&registry);
+    let for_keys = Arc::clone(&registry);
+    let mut hooks = TuiRuntimeHooks {
+        plugin_slash_commands: Some(Box::new(move || for_cmds.lock().unwrap().0.clone())),
+        plugin_keymaps: Some(Box::new(move || for_keys.lock().unwrap().1.clone())),
+        ..TuiRuntimeHooks::default()
+    };
+    let mut app = TuiApp::new(
+        "thr_ui_km_05",
+        "openai/gpt-5.4-codex",
+        PermissionMode::Build,
+    );
+    hooks.sync_plugin_registrations(&mut app);
+    assert!(app.extra_slash_commands.is_empty() && app.keymaps.is_empty());
+
+    // `/reload` registers a command and a key: the next sync must reflect both.
+    *registry.lock().unwrap() = (
+        vec![("ping".to_string(), "Ping the host".to_string())],
+        vec![KeymapSpec::parse("n", "<C-g>", "/ping").expect("spec")],
+    );
+    hooks.sync_plugin_registrations(&mut app);
+    assert_eq!(
+        app.extra_slash_commands,
+        vec![("ping".to_string(), "Ping the host".to_string())]
+    );
+    assert_eq!(app.keymaps.len(), 1);
+    match app.handle_key(ctrl('g')) {
+        TuiCommand::InvokePluginCommand { name, args } => {
+            assert_eq!((name.as_str(), args.as_str()), ("ping", ""));
+        }
+        other => panic!("expected plugin command, got {other:?}"),
+    }
 }

@@ -26,8 +26,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use tekvra_core::{ReviewTarget, SessionHandle, SubagentEntry};
 use tekvra_protocol::{
-    ApprovalResolution, InputDeliveryMode, PermissionMode, RevertScope, ReviewFinding,
-    SessionCommand, SessionEvent, TokenUsage,
+    ApprovalResolution, InputDeliveryMode, KeyChord, KeySpec, KeymapSpec, PermissionMode,
+    RevertScope, ReviewFinding, SessionCommand, SessionEvent, TokenUsage,
 };
 use tekvra_storage::{RolloutRecord, StateIndex, WorkspaceSnapshotStore};
 
@@ -168,6 +168,9 @@ pub type TrustCommandHandler = Box<dyn FnMut(TrustUiCommand) -> Result<String, S
 /// Result returned when switching or forking a session in [`TuiRuntimeHooks::on_switch_session`].
 pub type SwitchSessionOutcome = (SessionHandle, Vec<RolloutRecord>);
 
+/// Provider of the `(name, description)` slash commands currently registered by Luau plugins.
+pub type PluginSlashCommandsProvider = Box<dyn Fn() -> Vec<(String, String)> + Send>;
+
 /// Boxed callback invoked when resuming or forking a session from `/sessions`.
 pub type SwitchSessionHandler =
     Box<dyn FnMut(&str, bool) -> Result<SwitchSessionOutcome, String> + Send>;
@@ -179,8 +182,11 @@ pub struct TuiRuntimeHooks {
     pub initial_records: Vec<RolloutRecord>,
     /// Pre-scanned non-sensitive workspace relative file paths for `@file` completion.
     pub workspace_files: Vec<String>,
-    /// Extra `(name, description)` slash commands registered by active Luau plugins.
-    pub extra_slash_commands: Vec<(String, String)>,
+    /// Provider of `(name, description)` slash commands registered by active Luau plugins
+    /// (re-queried at startup and after every successful `/reload`).
+    pub plugin_slash_commands: Option<PluginSlashCommandsProvider>,
+    /// Provider of keybindings registered by active Luau plugins (same lifecycle).
+    pub plugin_keymaps: Option<Box<dyn Fn() -> Vec<KeymapSpec> + Send>>,
     /// Discovered `(name, description)` SKILL.md packages for `/skill` completion.
     pub discovered_skills: Vec<(String, String)>,
     /// Selectable `(provider/model, description)` entries for the interactive `/model` picker.
@@ -200,6 +206,19 @@ pub struct TuiRuntimeHooks {
     pub on_run_review: Option<Box<dyn FnMut(ReviewTarget) -> BoxReviewFuture + Send>>,
     /// Invoked when the user selects a session to resume or fork in `/sessions`.
     pub on_switch_session: Option<SwitchSessionHandler>,
+}
+
+impl TuiRuntimeHooks {
+    /// Pulls the current plugin slash commands and keymaps from their providers into `app`.
+    /// Called once at startup and after every successful `/reload`.
+    pub fn sync_plugin_registrations(&mut self, app: &mut TuiApp) {
+        if let Some(provider) = &self.plugin_slash_commands {
+            app.set_extra_slash_commands(provider());
+        }
+        if let Some(provider) = &self.plugin_keymaps {
+            app.set_plugin_keymaps(provider());
+        }
+    }
 }
 
 /// Pure, deterministic full-screen TUI state machine (testable headlessly with `ratatui::backend::TestBackend`).
@@ -234,6 +253,8 @@ pub struct TuiApp {
     pub workspace_files: Vec<String>,
     /// Extra `(name, description)` slash commands from active Luau plugins.
     pub extra_slash_commands: Vec<(String, String)>,
+    /// Active plugin keybindings (`tekvra.keymap.set`), latest registration last.
+    pub keymaps: Vec<KeymapSpec>,
     /// Discovered `(name, description)` SKILL.md packages for `/skill` completion.
     pub skills: Vec<(String, String)>,
     /// Selectable models for the interactive `/model` picker.
@@ -272,6 +293,7 @@ impl TuiApp {
             cursor_byte_pos: 0,
             workspace_files: Vec::new(),
             extra_slash_commands: Vec::new(),
+            keymaps: Vec::new(),
             skills: Vec::new(),
             available_models: Vec::new(),
             memory_view: None,
@@ -298,6 +320,11 @@ impl TuiApp {
     pub fn set_extra_slash_commands(&mut self, cmds: Vec<(String, String)>) {
         self.extra_slash_commands = cmds;
         self.refresh_completions();
+    }
+
+    /// Sets the active plugin keybindings; later registrations win on equal chords.
+    pub fn set_plugin_keymaps(&mut self, keymaps: Vec<KeymapSpec>) {
+        self.keymaps = keymaps;
     }
 
     /// Attaches the `/memory` viewer (project memory content + file path).
@@ -1019,6 +1046,13 @@ impl TuiApp {
             return TuiCommand::Noop;
         }
 
+        // Plugin keymaps: a registered chord dispatches its slash command directly, without
+        // touching the composer draft (open overlays never reach this handler).
+        if let Some(spec) = self.match_keymap(key) {
+            self.completion = None;
+            return self.dispatch_slash_input(&spec.command, false);
+        }
+
         // Inline `/` and `@file` fuzzy completion popup keyboard navigation
         if let Some(popup) = &mut self.completion {
             match key.code {
@@ -1095,278 +1129,329 @@ impl TuiApp {
                 if trimmed.is_empty() {
                     return TuiCommand::Noop;
                 }
-                if trimmed == "/quit" || trimmed == "/exit" {
-                    return TuiCommand::Quit;
-                }
-                if trimmed == "/help" {
-                    self.main_transcript.push(TranscriptEntry::SystemBanner {
-                        tag: "help".to_string(),
-                        text: "Commands: /help, /model <provider/model>, /mode <plan|build|auto|yolo>, /sessions (/resume [id]), /fork <id>, /goal <cond|clear>, /review [uncommitted|base <branch>|commit <sha>], /mcp, /tasks (Ctrl-X), /search <query>, /revert <turn_id>, /reload, /quit | Keys: @file & / completion (Tab/Up/Down), Left/Right/Home/End/Delete, Ctrl-J newline, Shift-Tab cycle mode, r Raw/Filtered".to_string(),
-                    });
-                    return TuiCommand::Noop;
-                }
-                if trimmed == "/sessions" || trimmed == "/resume" {
-                    return TuiCommand::OpenSessionsOverlay;
-                }
-                if trimmed == "/undo" {
-                    self.main_transcript.push(TranscriptEntry::SystemBanner {
-                        tag: "undo".to_string(),
-                        text: "Undo requested: reverting the most recent turn (conversation + workspace files).".to_string(),
-                    });
-                    return TuiCommand::Session(SessionCommand::UndoLastTurn {
-                        scope: RevertScope::ConversationAndFiles,
-                    });
-                }
-                if trimmed == "/compact" {
-                    self.main_transcript.push(TranscriptEntry::SystemBanner {
-                        tag: "compact".to_string(),
-                        text:
-                            "Compaction requested: summarizing older context into a new generation."
-                                .to_string(),
-                    });
-                    return TuiCommand::Session(SessionCommand::Compact);
-                }
-                if trimmed == "/trust" || trimmed.starts_with("/trust ") {
-                    let arg = trimmed
-                        .strip_prefix("/trust")
-                        .unwrap_or_default()
-                        .trim()
-                        .to_ascii_lowercase();
-                    let action = match arg.as_str() {
-                        "" | "status" => TrustUiCommand::Status,
-                        "allow" | "grant" => TrustUiCommand::Allow,
-                        "revoke" | "deny" => TrustUiCommand::Revoke,
-                        other => {
-                            self.main_transcript.push(TranscriptEntry::SystemBanner {
-                                tag: "error".to_string(),
-                                text: format!(
-                                    "Usage: `/trust <status|allow|revoke>` (got `{other}`)"
-                                ),
-                            });
-                            return TuiCommand::Noop;
-                        }
-                    };
-                    return TuiCommand::RunTrust { action };
-                }
-                if trimmed == "/copy" || trimmed.starts_with("/copy ") {
-                    let arg = trimmed.strip_prefix("/copy").unwrap_or_default().trim();
-                    let Some(markdown) = self.latest_assistant_markdown() else {
-                        self.main_transcript.push(TranscriptEntry::SystemBanner {
-                            tag: "error".to_string(),
-                            text: "Nothing to copy yet: no completed assistant reply.".to_string(),
-                        });
-                        return TuiCommand::Noop;
-                    };
-                    let (text, label) = if arg == "code" {
-                        match extract_last_fenced_code_block(&markdown) {
-                            Some(code) => (code, "code block".to_string()),
-                            None => {
-                                self.main_transcript.push(TranscriptEntry::SystemBanner {
-                                    tag: "error".to_string(),
-                                    text: "No fenced code block found in the latest reply."
-                                        .to_string(),
-                                });
-                                return TuiCommand::Noop;
-                            }
-                        }
-                    } else {
-                        (markdown, "reply".to_string())
-                    };
-                    return TuiCommand::CopyToClipboard { text, label };
-                }
-                if let Some(rest) = trimmed.strip_prefix("/resume ") {
-                    let sid = rest.trim();
-                    if !sid.is_empty() {
-                        return TuiCommand::SwitchSession {
-                            session_id: sid.to_string(),
-                            fork: false,
-                        };
-                    }
-                }
-                if let Some(rest) = trimmed.strip_prefix("/fork ") {
-                    let sid = rest.trim();
-                    if !sid.is_empty() {
-                        return TuiCommand::SwitchSession {
-                            session_id: sid.to_string(),
-                            fork: true,
-                        };
-                    }
-                }
-                if trimmed == "/tasks" {
-                    return TuiCommand::OpenTasksOverlay;
-                }
-                if trimmed == "/reload" {
-                    return TuiCommand::ReloadPlugins;
-                }
-                if trimmed == "/mcp" {
-                    return TuiCommand::ShowMcpStatus;
-                }
-                if trimmed == "/memory" || trimmed == "/memory edit" {
-                    let edit = trimmed == "/memory edit";
-                    let text = match self.memory_view.as_mut() {
-                        Some(cb) => cb(),
-                        None => "Project memory unavailable (no memory hook attached).".to_string(),
-                    };
-                    if edit {
-                        // Purely informational: MEMORY.md is plain Markdown, edit it in any editor.
-                        let path = text.lines().next().unwrap_or("<unknown path>").to_string();
-                        self.main_transcript.push(TranscriptEntry::SystemBanner {
-                            tag: "memory".to_string(),
-                            text: format!(
-                                "Edit {path} in your editor; it is re-read at session start."
-                            ),
-                        });
-                    } else {
-                        self.main_transcript.push(TranscriptEntry::SystemBanner {
-                            tag: "memory".to_string(),
-                            text,
-                        });
-                    }
-                    return TuiCommand::Noop;
-                }
-                if trimmed == "/model" || trimmed.starts_with("/model ") {
-                    let arg = trimmed.strip_prefix("/model").unwrap_or_default().trim();
-                    if arg.is_empty() {
-                        if self.available_models.is_empty() {
-                            self.main_transcript.push(TranscriptEntry::SystemBanner {
-                                tag: "model".to_string(),
-                                text: format!("Active model: `{}` (no model catalog available for the interactive picker)", self.active_model),
-                            });
-                        } else {
-                            self.overlay = ActiveOverlay::ModelPicker(ModelPickerState::new(
-                                self.available_models.clone(),
-                            ));
-                        }
-                        return TuiCommand::Noop;
-                    }
-                    self.active_model = arg.to_string();
-                    self.main_transcript.push(TranscriptEntry::SystemBanner {
-                        tag: "model".to_string(),
-                        text: format!("Switched active model to `{arg}`"),
-                    });
-                    return TuiCommand::Session(SessionCommand::SwitchModel {
-                        model: arg.to_string(),
-                    });
-                }
-                if trimmed == "/mode" || trimmed.starts_with("/mode ") {
-                    let arg = trimmed
-                        .strip_prefix("/mode")
-                        .unwrap_or_default()
-                        .trim()
-                        .to_ascii_lowercase();
-                    let parsed = match arg.as_str() {
-                        "plan" => Some(PermissionMode::Plan),
-                        "readonly" | "read-only" => Some(PermissionMode::ReadOnly),
-                        "build" => Some(PermissionMode::Build),
-                        "auto" => Some(PermissionMode::Auto),
-                        "yolo" => Some(PermissionMode::Yolo),
-                        _ => None,
-                    };
-                    let Some(new_mode) = parsed else {
-                        self.main_transcript.push(TranscriptEntry::SystemBanner {
-                            tag: "error".to_string(),
-                            text: "Usage: `/mode <plan|build|auto|yolo>`".to_string(),
-                        });
-                        return TuiCommand::Noop;
-                    };
-                    self.mode = new_mode;
-                    self.main_transcript.push(TranscriptEntry::SystemBanner {
-                        tag: "mode".to_string(),
-                        text: format!("Switched permission mode to `{new_mode:?}`"),
-                    });
-                    return TuiCommand::Session(SessionCommand::SetMode { mode: new_mode });
-                }
-                if trimmed == "/review" || trimmed.starts_with("/review ") {
-                    let rest = trimmed.strip_prefix("/review").unwrap_or_default().trim();
-                    let target = parse_tui_review_target(rest);
-                    return TuiCommand::RunReview { target };
-                }
-                if trimmed == "/goal" || trimmed.starts_with("/goal ") {
-                    let cond = trimmed.strip_prefix("/goal").unwrap_or_default().trim();
-                    let opt = (!cond.is_empty() && cond != "clear").then(|| cond.to_string());
-                    self.active_goal.clone_from(&opt);
-                    return TuiCommand::Session(SessionCommand::SetGoal { condition: opt });
-                }
-                if trimmed == "/search" || trimmed.starts_with("/search ") {
-                    let q = trimmed.strip_prefix("/search").unwrap_or_default().trim();
-                    return TuiCommand::RunSearch {
-                        query: q.to_string(),
-                    };
-                }
-                if trimmed == "/revert" || trimmed.starts_with("/revert ") {
-                    let tid = trimmed.strip_prefix("/revert").unwrap_or_default().trim();
-                    return TuiCommand::OpenRevertPreview {
-                        turn_id: tid.to_string(),
-                    };
-                }
-                // `/skill <name> [prompt]` is expanded by the session runner, not the plugin host.
-                if trimmed == "/skill" || trimmed.starts_with("/skill ") {
-                    let arg = trimmed.strip_prefix("/skill").unwrap_or_default().trim();
-                    if arg.is_empty() {
-                        self.main_transcript.push(TranscriptEntry::SystemBanner {
-                            tag: "error".to_string(),
-                            text: "Usage: `/skill <name> [prompt]`".to_string(),
-                        });
-                        return TuiCommand::Noop;
-                    }
-                    self.main_transcript
-                        .push(TranscriptEntry::UserMessage(trimmed.to_string()));
-                    let delivery = if self.turn_running {
-                        InputDeliveryMode::Guide
-                    } else {
-                        InputDeliveryMode::Next
-                    };
-                    return TuiCommand::Session(SessionCommand::SubmitInput {
-                        prompt: trimmed.to_string(),
-                        delivery,
-                        images: Vec::new(),
-                    });
-                }
-                if let Some(after_slash) = trimmed.strip_prefix('/') {
-                    let mut parts = after_slash.splitn(2, char::is_whitespace);
-                    let cmd_name = parts.next().unwrap_or_default();
-                    let cmd_args = parts.next().unwrap_or_default().trim();
-                    if !cmd_name.is_empty()
-                        && !cmd_name.contains('/')
-                        && cmd_name
-                            .chars()
-                            .next()
-                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    {
-                        return TuiCommand::InvokePluginCommand {
-                            name: cmd_name.to_string(),
-                            args: cmd_args.to_string(),
-                        };
-                    }
-                }
-
-                if let Some(sub_tid) = self.viewing_subagent.clone() {
-                    return TuiCommand::SteerSubagent {
-                        task_id: sub_tid,
-                        prompt: trimmed.to_string(),
-                        delivery: InputDeliveryMode::Guide,
-                    };
-                }
-
-                self.main_transcript
-                    .push(TranscriptEntry::UserMessage(trimmed.to_string()));
-                let delivery = if self.turn_running {
-                    if key.modifiers.contains(KeyModifiers::ALT) {
-                        InputDeliveryMode::Replace
-                    } else {
-                        InputDeliveryMode::Guide
-                    }
-                } else {
-                    InputDeliveryMode::Next
-                };
-                TuiCommand::Session(SessionCommand::SubmitInput {
-                    prompt: trimmed.to_string(),
-                    delivery,
-                    images: Vec::new(),
-                })
+                self.dispatch_slash_input(trimmed, key.modifiers.contains(KeyModifiers::ALT))
             }
             _ => TuiCommand::Noop,
         }
+    }
+
+    /// Dispatches one trimmed composer line exactly as pressing <Enter> would: built-in slash
+    /// commands, plugin commands, steering, or a new prompt (`alt` selects Alt+Enter delivery).
+    /// Shared with plugin keymaps, which dispatch a bound command without touching the draft.
+    fn dispatch_slash_input(&mut self, trimmed: &str, alt: bool) -> TuiCommand {
+        if trimmed.is_empty() {
+            return TuiCommand::Noop;
+        }
+        if trimmed == "/quit" || trimmed == "/exit" {
+            return TuiCommand::Quit;
+        }
+        if trimmed == "/help" {
+            self.main_transcript.push(TranscriptEntry::SystemBanner {
+                tag: "help".to_string(),
+                text: self.help_text(),
+            });
+            return TuiCommand::Noop;
+        }
+        if trimmed == "/sessions" || trimmed == "/resume" {
+            return TuiCommand::OpenSessionsOverlay;
+        }
+        if trimmed == "/undo" {
+            self.main_transcript.push(TranscriptEntry::SystemBanner {
+                tag: "undo".to_string(),
+                text: "Undo requested: reverting the most recent turn (conversation + workspace files).".to_string(),
+            });
+            return TuiCommand::Session(SessionCommand::UndoLastTurn {
+                scope: RevertScope::ConversationAndFiles,
+            });
+        }
+        if trimmed == "/compact" {
+            self.main_transcript.push(TranscriptEntry::SystemBanner {
+                tag: "compact".to_string(),
+                text: "Compaction requested: summarizing older context into a new generation."
+                    .to_string(),
+            });
+            return TuiCommand::Session(SessionCommand::Compact);
+        }
+        if trimmed == "/trust" || trimmed.starts_with("/trust ") {
+            let arg = trimmed
+                .strip_prefix("/trust")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            let action = match arg.as_str() {
+                "" | "status" => TrustUiCommand::Status,
+                "allow" | "grant" => TrustUiCommand::Allow,
+                "revoke" | "deny" => TrustUiCommand::Revoke,
+                other => {
+                    self.main_transcript.push(TranscriptEntry::SystemBanner {
+                        tag: "error".to_string(),
+                        text: format!("Usage: `/trust <status|allow|revoke>` (got `{other}`)"),
+                    });
+                    return TuiCommand::Noop;
+                }
+            };
+            return TuiCommand::RunTrust { action };
+        }
+        if trimmed == "/copy" || trimmed.starts_with("/copy ") {
+            let arg = trimmed.strip_prefix("/copy").unwrap_or_default().trim();
+            let Some(markdown) = self.latest_assistant_markdown() else {
+                self.main_transcript.push(TranscriptEntry::SystemBanner {
+                    tag: "error".to_string(),
+                    text: "Nothing to copy yet: no completed assistant reply.".to_string(),
+                });
+                return TuiCommand::Noop;
+            };
+            let (text, label) = if arg == "code" {
+                match extract_last_fenced_code_block(&markdown) {
+                    Some(code) => (code, "code block".to_string()),
+                    None => {
+                        self.main_transcript.push(TranscriptEntry::SystemBanner {
+                            tag: "error".to_string(),
+                            text: "No fenced code block found in the latest reply.".to_string(),
+                        });
+                        return TuiCommand::Noop;
+                    }
+                }
+            } else {
+                (markdown, "reply".to_string())
+            };
+            return TuiCommand::CopyToClipboard { text, label };
+        }
+        if let Some(rest) = trimmed.strip_prefix("/resume ") {
+            let sid = rest.trim();
+            if !sid.is_empty() {
+                return TuiCommand::SwitchSession {
+                    session_id: sid.to_string(),
+                    fork: false,
+                };
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/fork ") {
+            let sid = rest.trim();
+            if !sid.is_empty() {
+                return TuiCommand::SwitchSession {
+                    session_id: sid.to_string(),
+                    fork: true,
+                };
+            }
+        }
+        if trimmed == "/tasks" {
+            return TuiCommand::OpenTasksOverlay;
+        }
+        if trimmed == "/reload" {
+            return TuiCommand::ReloadPlugins;
+        }
+        if trimmed == "/mcp" {
+            return TuiCommand::ShowMcpStatus;
+        }
+        if trimmed == "/memory" || trimmed == "/memory edit" {
+            let edit = trimmed == "/memory edit";
+            let text = match self.memory_view.as_mut() {
+                Some(cb) => cb(),
+                None => "Project memory unavailable (no memory hook attached).".to_string(),
+            };
+            if edit {
+                // Purely informational: MEMORY.md is plain Markdown, edit it in any editor.
+                let path = text.lines().next().unwrap_or("<unknown path>").to_string();
+                self.main_transcript.push(TranscriptEntry::SystemBanner {
+                    tag: "memory".to_string(),
+                    text: format!("Edit {path} in your editor; it is re-read at session start."),
+                });
+            } else {
+                self.main_transcript.push(TranscriptEntry::SystemBanner {
+                    tag: "memory".to_string(),
+                    text,
+                });
+            }
+            return TuiCommand::Noop;
+        }
+        if trimmed == "/model" || trimmed.starts_with("/model ") {
+            let arg = trimmed.strip_prefix("/model").unwrap_or_default().trim();
+            if arg.is_empty() {
+                if self.available_models.is_empty() {
+                    self.main_transcript.push(TranscriptEntry::SystemBanner {
+                        tag: "model".to_string(),
+                        text: format!("Active model: `{}` (no model catalog available for the interactive picker)", self.active_model),
+                    });
+                } else {
+                    self.overlay = ActiveOverlay::ModelPicker(ModelPickerState::new(
+                        self.available_models.clone(),
+                    ));
+                }
+                return TuiCommand::Noop;
+            }
+            self.active_model = arg.to_string();
+            self.main_transcript.push(TranscriptEntry::SystemBanner {
+                tag: "model".to_string(),
+                text: format!("Switched active model to `{arg}`"),
+            });
+            return TuiCommand::Session(SessionCommand::SwitchModel {
+                model: arg.to_string(),
+            });
+        }
+        if trimmed == "/mode" || trimmed.starts_with("/mode ") {
+            let arg = trimmed
+                .strip_prefix("/mode")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            let parsed = match arg.as_str() {
+                "plan" => Some(PermissionMode::Plan),
+                "readonly" | "read-only" => Some(PermissionMode::ReadOnly),
+                "build" => Some(PermissionMode::Build),
+                "auto" => Some(PermissionMode::Auto),
+                "yolo" => Some(PermissionMode::Yolo),
+                _ => None,
+            };
+            let Some(new_mode) = parsed else {
+                self.main_transcript.push(TranscriptEntry::SystemBanner {
+                    tag: "error".to_string(),
+                    text: "Usage: `/mode <plan|build|auto|yolo>`".to_string(),
+                });
+                return TuiCommand::Noop;
+            };
+            self.mode = new_mode;
+            self.main_transcript.push(TranscriptEntry::SystemBanner {
+                tag: "mode".to_string(),
+                text: format!("Switched permission mode to `{new_mode:?}`"),
+            });
+            return TuiCommand::Session(SessionCommand::SetMode { mode: new_mode });
+        }
+        if trimmed == "/review" || trimmed.starts_with("/review ") {
+            let rest = trimmed.strip_prefix("/review").unwrap_or_default().trim();
+            let target = parse_tui_review_target(rest);
+            return TuiCommand::RunReview { target };
+        }
+        if trimmed == "/goal" || trimmed.starts_with("/goal ") {
+            let cond = trimmed.strip_prefix("/goal").unwrap_or_default().trim();
+            let opt = (!cond.is_empty() && cond != "clear").then(|| cond.to_string());
+            self.active_goal.clone_from(&opt);
+            return TuiCommand::Session(SessionCommand::SetGoal { condition: opt });
+        }
+        if trimmed == "/search" || trimmed.starts_with("/search ") {
+            let q = trimmed.strip_prefix("/search").unwrap_or_default().trim();
+            return TuiCommand::RunSearch {
+                query: q.to_string(),
+            };
+        }
+        if trimmed == "/revert" || trimmed.starts_with("/revert ") {
+            let tid = trimmed.strip_prefix("/revert").unwrap_or_default().trim();
+            return TuiCommand::OpenRevertPreview {
+                turn_id: tid.to_string(),
+            };
+        }
+        // `/skill <name> [prompt]` is expanded by the session runner, not the plugin host.
+        if trimmed == "/skill" || trimmed.starts_with("/skill ") {
+            let arg = trimmed.strip_prefix("/skill").unwrap_or_default().trim();
+            if arg.is_empty() {
+                self.main_transcript.push(TranscriptEntry::SystemBanner {
+                    tag: "error".to_string(),
+                    text: "Usage: `/skill <name> [prompt]`".to_string(),
+                });
+                return TuiCommand::Noop;
+            }
+            self.main_transcript
+                .push(TranscriptEntry::UserMessage(trimmed.to_string()));
+            let delivery = if self.turn_running {
+                InputDeliveryMode::Guide
+            } else {
+                InputDeliveryMode::Next
+            };
+            return TuiCommand::Session(SessionCommand::SubmitInput {
+                prompt: trimmed.to_string(),
+                delivery,
+                images: Vec::new(),
+            });
+        }
+        if let Some(after_slash) = trimmed.strip_prefix('/') {
+            let mut parts = after_slash.splitn(2, char::is_whitespace);
+            let cmd_name = parts.next().unwrap_or_default();
+            let cmd_args = parts.next().unwrap_or_default().trim();
+            if !cmd_name.is_empty()
+                && !cmd_name.contains('/')
+                && cmd_name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            {
+                return TuiCommand::InvokePluginCommand {
+                    name: cmd_name.to_string(),
+                    args: cmd_args.to_string(),
+                };
+            }
+        }
+
+        if let Some(sub_tid) = self.viewing_subagent.clone() {
+            return TuiCommand::SteerSubagent {
+                task_id: sub_tid,
+                prompt: trimmed.to_string(),
+                delivery: InputDeliveryMode::Guide,
+            };
+        }
+
+        self.main_transcript
+            .push(TranscriptEntry::UserMessage(trimmed.to_string()));
+        let delivery = if self.turn_running {
+            if alt {
+                InputDeliveryMode::Replace
+            } else {
+                InputDeliveryMode::Guide
+            }
+        } else {
+            InputDeliveryMode::Next
+        };
+        TuiCommand::Session(SessionCommand::SubmitInput {
+            prompt: trimmed.to_string(),
+            delivery,
+            images: Vec::new(),
+        })
+    }
+
+    /// Plugin binding for `key`, if any: the last registration whose mode matches the composer
+    /// state wins; matching ignores `Shift` and letter case.
+    fn match_keymap(&self, key: KeyEvent) -> Option<KeymapSpec> {
+        let pressed = Self::chord_of(key)?;
+        let draft_empty = self.input_buffer.is_empty();
+        self.keymaps
+            .iter()
+            .rev()
+            .find(|spec| spec.chord == pressed && spec.mode.matches_draft(draft_empty))
+            .cloned()
+    }
+
+    /// Normalizes a key event to the chord it represents: `Ctrl`/`Alt` plus a letter or
+    /// function key, ignoring `Shift` and letter case. `None` for anything unbindable.
+    fn chord_of(key: KeyEvent) -> Option<KeyChord> {
+        let mut modifiers = key.modifiers;
+        modifiers.set(KeyModifiers::SHIFT, false);
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        let alt = modifiers.contains(KeyModifiers::ALT);
+        modifiers.set(KeyModifiers::CONTROL, false);
+        modifiers.set(KeyModifiers::ALT, false);
+        if !modifiers.is_empty() {
+            return None;
+        }
+        let key = match key.code {
+            KeyCode::Char(ch) if ch.is_ascii() => KeySpec::Char(ch.to_ascii_lowercase()),
+            KeyCode::F(n) => KeySpec::Function(n),
+            _ => return None,
+        };
+        KeyChord::new(ctrl, alt, key)
+    }
+
+    /// `/help` banner: the built-in command reference plus active plugin keys, if any.
+    fn help_text(&self) -> String {
+        let mut text = "Commands: /help, /model <provider/model>, /mode <plan|build|auto|yolo>, /sessions (/resume [id]), /fork <id>, /goal <cond|clear>, /review [uncommitted|base <branch>|commit <sha>], /mcp, /tasks (Ctrl-X), /search <query>, /revert <turn_id>, /reload, /quit | Keys: @file & / completion (Tab/Up/Down), Left/Right/Home/End/Delete, Ctrl-J newline, Shift-Tab cycle mode, r Raw/Filtered".to_string();
+        if !self.keymaps.is_empty() {
+            let keys: Vec<String> = self
+                .keymaps
+                .iter()
+                .map(|spec| format!("{} → {} ({})", spec.chord, spec.command, spec.mode.as_str()))
+                .collect();
+            text.push_str(" | Plugin keys: ");
+            text.push_str(&keys.join(", "));
+        }
+        text
     }
 
     /// Renders the full-screen Alternate-Screen interface onto `frame`.
@@ -1983,7 +2068,7 @@ pub async fn run_fullscreen_tui(
         hooks.initial_records.clear();
     }
     app.set_workspace_files(std::mem::take(&mut hooks.workspace_files));
-    app.set_extra_slash_commands(std::mem::take(&mut hooks.extra_slash_commands));
+    hooks.sync_plugin_registrations(&mut app);
     app.set_discovered_skills(std::mem::take(&mut hooks.discovered_skills));
     if let Some(cb) = hooks.on_memory_view.take() {
         app.set_memory_view(cb);
@@ -2089,7 +2174,10 @@ pub async fn run_fullscreen_tui(
                         TuiCommand::ReloadPlugins => {
                             if let Some(cb) = &mut hooks.on_reload_plugins {
                                 let msg = match cb() {
-                                    Ok(ok) => ok,
+                                    Ok(ok) => {
+                                        hooks.sync_plugin_registrations(&mut app);
+                                        ok
+                                    }
                                     Err(err) => format!("Plugin reload failed: {err}"),
                                 };
                                 app.main_transcript.push(TranscriptEntry::SystemBanner {

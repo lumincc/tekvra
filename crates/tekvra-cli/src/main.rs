@@ -624,6 +624,7 @@ async fn try_main() -> Result<()> {
         LuaHostOptions {
             no_plugins: cli.no_plugins,
             no_jit: cli.no_jit,
+            net_ssrf_allowlist: Vec::new(),
         },
     )?;
     for notice in &plugin_report.notices {
@@ -972,11 +973,6 @@ async fn launch_interactive_tui(
     available_models: Vec<(String, String)>,
 ) -> Result<()> {
     let workspace_files = scan_workspace_mention_files(&resolved.cwd, 4_000);
-    let extra_slash_commands: Vec<(String, String)> = plugin_host
-        .registered_commands()
-        .into_iter()
-        .map(|c| (c.name, c.description))
-        .collect();
     let discovered_skills: Vec<(String, String)> = tekvra_config::discover_skills(
         &resolved.paths.global_config_dir,
         resolved.paths.home_dir.as_deref(),
@@ -989,6 +985,8 @@ async fn launch_interactive_tui(
     let trust_cwd = resolved.cwd.clone();
 
     let host_for_reload = plugin_host.clone();
+    let host_for_slash = plugin_host.clone();
+    let host_for_keys = plugin_host.clone();
     let host_for_cmd = plugin_host;
     let mcp_for_tui = mcp_gateway_opt.clone();
     let review_cwd = resolved.cwd.clone();
@@ -1010,7 +1008,14 @@ async fn launch_interactive_tui(
     let hooks = TuiRuntimeHooks {
         initial_records,
         workspace_files,
-        extra_slash_commands,
+        plugin_slash_commands: Some(Box::new(move || {
+            host_for_slash
+                .registered_commands()
+                .into_iter()
+                .map(|c| (c.name, c.description))
+                .collect()
+        })),
+        plugin_keymaps: Some(Box::new(move || host_for_keys.registered_keymaps())),
         discovered_skills,
         available_models,
         on_trust_command: Some(Box::new(move |action| {
@@ -1044,11 +1049,16 @@ async fn launch_interactive_tui(
         })),
         on_reload_plugins: Some(Box::new(move || {
             let rep = host_for_reload.reload().map_err(|e| e.to_string())?;
-            Ok(format!(
+            let mut msg = format!(
                 "Reloaded {} plugin(s) (vm_active={})",
                 rep.loaded_plugins.len(),
                 rep.vm_initialized
-            ))
+            );
+            for notice in &rep.notices {
+                msg.push('\n');
+                msg.push_str(notice);
+            }
+            Ok(msg)
         })),
         on_plugin_command: Some(Box::new(move |name, args| {
             if !host_for_cmd.has_command(name) {

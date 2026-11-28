@@ -3,11 +3,19 @@
 //! - Migration notice when `init.lua` exists while disabled
 //! - Per-plugin `plugin.toml` capability denial on `tekvra.fs.read_bytes` when `fs_read` is absent
 //! - Live `/reload`, `--no-jit` interpreter mode, and Luau GC drop safety (no panics on `Lua` drop)
+//! - Real `tekvra.net.get` (SSRF-safe, per-hop `net` grants, 64 KiB body cap)
+//! - `tekvra.keymap.set` validation and per-plugin load isolation
+
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 use tekvra_config::{CliConfigOverrides, ConfigPaths, TrustStore, load_config};
 use tekvra_core::PluginToolExecutor;
 use tekvra_lua::{LuaHostOptions, PluginHost};
+use tekvra_protocol::{KeymapMode, KeymapSpec, parse_key_chord};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -76,7 +84,7 @@ async fn skipped_vm_by_default_with_migration_notice_and_no_plugins_override() {
         resolved_enabled,
         LuaHostOptions {
             no_plugins: true,
-            no_jit: false,
+            ..LuaHostOptions::default()
         },
     )
     .expect("init with --no-plugins");
@@ -130,7 +138,7 @@ tekvra.api.register_command({
     end,
 })
 
-tekvra.keymap.set("n", "<C-p>", "ping")
+tekvra.keymap.set("n", "<C-p>", "/ping")
 "#,
     )
     .expect("write plugin init.lua");
@@ -151,6 +159,7 @@ tekvra.keymap.set("n", "<C-p>", "ping")
         LuaHostOptions {
             no_plugins: false,
             no_jit: true, // Verify `--no-jit` interpreter mode!
+            ..LuaHostOptions::default()
         },
     )
     .expect("initialize host");
@@ -158,7 +167,11 @@ tekvra.keymap.set("n", "<C-p>", "ping")
     assert!(!report.jit_enabled);
     assert_eq!(report.loaded_plugins, vec!["demo".to_string()]);
     assert_eq!(host.registered_tools().len(), 1);
-    assert_eq!(host.registered_keymaps().len(), 1);
+    let keymaps = host.registered_keymaps();
+    assert_eq!(keymaps.len(), 1);
+    assert_eq!(keymaps[0].mode, KeymapMode::Normal);
+    assert_eq!(keymaps[0].chord, parse_key_chord("<C-p>").expect("chord"));
+    assert_eq!(keymaps[0].command, "/ping");
     assert!(host.has_command("ping"));
     assert!(!host.has_command("nonexistent"));
     assert_eq!(
@@ -395,8 +408,320 @@ end)
     )
     .expect("load config");
 
-    let err = PluginHost::initialize(resolved, LuaHostOptions::default())
-        .map(|_| ())
-        .expect_err("unknown event must fail plugin load");
-    assert!(err.to_string().contains("unknown hook event"), "got: {err}");
+    let (host, report) = PluginHost::initialize(resolved, LuaHostOptions::default())
+        .expect("a failing plugin is reported as a notice, never fatal");
+    assert!(report.vm_initialized, "the VM itself still starts");
+    assert!(
+        report.loaded_plugins.is_empty(),
+        "the failing plugin must not be listed as loaded: {:?}",
+        report.loaded_plugins
+    );
+    let notice = report
+        .notices
+        .iter()
+        .find(|n| n.contains("Failed to load plugin `hooks`"))
+        .expect("notice naming the failed plugin");
+    assert!(
+        notice.contains("unknown hook event") && notice.contains("registrations were discarded"),
+        "got: {notice}"
+    );
+    assert!(
+        host.registered_tools().is_empty()
+            && host.registered_commands().is_empty()
+            && host.registered_keymaps().is_empty()
+    );
+}
+
+/// Boots a plugin-enabled host over the plugins already written under `<cfg>/lua/<name>/`.
+fn boot_host(
+    ws: &Path,
+    cfg_dir: &Path,
+    state_dir: &Path,
+    options: LuaHostOptions,
+) -> (PluginHost, tekvra_lua::PluginLoadReport) {
+    std::fs::create_dir_all(cfg_dir).expect("mkdir cfg");
+    std::fs::create_dir_all(state_dir).expect("mkdir state");
+    std::fs::create_dir_all(ws.join(".git")).expect("mkdir ws/.git");
+    std::fs::write(
+        cfg_dir.join("tekvra.toml"),
+        "version = 2\n[experimental]\nlua_plugins = true\n",
+    )
+    .expect("write tekvra.toml");
+    let mut trust = TrustStore::load(state_dir).expect("trust");
+    trust.grant_trust(ws).expect("grant trust");
+    let resolved = load_config(
+        ConfigPaths {
+            global_config_dir: cfg_dir.to_path_buf(),
+            state_dir: state_dir.to_path_buf(),
+            home_dir: Some(ws.to_path_buf()),
+        },
+        ws,
+        &CliConfigOverrides::default(),
+    )
+    .expect("load config");
+    PluginHost::initialize(resolved, options).expect("initialize host")
+}
+
+/// Writes `<cfg>/lua/<name>/{init.lua,plugin.toml}` (manifest optional).
+fn write_plugin(cfg_dir: &Path, name: &str, init_lua: &str, manifest: Option<&str>) {
+    let dir = cfg_dir.join("lua").join(name);
+    std::fs::create_dir_all(&dir).expect("mkdir plugin");
+    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
+    if let Some(manifest) = manifest {
+        std::fs::write(dir.join("plugin.toml"), manifest).expect("write plugin.toml");
+    }
+}
+
+/// Minimal HTTP/1.1 server on `127.0.0.1:<ephemeral>` recording request paths. `/redirect`
+/// answers `302` to `http://localhost:<same port>/secret` so the redirect hop has a different
+/// host string than the granted `127.0.0.1`.
+fn spawn_loopback_http(requests: Arc<Mutex<Vec<String>>>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let requests = Arc::clone(&requests);
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut buf = [0u8; 4096];
+                let mut raw = Vec::new();
+                loop {
+                    let Ok(n) = stream.read(&mut buf) else {
+                        return;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
+                requests.lock().unwrap().push(path.clone());
+                let body: Vec<u8> = match path.as_str() {
+                    "/hello" => b"HELLO_FROM_NET".to_vec(),
+                    "/secret" => b"SECRET".to_vec(),
+                    "/big" => vec![b'a'; 70 * 1024],
+                    _ => Vec::new(),
+                };
+                let response = if path == "/redirect" {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&body);
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn net_get_fetches_through_ssrf_safe_fetcher_with_per_hop_grants_and_body_cap() {
+    let tmp = TempDir::new().expect("tempdir");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = spawn_loopback_http(Arc::clone(&requests));
+    let cfg_dir = tmp.path().join("cfg");
+    let ws = tmp.path().join("repo");
+    let state_dir = tmp.path().join("state");
+    for (name, manifest) in [
+        (
+            "nettest",
+            Some("name = \"nettest\"\n\n[permissions]\nnet = [\"127.0.0.1\"]\n"),
+        ),
+        ("nonet", None),
+        (
+            "star",
+            Some("name = \"star\"\n\n[permissions]\nnet = [\"*\"]\n"),
+        ),
+    ] {
+        write_plugin(
+            &cfg_dir,
+            name,
+            &format!(
+                "tekvra.api.register_command({{ name = \"fetch_{name}\", description = \"GET\", handler = function(arg) return tekvra.net.get(arg) end }})\n"
+            ),
+            manifest,
+        );
+    }
+    let loopback_admitted = LuaHostOptions {
+        net_ssrf_allowlist: vec!["127.0.0.1".to_string()],
+        ..LuaHostOptions::default()
+    };
+    let (host, report) = boot_host(&ws, &cfg_dir, &state_dir, loopback_admitted.clone());
+    assert_eq!(report.loaded_plugins.len(), 3, "{:?}", report.notices);
+    let hello = format!("http://127.0.0.1:{port}/hello");
+
+    // 1. Granted host: a real response, not the old `authorized:<url>` stub.
+    let text = host
+        .invoke_command("fetch_nettest", &hello)
+        .expect("granted fetch");
+    assert!(
+        text.starts_with("HTTP 200 ") && text.contains("HELLO_FROM_NET"),
+        "{text}"
+    );
+
+    // 2. Redirect to a host that is not granted: denied before any request reaches it.
+    let denied = host
+        .invoke_command(
+            "fetch_nettest",
+            &format!("http://127.0.0.1:{port}/redirect"),
+        )
+        .expect_err("redirect hop must be denied");
+    let denied = denied.to_string();
+    assert!(
+        denied.contains("permission denied") && denied.contains("redirect host `localhost`"),
+        "{denied}"
+    );
+    assert!(
+        !requests.lock().unwrap().iter().any(|p| p == "/secret"),
+        "the non-granted hop must never be contacted: {:?}",
+        requests
+    );
+
+    // 3. No `net` grant at all: nothing leaves the process.
+    let before = requests.lock().unwrap().len();
+    let no_grant = host
+        .invoke_command("fetch_nonet", &hello)
+        .expect_err("missing grant");
+    let no_grant = no_grant.to_string();
+    assert!(
+        no_grant.contains("permission denied")
+            && no_grant.contains("`net` capability for host `127.0.0.1`")
+            && no_grant.contains("plugin `nonet`"),
+        "{no_grant}"
+    );
+    assert_eq!(requests.lock().unwrap().len(), before);
+
+    // 4. Grants never bypass SSRF policy: a host without the loopback admission blocks it.
+    let (strict_host, _) = boot_host(&ws, &cfg_dir, &state_dir, LuaHostOptions::default());
+    let ssrf = strict_host
+        .invoke_command("fetch_star", &hello)
+        .expect_err("loopback must stay blocked");
+    assert!(ssrf.to_string().contains("blocked SSRF"), "{ssrf}");
+    assert_eq!(requests.lock().unwrap().len(), before);
+
+    // 5. Bodies over 64 KiB are capped with a marker; the status line stays intact.
+    let big = host
+        .invoke_command("fetch_nettest", &format!("http://127.0.0.1:{port}/big"))
+        .expect("big fetch");
+    assert_eq!(
+        big,
+        format!(
+            "HTTP 200 http://127.0.0.1:{port}/big\n\n{}{}",
+            "a".repeat(64 * 1024),
+            "\n...[net.get: body truncated at 64 KiB]"
+        )
+    );
+}
+
+#[tokio::test]
+async fn keymap_set_is_validated_at_load_and_exposes_parsed_specs() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg_dir = tmp.path().join("cfg");
+    let ws = tmp.path().join("repo");
+    let state_dir = tmp.path().join("state");
+    for (name, init_lua) in [
+        (
+            "good",
+            "tekvra.keymap.set(\"n\", \"<C-g>\", \"/review\")\ntekvra.keymap.set(\"*\", \"<A-F4>\", \"/hello world\")\n",
+        ),
+        ("badmode", "tekvra.keymap.set(\"v\", \"<C-g>\", \"/x\")\n"),
+        ("badchord", "tekvra.keymap.set(\"n\", \"<a>\", \"/x\")\n"),
+        (
+            "badreserved",
+            "tekvra.keymap.set(\"n\", \"<C-c>\", \"/x\")\n",
+        ),
+        (
+            "badcommand",
+            "tekvra.keymap.set(\"n\", \"<C-g>\", \"ping\")\n",
+        ),
+    ] {
+        write_plugin(&cfg_dir, name, init_lua, None);
+    }
+    let (host, report) = boot_host(&ws, &cfg_dir, &state_dir, LuaHostOptions::default());
+    assert_eq!(report.loaded_plugins, vec!["good".to_string()]);
+    let keymaps = host.registered_keymaps();
+    assert_eq!(
+        keymaps,
+        vec![
+            KeymapSpec::parse("n", "<C-g>", "/review").expect("spec"),
+            KeymapSpec::parse("*", "<A-F4>", "/hello world").expect("spec"),
+        ]
+    );
+    assert_eq!(report.notices.len(), 4, "{:?}", report.notices);
+    for (plugin, reason) in [
+        ("badmode", "invalid keymap mode `v`"),
+        ("badchord", "a bare key cannot be bound"),
+        ("badreserved", "reserved for interrupt / quit"),
+        ("badcommand", "expected a slash command"),
+    ] {
+        let notice = report
+            .notices
+            .iter()
+            .find(|n| n.contains(&format!("Failed to load plugin `{plugin}`")))
+            .unwrap_or_else(|| panic!("no notice for {plugin}: {:?}", report.notices));
+        assert!(notice.contains(reason), "{plugin}: {notice}");
+    }
+}
+
+#[tokio::test]
+async fn failing_plugin_is_isolated_and_its_registrations_rolled_back() {
+    use tekvra_core::{HookEvent, HookEventPayload};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg_dir = tmp.path().join("cfg");
+    let ws = tmp.path().join("repo");
+    let state_dir = tmp.path().join("state");
+    // `a_broken` registers a command and a hook BEFORE its failing keymap call: all of it
+    // must vanish. `b_works` loads after it and must be unaffected.
+    write_plugin(
+        &cfg_dir,
+        "a_broken",
+        r#"tekvra.api.register_command({ name = "ghost", description = "", handler = function() return "boo" end })
+tekvra.api.register_hook("session_start", function() return "ghost note" end)
+tekvra.keymap.set("v", "<C-g>", "/x")
+"#,
+        None,
+    );
+    write_plugin(
+        &cfg_dir,
+        "b_works",
+        r#"tekvra.api.register_command({ name = "alive", description = "", handler = function() return "alive" end })
+tekvra.keymap.set("i", "<C-g>", "/alive")
+"#,
+        None,
+    );
+    let (host, report) = boot_host(&ws, &cfg_dir, &state_dir, LuaHostOptions::default());
+    assert_eq!(report.loaded_plugins, vec!["b_works".to_string()]);
+    let notice = report
+        .notices
+        .iter()
+        .find(|n| n.contains("Failed to load plugin `a_broken`"))
+        .expect("notice naming the broken plugin");
+    assert!(
+        notice.contains("invalid keymap mode `v`")
+            && notice.contains("registrations were discarded"),
+        "{notice}"
+    );
+    assert!(!host.has_command("ghost"));
+    assert!(host.has_command("alive"));
+    assert_eq!(host.invoke_command("alive", "").expect("alive"), "alive");
+    let keymaps = host.registered_keymaps();
+    assert_eq!(keymaps.len(), 1);
+    assert_eq!(keymaps[0].command, "/alive");
+    let outcome = host.dispatch_hook(HookEvent::SessionStart, HookEventPayload::default());
+    assert!(
+        outcome.notes.is_empty() && outcome.failures.is_empty(),
+        "{outcome:?}"
+    );
 }
